@@ -1,0 +1,64 @@
+[package]
+name = "bcmalloc-bench-apps"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+description = "Real programs measured with the benchmark driver, as a held-out check against tuning to synthetic loops."
+
+[dependencies]
+bcmalloc = { path = ".." }
+mimalloc = "0.1"
+snmalloc-rs = "0.7"
+tikv-jemallocator = "0.7"
+libc = "0.2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+syn = { version = "3", features = ["full", "parsing", "printing", "visit"] }
+proc-macro2 = "1"
+quote = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[[bench]]
+name = "system"
+harness = false
+
+[[bench]]
+name = "bcmalloc"
+harness = false
+
+[[bench]]
+name = "mimalloc"
+harness = false
+
+[[bench]]
+name = "jemalloc"
+harness = false
+
+[[bench]]
+name = "snmalloc"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only"
+
+[profile.bench]
+debug = "line-tables-only"
+
+# snmalloc-sys 0.7 builds snmalloc as a CMake Debug build at -O0 whenever its build script sees
+# debug info enabled, so the comparison builds it without debug info.
+[profile.release.package.snmalloc-sys]
+debug = false
+
+[profile.bench.package.snmalloc-sys]
+debug = false
+
+# Keep the benchmark apps out of the parent crate's build.
+[workspace]
