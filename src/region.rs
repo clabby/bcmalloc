@@ -101,9 +101,9 @@ pub struct Region<'a> {
     heaps: &'a [HeapData],
     /// The bin slots of every heap, [`BIN_SLOTS`] for each, owned by whoever claims the heap.
     bin_slots: *mut *mut Block,
-    /// How many NUMA nodes the region is split between, and how many bitmap words each part has.
+    /// How many NUMA nodes the region is split between, and how many bitmap words there are.
     nodes: usize,
-    node_words: usize,
+    words: usize,
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
@@ -158,7 +158,9 @@ impl<'a> Region<'a> {
         debug_assert_eq!(parts.slabs.len(), parts.chunk_count);
         debug_assert_eq!(parts.map.len(), parts.chunk_count);
         let words = Chunks::words_for(parts.chunk_count);
-        let nodes = parts.nodes.clamp(1, words);
+        // A region too small to give every node a word of its own is not split at all, because
+        // the parts are numbered by physical node.
+        let nodes = if parts.nodes <= words { parts.nodes.max(1) } else { 1 };
         Self {
             base: parts.base,
             chunks: Chunks::with_granule(parts.words, parts.chunk_count, parts.purge_granule),
@@ -167,7 +169,7 @@ impl<'a> Region<'a> {
             heaps: parts.heaps,
             bin_slots: parts.bin_slots,
             nodes,
-            node_words: words.div_ceil(nodes),
+            words,
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
             aging: AtomicBool::new(false),
@@ -294,8 +296,8 @@ impl<'a> Region<'a> {
 
     /// The bitmap words of the part of the region that belongs to NUMA node `node`.
     pub(crate) const fn home(&self, node: usize) -> Range<usize> {
-        let start = (node % self.nodes) * self.node_words;
-        start..start + self.node_words
+        let node = node % self.nodes;
+        node * self.words / self.nodes..(node + 1) * self.words / self.nodes
     }
 
     /// The NUMA node of the CPU the calling thread runs on, as the region numbers its parts.
@@ -307,8 +309,25 @@ impl<'a> Region<'a> {
     /// free, and returns whether it did.
     pub(crate) fn grow_in_place(&self, first: usize, had: usize, wants: usize) -> bool {
         let (start, more) = (first + had, wants - had);
-        if start + more > self.chunks.len() || !self.chunks.claim_at(start, more) {
+        if start + more > self.chunks.len() {
             return false;
+        }
+        // A purge pass may hold the chunks for a moment, so a failed claim only counts when no
+        // pass overlapped it, as for any other claim.
+        loop {
+            let active = self.purges_active.load(Ordering::Acquire);
+            let done = self.purges_done.load(Ordering::Acquire);
+            if self.chunks.claim_at(start, more) {
+                break;
+            }
+            fence(Ordering::Acquire);
+            if active == 0 &&
+                self.purges_active.load(Ordering::Acquire) == 0 &&
+                self.purges_done.load(Ordering::Acquire) == done
+            {
+                return false;
+            }
+            core::hint::spin_loop();
         }
         self.chunks.take_purged(start, more, |run| {
             // SAFETY: the run is inside the region and belongs to us since the claim above.
@@ -706,6 +725,48 @@ mod test {
 
     const fn config(capacity: usize) -> Config {
         Config::new().capacity(capacity).max_heaps(4)
+    }
+
+    #[test]
+    fn every_numa_node_gets_a_part_of_the_region() {
+        // Five words for four nodes, which an even split per word count would get wrong.
+        let test = crate::testing::TestRegion::with_nodes(320, 1, 4);
+        let region = test.region();
+        let mut next = 0;
+        for node in 0..4 {
+            let home = region.home(node);
+            assert_eq!(home.start, next, "the parts tile the bitmap");
+            assert!(!home.is_empty(), "node {node} has no part");
+            next = home.end;
+        }
+        assert_eq!(next, 5);
+        let tiny = crate::testing::TestRegion::with_nodes(64, 1, 4);
+        assert_eq!(tiny.region().home(3), 0..1, "a region smaller than the nodes is not split");
+    }
+
+    #[test]
+    fn growing_in_place_waits_out_a_purge_that_holds_the_next_chunks() {
+        let test = crate::testing::TestRegion::new(20, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let layout = |chunks: usize| Layout::from_size_align(chunks << CHUNK_SHIFT, 8).unwrap();
+        let block = heap.alloc(layout(20)).unwrap();
+        // SAFETY: the block is live with this layout.
+        let block = unsafe { heap.realloc(block, layout(20), 9 << CHUNK_SHIFT) }.unwrap();
+        // What a purge pass looks like while it holds the free tail.
+        region.purges_active.fetch_add(1, Ordering::Release);
+        assert!(region.chunks.claim_at(9, 11));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                region.chunks.free_at(9, 11, 0);
+                region.purges_done.fetch_add(1, Ordering::Release);
+                region.purges_active.fetch_sub(1, Ordering::Release);
+            });
+            // SAFETY: the block is live with nine chunks.
+            let grown = unsafe { heap.realloc(block, layout(9), 12 << CHUNK_SHIFT) };
+            assert_eq!(grown, Some(block), "the pass let go of the chunks after the block");
+        });
     }
 
     #[test]

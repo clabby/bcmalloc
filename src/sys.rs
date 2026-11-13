@@ -236,15 +236,22 @@ pub(crate) fn numa_nodes() -> usize {
 #[cfg(any(test, all(target_os = "linux", not(miri))))]
 fn parse_node_list(list: &[u8]) -> usize {
     let list = list.strip_suffix(b"\n").unwrap_or(list);
-    match list {
+    let count = match list {
         b"0" => 1,
-        [b'0', b'-', last @ ..] if !last.is_empty() && last.iter().all(u8::is_ascii_digit) => last
-            .iter()
-            .fold(0_usize, |n, digit| n * 10 + usize::from(digit - b'0'))
-            .saturating_add(1),
+        [b'0', b'-', last @ ..]
+            if (1..=4).contains(&last.len()) && last.iter().all(u8::is_ascii_digit) =>
+        {
+            last.iter().fold(0_usize, |n, digit| n * 10 + usize::from(digit - b'0')) + 1
+        }
         _ => 1,
-    }
+    };
+    if count > MAX_NODES { 1 } else { count }
 }
+
+/// The most NUMA nodes the allocator splits a region between. Machines with more are treated as
+/// one node.
+#[cfg(any(test, all(target_os = "linux", not(miri))))]
+const MAX_NODES: usize = 1024;
 
 /// The NUMA node of the CPU the calling thread runs on, or 0 where the system does not say.
 #[cfg_attr(
@@ -287,7 +294,11 @@ pub(crate) unsafe fn prefer_node(ptr: NonNull<u8>, len: usize, node: usize) {
     {
         /// The memory policy that prefers one node and falls back to the others.
         const MPOL_PREFERRED: libc::c_long = 1;
-        let mask: u64 = 1 << (node % 64);
+        let mut mask = [0_u64; MAX_NODES / 64];
+        if node >= MAX_NODES {
+            return;
+        }
+        mask[node / 64] = 1 << (node % 64);
         // SAFETY: the range is inside a reservation, and the mask outlives the call.
         unsafe {
             libc::syscall(
@@ -295,8 +306,9 @@ pub(crate) unsafe fn prefer_node(ptr: NonNull<u8>, len: usize, node: usize) {
                 ptr.as_ptr(),
                 len,
                 MPOL_PREFERRED,
-                &raw const mask,
-                64 as libc::c_ulong,
+                mask.as_ptr(),
+                // The kernel reads one bit fewer than this.
+                (MAX_NODES + 1) as libc::c_ulong,
                 0 as libc::c_uint,
             );
         }
@@ -316,6 +328,8 @@ mod test {
         assert_eq!(parse_node_list(b"0-15"), 16);
         assert_eq!(parse_node_list(b"0,2-3\n"), 1, "a list with gaps binds nothing");
         assert_eq!(parse_node_list(b""), 1);
+        assert_eq!(parse_node_list(b"0-4095\n"), 1, "more nodes than the masks hold");
+        assert_eq!(parse_node_list(b"0-99999999999999999999"), 1);
         assert!(numa_nodes() >= 1);
         assert!(current_node() < 1024);
     }

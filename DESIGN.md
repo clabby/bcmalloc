@@ -1,6 +1,6 @@
 # How bcmalloc works
 
-**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A thread allocates by popping a pointer off a small stack for the size class, and frees by pushing it back, with no atomic instructions and without touching the block. Blocks freed by another thread travel home in messages, so no thread writes into memory that another core holds. Idle memory goes back to the operating system on a clock, in whole huge pages on Linux.
+**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A thread allocates by popping a pointer off a small stack for the size class, and frees by pushing it back, with no atomic instructions and without touching the block. Blocks freed by another thread travel home in batches of pointers, so neither thread walks or writes memory that the other core holds. Idle memory goes back to the operating system on a clock, in whole huge pages on Linux.
 
 This document explains the design, where each idea comes from, and what each choice costs. Benchmark results close the document.
 
@@ -51,9 +51,9 @@ The mapping holds the allocator's own metadata and the memory it hands out, laid
 
 ![A memory map of the reservation with its header, heap slots, bin slots, slab descriptors, chunk map, bitmaps and chunks, and the arithmetic that turns a pointer into its chunk map entry and descriptor](assets/region-map.svg)
 
-**Figure 2.** The reservation. Metadata is about 1% of the region. A pointer finds its chunk map entry with a subtraction and a shift, and its slab descriptor with a mask on top.
+**Figure 2.** The reservation. Metadata costs about 1% of the managed memory, plus about 110 KiB of bin slots for each heap slot. A pointer finds its chunk map entry with a subtraction and a shift, and its slab descriptor with a mask on top.
 
-Metadata sits next to the memory it describes and never inside it. A buffer overflow in the program cannot corrupt the bookkeeping, and the allocator never writes into a block it has handed out or is about to hand out.
+Metadata sits next to the memory it describes and never inside a slab. The descriptors, the chunk map and the bitmaps are separate from the blocks the program uses, and the allocator does not keep its own state in the blocks it hands out. Only blocks on their way home to another heap carry allocator data, as section 7 describes.
 
 The **chunk map** has one word per chunk. For every chunk of a slab it records the heap that owns the slab and the slab's size class. TCMalloc and snmalloc call this structure a pagemap. Here it is a flat array, because the region is one reservation. A free reads one word of it to learn both the size class and whether the block belongs to the calling thread's heap.
 
@@ -90,7 +90,7 @@ Freeing a run is one `fetch_and` per word it touches. Neighbouring free chunks c
 Where a run goes matters for memory as much as for speed.
 
 - Single chunks come from the low end of the region, starting at a hint so that threads spread over different words. Longer runs come from the high end. Long-lived small slabs then do not scatter through the address space and break up the room that large runs need.
-- A bitmap word covers two 2 MiB huge pages. When a run fits in either half of a word, it goes to the half that is already fuller. Allocations pack into huge pages that are partly used and leave empty ones empty, where they can be given back whole. Temeraire places small allocations by the same principle, by how full each huge page is[^temeraire].
+- A bitmap word covers two 2 MiB huge pages. When a run fits in either half of a word, it goes to the half that is already fuller. Allocations pack into huge pages that are partly used and leave empty ones empty, where they can be given back whole. Temeraire's filler packs allocations into huge pages densely for the same reason[^temeraire], with a fuller placement policy than this local choice between two halves.
 - A run of more than 64 chunks cannot be claimed with one atomic. It claims words in order and rolls back if it loses. That path is obstruction-free and not lock-free, which is acceptable because it only serves allocations over 4 MiB.
 
 ## 5. Size classes and slabs
@@ -141,7 +141,7 @@ Each bin is a range of pointer slots in the region, with its top pointer kept ne
 
 **Refills and flushes.** An empty bin first looks at the heap's inbox, where other threads send blocks home, and then fills half its capacity from the front slab with room. Blocks come out of each slab in address order, and the bin hands them out in the same order, so a run of allocations walks memory upwards. A slab that runs out moves to the full list. A full bin gives back its older half, and blocks that follow each other in one slab go back with one look at the slab and one write per bitmap word.
 
-**Sizing.** A bin starts at a capacity that holds about 32 KiB of blocks. When a class alternates between running dry and overflowing, which is a sign that its bursts are bigger than the bin, the bin doubles, up to a limit and within a budget of 2 MiB for the whole heap. A bin that has not missed for a while is halved again. This is how TCMalloc sizes its per-CPU caches[^tcmalloc]. A program that builds and drops trees of a few thousand nodes then keeps them all in the bin, and a quiet class holds little.
+**Sizing.** A bin starts with room for about 32 KiB of blocks of its class, at least 8 and at most 128 pointers, and a bin for a class above 8 KiB with room for about 64 KiB, between 1 and 8 pointers. When a class alternates between running dry and overflowing, which is a sign that its bursts are bigger than the bin, the bin doubles, up to a limit and within a budget of 2 MiB for the whole heap. A bin that has not missed for a while is halved again. This is how TCMalloc sizes its per-CPU caches[^tcmalloc]. A program that builds and drops trees of a few thousand nodes then keeps them all in the bin, and a quiet class holds little.
 
 **Heap lifetime.** A heap is a slot in the region and not a property of a thread. When a thread exits, its heap empties its bins and outboxes and goes back to the pool with all its slabs, and the next thread to start takes it. A thread that is about to go quiet can call `Bcmalloc::flush_thread` to hand back what its heap keeps, as jemalloc's thread cache flush does.
 
@@ -155,7 +155,7 @@ A free reads the chunk map entry of the block, which names the heap that owns it
 
 ![A consumer thread sends blocks to the producer that owns them: the blocks go into an outbox message, the message goes onto the producer's inbox with one compare-and-swap, and the producer files the pointers into its bins](assets/messages.svg)
 
-**Figure 8.** A remote free. The sender writes only pointers, into memory it owns. The owner reads only the message, and files the pointers into its bins without touching the blocks.
+**Figure 8.** A remote free. The sender writes only pointers, into memory it owns. The owner reads only the message, and files the pointers into its bins without touching the blocks. A block that travels alone is the one exception: its link is written into the block itself.
 
 The messages carry pointers and are not lists threaded through the blocks. A list would make the sender write into each freed block, whose cache line usually sits in the owner's core, and the owner would then read every block in turn to find the next. With messages, the only memory that moves between cores is the message itself, one line per eight blocks.
 
@@ -203,7 +203,7 @@ The design spends a little memory and some bookkeeping to keep three things chea
 
 **The common path does almost nothing.** An allocation is a table lookup and a pop, and a free is one load from a dense, read-mostly map and a push. Neither uses an atomic instruction, and neither reads or writes the block. A freed block is the next one handed out, so a program that allocates and frees in a loop works in a few cache lines.
 
-**Memory that moves between threads does not drag cache lines with it.** A block freed on another core is never written by the freeing thread and never walked by the owner. Only the messages travel, one line for every eight blocks. Blocks of classes that cannot share a line are reused where they are freed, which is what makes a thread pool that passes buffers around about as fast as one that does not.
+**Memory that moves between threads does not drag cache lines with it.** A block freed on another core in a batch is never written by the freeing thread and never walked by the owner. Only the messages travel, one line for every eight blocks. A block that has to travel alone, because it is large, the outbox holds nothing else for its owner, or the freeing thread has no heap, carries its own link. Blocks of classes that cannot share a line are reused where they are freed, which is what makes a thread pool that passes buffers around about as fast as one that does not.
 
 **Scattered frees stay cheap.** A free that lands in a cold part of memory costs a bitmap bit and not a write into the block, and a refill hands out a slab's free blocks in address order whatever order they came back in. Programs that free large structures in random order, and then build new ones, get memory that is laid out for them again.
 
@@ -213,7 +213,7 @@ The design spends a little memory and some bookkeeping to keep three things chea
 
 These are the costs.
 
-- **Metadata.** The free bitmaps make a slab descriptor 640 bytes, so metadata is about 1% of the region instead of a fraction of that. It is address space until a slab uses it.
+- **Metadata.** The free bitmaps make a slab descriptor 640 bytes, so metadata is about 1% of the managed memory instead of a fraction of that, and every heap slot reserves about 110 KiB of bin slots. All of it is address space until it is used, but a small region with the default 4096 heaps reserves more for bins than for blocks, so small regions should set `max_heaps` to what they need.
 - **Bursts larger than a bin.** A block that overflows a bin goes back to its slab and comes out again on the next refill, one bitmap operation each way, where a list would move a whole chain at once. Bins that keep overflowing grow to make this rare, within a budget.
 - **Blocks that share lines always go home.** For small classes the freeing thread cannot keep the block, so a producer and a consumer pay one message per batch, and blocks wait in an outbox until it fills, is needed for another destination, or is flushed.
 - **Per-thread caches hold memory.** A heap's bins and outboxes keep blocks that other threads cannot use until the heap flushes them, and a thread that goes quiet keeps them until it exits or calls `flush_thread`.
