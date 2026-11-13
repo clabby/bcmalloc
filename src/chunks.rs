@@ -64,10 +64,18 @@ pub(crate) const CHUNK_SIZE: usize = 1 << CHUNK_SHIFT;
 /// Chunks per bitmap word.
 const WORD: usize = 64;
 
-/// The bitmap of chunks. See the [module documentation](self).
+/// The bitmaps of chunks. See the [module documentation](self).
 #[derive(Debug)]
 pub(crate) struct Chunks<'a> {
-    words: &'a [AtomicU64],
+    /// One bit per chunk, set while the chunk is allocated.
+    used: &'a [AtomicU64],
+    /// Set for chunks that have been freed since they were last purged, so their pages may still
+    /// be resident. Chunks that were never used are not set, because they hold no pages.
+    dirty: &'a [AtomicU64],
+    /// Set for chunks whose pages have been given back to the operating system.
+    purged: &'a [AtomicU64],
+    /// For each word, the latest time that one of its chunks was freed, in milliseconds.
+    stamps: &'a [AtomicU64],
     len: usize,
 }
 
@@ -77,14 +85,23 @@ impl<'a> Chunks<'a> {
         chunks.div_ceil(WORD)
     }
 
+    /// The number of words of storage needed to track `chunks` chunks, for all four arrays.
+    pub(crate) const fn storage_words(chunks: usize) -> usize {
+        4 * Self::words_for(chunks)
+    }
+
     /// Wraps zeroed bitmap storage that tracks `len` chunks.
     ///
     /// # Panics
     ///
-    /// Panics if `words` is too short for `len`.
+    /// Panics if `words` is shorter than [`storage_words`] for `len`.
     pub(crate) fn new(words: &'a [AtomicU64], len: usize) -> Self {
-        assert!(words.len() >= Self::words_for(len), "bitmap too short for {len} chunks");
-        Self { words, len }
+        let each = Self::words_for(len);
+        assert!(words.len() >= 4 * each, "bitmap too short for {len} chunks");
+        let (used, rest) = words.split_at(each);
+        let (dirty, rest) = rest.split_at(each);
+        let (purged, rest) = rest.split_at(each);
+        Self { used, dirty, purged, stamps: &rest[..each], len }
     }
 
     /// The number of chunks tracked.
@@ -95,7 +112,7 @@ impl<'a> Chunks<'a> {
     /// The number of chunks currently free.
     pub(crate) fn free_chunks(&self) -> usize {
         let allocated: usize = self
-            .words
+            .used
             .iter()
             .take(Self::words_for(self.len))
             .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
@@ -121,11 +138,11 @@ impl<'a> Chunks<'a> {
         }
     }
 
-    /// Returns `n` chunks starting at `first`.
+    /// Returns `n` chunks starting at `first`, which were freed at time `now` in milliseconds.
     ///
     /// The run must be exactly one previously returned by [`alloc`](Self::alloc), or a part of
-    /// one.
-    pub(crate) fn free(&self, first: usize, n: usize) {
+    /// one. The time starts the clock that decides when the chunks are purged.
+    pub(crate) fn free_at(&self, first: usize, n: usize, now: u64) {
         debug_assert!(n > 0 && first + n <= self.len);
         let mut chunk = first;
         let end = first + n;
@@ -133,22 +150,33 @@ impl<'a> Chunks<'a> {
             let (word, offset) = (chunk / WORD, chunk % WORD);
             let take = (WORD - offset).min(end - chunk);
             let mask = run_mask(take, offset);
-            let before = self.words[word].fetch_and(!mask, Ordering::Release);
+            // These change before the chunks become free, so that a purge pass cannot take them
+            // on the strength of an older time.
+            self.dirty[word].fetch_or(mask, Ordering::Relaxed);
+            self.stamps[word].fetch_max(now, Ordering::Relaxed);
+            let before = self.used[word].fetch_and(!mask, Ordering::Release);
             debug_assert_eq!(before & mask, mask, "freeing chunks that are not allocated");
             chunk += take;
         }
     }
 
-    /// Claims every free chunk one word at a time, hands each maximal free run to `visit`, and
-    /// gives the chunks back.
+    /// Returns `n` chunks starting at `first` as [`free_at`] does, with the clock at zero.
+    #[cfg(test)]
+    pub(crate) fn free(&self, first: usize, n: usize) {
+        self.free_at(first, n, 0);
+    }
+
+    /// Claims every free chunk one word at a time, hands each maximal free run to `visit`, records
+    /// that the runs were purged, and gives the chunks back.
     ///
-    /// This is how the allocator returns physical memory to the OS. While `visit` runs the run
-    /// belongs to the caller, so nobody can allocate and use it at the same time. The cost is that
-    /// other threads see up to 64 chunks of free memory as missing while a word is being drained.
+    /// The caller returns the runs' pages to the OS in `visit`, which is why they count as purged.
+    /// While `visit` runs the run belongs to the caller, so nobody can allocate and use it at the
+    /// same time. The cost is that other threads see up to 64 chunks of free memory as missing
+    /// while a word is being drained.
     pub(crate) fn drain(&self, mut visit: impl FnMut(Range<usize>)) {
-        for (w, word) in self.words.iter().take(Self::words_for(self.len)).enumerate() {
+        for (w, word) in self.used.iter().take(Self::words_for(self.len)).enumerate() {
             let valid = self.valid_mask(w);
-            let claimed = !word.fetch_or(valid, Ordering::Acquire) & valid;
+            let claimed = !word.fetch_or(valid, Ordering::AcqRel) & valid;
             let mut rest = claimed;
             while rest != 0 {
                 let start = rest.trailing_zeros() as usize;
@@ -157,8 +185,95 @@ impl<'a> Chunks<'a> {
                 rest &= !run_mask(run, start);
             }
             if claimed != 0 {
+                self.purged[w].fetch_or(claimed, Ordering::Relaxed);
+                self.dirty[w].fetch_and(!claimed, Ordering::Relaxed);
                 word.fetch_and(!claimed, Ordering::Release);
             }
+        }
+    }
+
+    /// One pass of the purge clock at time `now` in milliseconds. Free chunks of a word whose
+    /// latest free is at least `delay` old are claimed and handed to `visit` in maximal runs.
+    /// Returns whether free chunks that still hold pages remain, because their word was freed into
+    /// too recently.
+    ///
+    /// Only chunks that this pass has claimed are visited, so `visit` may return their pages to the
+    /// OS without risk to a live allocation. The claims are release operations, so a thread that
+    /// sees a chunk missing because of this pass also sees anything the caller stored before the
+    /// pass began.
+    pub(crate) fn purge_pass(
+        &self,
+        now: u64,
+        delay: u64,
+        mut visit: impl FnMut(Range<usize>),
+    ) -> bool {
+        let mut pending = false;
+        for w in 0..Self::words_for(self.len) {
+            let valid = self.valid_mask(w);
+            if self.dirty[w].load(Ordering::Relaxed) & valid == 0 {
+                continue;
+            }
+            if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < delay {
+                pending |= self.dirty[w].load(Ordering::Relaxed) &
+                    !self.used[w].load(Ordering::Relaxed) &
+                    valid !=
+                    0;
+                continue;
+            }
+            // Claim the dirty chunks that are still free. A dirty chunk in use was reclaimed after
+            // it was freed and becomes dirty again when it is freed.
+            let mut seen = self.used[w].load(Ordering::Relaxed);
+            let claimed = loop {
+                let want = self.dirty[w].load(Ordering::Relaxed) & valid & !seen;
+                if want == 0 {
+                    break 0;
+                }
+                match self.used[w].compare_exchange_weak(
+                    seen,
+                    seen | want,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break want,
+                    Err(actual) => seen = actual,
+                }
+            };
+            let mut rest = claimed;
+            while rest != 0 {
+                let start = rest.trailing_zeros() as usize;
+                let run = (rest >> start).trailing_ones() as usize;
+                visit(w * WORD + start..w * WORD + start + run);
+                rest &= !run_mask(run, start);
+            }
+            if claimed != 0 {
+                self.purged[w].fetch_or(claimed, Ordering::Relaxed);
+                self.dirty[w].fetch_and(!claimed, Ordering::Relaxed);
+                self.used[w].fetch_and(!claimed, Ordering::Release);
+            }
+        }
+        pending
+    }
+
+    /// Hands the purged runs among the `n` chunks from `first`, which the caller has just claimed,
+    /// to `visit`, and records that they are in use again. The caller makes the pages ready for
+    /// reuse where the system needs that.
+    pub(crate) fn take_purged(&self, first: usize, n: usize, mut visit: impl FnMut(Range<usize>)) {
+        let end = first + n;
+        let mut chunk = first;
+        while chunk < end {
+            let (word, offset) = (chunk / WORD, chunk % WORD);
+            let take = (WORD - offset).min(end - chunk);
+            let mask = run_mask(take, offset);
+            if self.purged[word].load(Ordering::Relaxed) & mask != 0 {
+                let mut rest = self.purged[word].fetch_and(!mask, Ordering::Relaxed) & mask;
+                while rest != 0 {
+                    let start = rest.trailing_zeros() as usize;
+                    let run = (rest >> start).trailing_ones() as usize;
+                    visit(word * WORD + start..word * WORD + start + run);
+                    rest &= !run_mask(run, start);
+                }
+            }
+            chunk += take;
         }
     }
 
@@ -171,7 +286,7 @@ impl<'a> Chunks<'a> {
     /// Claims a run of `n <= 64` chunks inside word `w`, preferring the highest start if `highest`
     /// and the lowest otherwise.
     fn claim(&self, w: usize, n: usize, align: usize, highest: bool) -> Option<usize> {
-        let word = &self.words[w];
+        let word = &self.used[w];
         let unusable = !self.valid_mask(w);
         let mut seen = word.load(Ordering::Relaxed);
         loop {
@@ -207,22 +322,22 @@ impl<'a> Chunks<'a> {
 
     /// A cheap, racy pre-check that avoids claiming words that are obviously taken.
     fn looks_free(&self, first: usize, full: usize, rest: usize) -> bool {
-        self.words[first..first + full].iter().all(|w| w.load(Ordering::Relaxed) == 0) &&
+        self.used[first..first + full].iter().all(|w| w.load(Ordering::Relaxed) == 0) &&
             (rest == 0 ||
-                self.words[first + full].load(Ordering::Relaxed) & run_mask(rest, 0) == 0)
+                self.used[first + full].load(Ordering::Relaxed) & run_mask(rest, 0) == 0)
     }
 
     /// Claims `full` whole words and the low `rest` bits of the next, undoing everything if any
     /// of them is taken.
     fn try_claim_span(&self, first: usize, full: usize, rest: usize) -> bool {
-        for (claimed, word) in self.words[first..first + full].iter().enumerate() {
+        for (claimed, word) in self.used[first..first + full].iter().enumerate() {
             if word.compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed).is_err() {
                 self.undo(first, claimed);
                 return false;
             }
         }
         if rest > 0 {
-            let (word, mask) = (&self.words[first + full], run_mask(rest, 0));
+            let (word, mask) = (&self.used[first + full], run_mask(rest, 0));
             let mut seen = word.load(Ordering::Relaxed);
             loop {
                 if seen & mask != 0 {
@@ -246,7 +361,7 @@ impl<'a> Chunks<'a> {
     /// Releases the first `claimed` whole words of a span claim that is being abandoned. The words
     /// are entirely ours, so a plain store is enough.
     fn undo(&self, first: usize, claimed: usize) {
-        for word in &self.words[first..first + claimed] {
+        for word in &self.used[first..first + claimed] {
             word.store(0, Ordering::Release);
         }
     }
@@ -368,6 +483,65 @@ mod test {
     }
 
     #[test]
+    fn chunks_are_purged_once_their_word_has_been_quiet_for_the_delay() {
+        let bitmap = Bitmap::new(8);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(4, 1, 0).unwrap();
+        chunks.free_at(first, 4, 100);
+        assert!(chunks.purge_pass(105, 10, |_| panic!("too early")), "the chunks are waiting");
+        let mut purged = Vec::new();
+        assert!(!chunks.purge_pass(110, 10, |run| purged.push(run)));
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0], first..first + 4);
+        assert_eq!(chunks.free_chunks(), 8, "purging gives the chunks back");
+        chunks.purge_pass(1000, 10, |_| panic!("purged chunks are not purged again"));
+    }
+
+    #[test]
+    fn a_later_free_into_the_word_delays_the_purge_of_all_of_it() {
+        let bitmap = Bitmap::new(8);
+        let chunks = bitmap.chunks();
+        let a = chunks.alloc(1, 1, 0).unwrap();
+        let b = chunks.alloc(1, 1, 0).unwrap();
+        chunks.free_at(a, 1, 100);
+        chunks.free_at(b, 1, 108);
+        chunks.purge_pass(112, 10, |_| panic!("the word was freed into at 108"));
+        let mut purged = Vec::new();
+        chunks.purge_pass(118, 10, |run| purged.push(run));
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0], a..b + 1);
+    }
+
+    #[test]
+    fn a_chunk_that_is_in_use_is_never_purged() {
+        let bitmap = Bitmap::new(8);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(1, 1, 0).unwrap();
+        chunks.free_at(first, 1, 100);
+        assert_eq!(chunks.alloc(1, 1, 0), Some(first));
+        chunks.purge_pass(1000, 10, |_| panic!("the chunk is in use"));
+        chunks.free_at(first, 1, 1000);
+        let mut purged = Vec::new();
+        chunks.purge_pass(1010, 10, |run| purged.push(run));
+        assert_eq!(purged.len(), 1);
+    }
+
+    #[test]
+    fn claiming_purged_chunks_reports_each_run_once() {
+        let bitmap = Bitmap::new(8);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(8, 1, 0).unwrap();
+        chunks.free_at(first, 8, 0);
+        chunks.purge_pass(10, 10, |_| ());
+        assert_eq!(chunks.alloc(3, 1, 0), Some(5), "runs of several chunks come from the top");
+        let mut reported = Vec::new();
+        chunks.take_purged(5, 3, |run| reported.push(run));
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0], 5..8);
+        chunks.take_purged(5, 3, |_| panic!("already reported"));
+    }
+
+    #[test]
     fn requests_larger_than_the_region_fail() {
         let bitmap = Bitmap::new(100);
         assert_eq!(bitmap.chunks().alloc(101, 1, 0), None);
@@ -416,7 +590,9 @@ mod test {
         let mut model = ChunkModel::new(300);
         let mut rng = Rng::new(42);
         for _ in 0..iterations(20_000) {
-            if model.live() == 0 || rng.below(100) < 55 {
+            if rng.below(100) < 4 {
+                model.purge(rng.below(12) as u64);
+            } else if model.live() == 0 || rng.below(100) < 55 {
                 let (n, align) = match rng.below(7) {
                     0..=2 => (1, 1),
                     3 => (8, 8),
@@ -488,6 +664,44 @@ mod loom_test {
             let got = claimer.join().unwrap();
             // Either the claim ran before the free and failed, or after it and won the chunk.
             assert_eq!(bitmap.chunks().free_chunks(), usize::from(got.is_none()));
+        });
+    }
+
+    #[test]
+    fn a_purge_pass_never_takes_a_chunk_that_a_claim_won() {
+        use loom::sync::atomic::{AtomicBool, Ordering};
+
+        loom::model(|| {
+            let bitmap = Arc::new(Bitmap::new(2));
+            let held = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            // Both chunks have been free for longer than the delay when the race starts.
+            assert_eq!(bitmap.chunks().alloc(2, 1, 0), Some(0));
+            bitmap.chunks().free_at(0, 2, 0);
+
+            let purger = {
+                let (bitmap, held) = (bitmap.clone(), held.clone());
+                thread::spawn(move || {
+                    bitmap.chunks().purge_pass(100, 10, |run| {
+                        for chunk in run {
+                            assert!(!held[chunk].load(Ordering::SeqCst), "purged a chunk in use");
+                        }
+                    });
+                })
+            };
+            let claimer = {
+                let (bitmap, held) = (bitmap.clone(), held);
+                thread::spawn(move || {
+                    // The pass may hold both chunks at this moment, so the claim can fail.
+                    let chunk = bitmap.chunks().alloc(1, 1, 0);
+                    if let Some(chunk) = chunk {
+                        held[chunk].store(true, Ordering::SeqCst);
+                    }
+                    chunk
+                })
+            };
+            purger.join().unwrap();
+            let claimed = claimer.join().unwrap();
+            assert_eq!(bitmap.chunks().free_chunks(), 2 - usize::from(claimed.is_some()));
         });
     }
 

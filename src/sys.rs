@@ -3,13 +3,14 @@
 //! The allocator manages one large mapping that it reserves at start-up. Everything it needs from
 //! the OS is a handful of calls on that mapping, and Linux and macOS differ in only a few of them.
 //!
-//! | Operation       | Linux                             | macOS                         |
-//! | --------------- | --------------------------------- | ----------------------------- |
-//! | [`reserve`]     | `mmap` with `MAP_NORESERVE`       | `mmap` with `MAP_NORESERVE`   |
-//! | [`advise_huge`] | `madvise(MADV_HUGEPAGE)`          | nothing, there is no THP      |
-//! | [`populate`]    | `MADV_POPULATE_WRITE`, else touch | touch every page              |
-//! | [`lock`]        | `mlock`                           | `mlock`                       |
-//! | [`discard`]     | `MADV_DONTNEED`, reads as zeros   | `MADV_FREE`, lazy, not zeroed |
+//! | Operation       | Linux                             | macOS                              |
+//! | --------------- | --------------------------------- | ---------------------------------- |
+//! | [`reserve`]     | `mmap` with `MAP_NORESERVE`       | `mmap` with `MAP_NORESERVE`        |
+//! | [`advise_huge`] | `madvise(MADV_HUGEPAGE)`          | nothing, there is no THP           |
+//! | [`populate`]    | `MADV_POPULATE_WRITE`, else touch | touch every page                   |
+//! | [`lock`]        | `mlock`                           | `mlock`                            |
+//! | [`discard`]     | `MADV_DONTNEED`, reads as zeros   | `MADV_FREE_REUSABLE`, not zeroed   |
+//! | [`reuse`]       | nothing                           | `MADV_FREE_REUSE`                  |
 //!
 //! A reservation is ordinary read-write anonymous memory that the kernel only backs with physical
 //! pages when they are first touched. Reserving tens of gigabytes therefore costs address space and
@@ -131,13 +132,39 @@ pub(crate) unsafe fn discard(ptr: NonNull<u8>, len: usize) {
     {
         #[cfg(target_os = "linux")]
         const ADVICE: libc::c_int = libc::MADV_DONTNEED;
+        // The reusable advice takes the pages out of the process's footprint at once, where the
+        // plain free advice waits for memory pressure. It must be undone by [`reuse`].
         #[cfg(target_os = "macos")]
-        const ADVICE: libc::c_int = libc::MADV_FREE;
+        const ADVICE: libc::c_int = libc::MADV_FREE_REUSABLE;
         // SAFETY: forwarded from the caller.
         unsafe { libc::madvise(ptr.as_ptr().cast(), len, ADVICE) };
     }
     #[cfg(miri)]
     let _ = (ptr, len);
+}
+
+/// Prepares pages that [`discard`] gave back for use again. Linux needs nothing, because the pages
+/// come back zeroed on first touch. On macOS this restores the accounting of the pages.
+///
+/// # Safety
+///
+/// The range must lie within a live reservation and belong to the caller.
+pub(crate) unsafe fn reuse(ptr: NonNull<u8>, len: usize) {
+    #[cfg(all(target_os = "macos", not(miri)))]
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_FREE_REUSE);
+    }
+    #[cfg(not(all(target_os = "macos", not(miri))))]
+    let _ = (ptr, len);
+}
+
+/// A monotonic clock in milliseconds.
+pub(crate) fn monotonic_ms() -> u64 {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: the pointer is valid for the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
 }
 
 #[cfg(test)]

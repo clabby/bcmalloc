@@ -34,9 +34,13 @@ use crate::{
     heap::{Heap, HeapData},
     size_class::{Class, Request, classify},
     slab::{Block, Slab},
-    sync::{AtomicU64, AtomicUsize, Ordering},
+    sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sys,
 };
+
+/// How often the purge clock ticks, in milliseconds, and how long free chunks must have gone
+/// unused before they go back to the OS.
+const PURGE_INTERVAL_MS: u64 = 10;
 
 /// The alignment of the managed memory, which is the size of the largest slab.
 const SLAB_ALIGN: usize = 64 * CHUNK_SIZE;
@@ -89,6 +93,12 @@ pub struct Region<'a> {
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
+    /// When the purge clock next ticks, in milliseconds on the monotonic clock.
+    next_purge: AtomicU64,
+    /// Whether any free chunk may still be waiting to be purged or to age towards it.
+    aging: AtomicBool,
+    /// How many purge passes and trims are holding free chunks, which makes them look allocated.
+    purging: AtomicUsize,
 }
 
 // SAFETY: the raw pointer is an address into memory the region owns, and every shared structure
@@ -120,6 +130,9 @@ impl<'a> Region<'a> {
             slabs,
             heaps,
             claimed_mark: AtomicUsize::new(0),
+            next_purge: AtomicU64::new(0),
+            aging: AtomicBool::new(false),
+            purging: AtomicUsize::new(0),
         }
     }
 
@@ -152,7 +165,8 @@ impl<'a> Region<'a> {
             // SAFETY: forwarded.
             Some(Request::Small(class)) => unsafe { self.free_remote(ptr, class) },
             Some(Request::Huge { chunks }) => {
-                self.chunks.free(self.chunk_index(ptr.as_ptr()), chunks)
+                self.free_chunks(self.chunk_index(ptr.as_ptr()), chunks);
+                self.purge_if_due();
             }
             None => debug_assert!(false, "layout was never allocated by this region"),
         }
@@ -173,6 +187,7 @@ impl<'a> Region<'a> {
                 data.release_claim();
             }
         }
+        self.purging.fetch_add(1, Ordering::Release);
         self.chunks.drain(|run| {
             // SAFETY: the run is free and held by the drain while we advise on it.
             unsafe {
@@ -180,6 +195,7 @@ impl<'a> Region<'a> {
                 sys::discard(start, run.len() << CHUNK_SHIFT);
             }
         });
+        self.purging.fetch_sub(1, Ordering::Release);
     }
 
     /// A snapshot of how full the region is.
@@ -198,8 +214,87 @@ impl<'a> Region<'a> {
         offset < self.chunks.len() << CHUNK_SHIFT
     }
 
-    pub(crate) const fn chunks(&self) -> &Chunks<'a> {
-        &self.chunks
+    /// Claims `n` chunks as `Chunks`::alloc does, and makes the pages of any that were given back
+    /// to the OS ready for use.
+    pub(crate) fn alloc_chunks(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
+        let first = match self.chunks.alloc(n, align, hint) {
+            Some(first) => first,
+            None => {
+                // Free chunks that a purge pass holds look allocated for a moment. Wait for the
+                // pass to finish and look again before reporting that the region is full.
+                if self.purging.load(Ordering::Acquire) == 0 {
+                    return None;
+                }
+                while self.purging.load(Ordering::Acquire) != 0 {
+                    core::hint::spin_loop();
+                }
+                self.chunks.alloc(n, align, hint)?
+            }
+        };
+        self.chunks.take_purged(first, n, |run| {
+            // SAFETY: the run is inside the region and belongs to us since the claim above.
+            unsafe {
+                sys::reuse(
+                    NonNull::new_unchecked(self.chunk_ptr(run.start)),
+                    run.len() << CHUNK_SHIFT,
+                );
+            }
+        });
+        Some(first)
+    }
+
+    /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge.
+    pub(crate) fn free_chunks(&self, first: usize, n: usize) {
+        self.chunks.free_at(first, n, sys::monotonic_ms());
+        self.aging.store(true, Ordering::Relaxed);
+    }
+
+    /// Runs the purge clock if free chunks are ageing and an interval has passed. Chunks that stay
+    /// free for one to two intervals go back to the OS. This is called from paths that are already
+    /// slow, so that an idle program pays nothing and a busy one pays a clock read now and then.
+    #[inline]
+    pub(crate) fn purge_if_due(&self) {
+        if self.aging.load(Ordering::Relaxed) {
+            self.purge_when_due();
+        }
+    }
+
+    #[cold]
+    fn purge_when_due(&self) {
+        let now = sys::monotonic_ms();
+        let due = self.next_purge.load(Ordering::Relaxed);
+        let won = now >= due &&
+            self.next_purge
+                .compare_exchange(
+                    due,
+                    now + PURGE_INTERVAL_MS,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok();
+        if won {
+            self.purge_pass(now);
+        }
+    }
+
+    /// One tick of the purge clock at time `now` in milliseconds.
+    pub(crate) fn purge_pass(&self, now: u64) {
+        // Clear the flag first so that a free that races with the pass sets it again.
+        self.aging.store(false, Ordering::Relaxed);
+        self.purging.fetch_add(1, Ordering::Release);
+        let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
+            // SAFETY: the pass holds the run, so no allocation overlaps it.
+            unsafe {
+                sys::discard(
+                    NonNull::new_unchecked(self.chunk_ptr(run.start)),
+                    run.len() << CHUNK_SHIFT,
+                );
+            }
+        });
+        self.purging.fetch_sub(1, Ordering::Release);
+        if pending {
+            self.aging.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The descriptor stored for the slab whose first chunk is chunk `first`.
@@ -276,7 +371,7 @@ impl Geometry {
         let slabs_at = heaps_at.checked_add(heaps.checked_mul(mem::size_of::<HeapData>())?)?;
         let words_at = slabs_at.checked_add(chunks.checked_mul(mem::size_of::<Slab>())?)?;
         let words_end =
-            words_at.checked_add(Chunks::words_for(chunks) * mem::size_of::<AtomicU64>())?;
+            words_at.checked_add(Chunks::storage_words(chunks) * mem::size_of::<AtomicU64>())?;
         let data = words_end.checked_next_multiple_of(SLAB_ALIGN)?;
         let total = data.checked_add(chunks.checked_mul(CHUNK_SIZE)?)?;
         Some(Self { heaps: heaps_at, slabs: slabs_at, words: words_at, data, total })
@@ -338,7 +433,7 @@ impl Mapping {
             let slabs = slice::from_raw_parts(at(geometry.slabs).cast::<Slab>(), chunks);
             let words = slice::from_raw_parts(
                 at(geometry.words).cast::<AtomicU64>(),
-                Chunks::words_for(chunks),
+                Chunks::storage_words(chunks),
             );
             let region = Region::from_parts(at(geometry.data), words, chunks, slabs, heap_slots);
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
@@ -431,6 +526,32 @@ mod test {
         let layout = Layout::from_size_align(512 << 10, 64 << 10).unwrap();
         let blocks: std::vec::Vec<_> = (0..4).map(|_| heap.alloc(layout).unwrap()).collect();
         assert!(blocks.iter().all(|block| block.as_ptr().addr() % (512 << 10) == 0));
+    }
+
+    #[test]
+    fn allocation_never_fails_because_a_purge_pass_holds_the_free_chunks() {
+        use crate::testing::{TestRegion, iterations};
+
+        // Two threads hold at most two of the four chunks, so two are always free. A pass that
+        // holds both for a moment must not make an allocation report that the region is full.
+        let test = TestRegion::new(4, 1);
+        let region = test.region();
+        let rounds = iterations(20_000);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..rounds {
+                        let chunk = region.alloc_chunks(1, 1, 0).expect("a chunk is free");
+                        region.free_chunks(chunk, 1);
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..rounds {
+                    region.purge_pass(u64::MAX);
+                }
+            });
+        });
     }
 
     #[test]

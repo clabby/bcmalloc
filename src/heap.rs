@@ -575,6 +575,7 @@ impl HeapData {
     /// hands out its first block.
     #[cold]
     unsafe fn alloc_slow(&self, region: &Region<'_>, class: Class) -> *mut u8 {
+        region.purge_if_due();
         loop {
             if !self.shared.unfull.load(Ordering::Relaxed).is_null() {
                 // SAFETY: the caller holds the claim.
@@ -605,7 +606,7 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let Some(first) = region.chunks().alloc(chunks, chunks, self.private.cursor.get()) else {
+        let Some(first) = region.alloc_chunks(chunks, chunks, self.private.cursor.get()) else {
             return false;
         };
         let slab = region.slab(first);
@@ -714,7 +715,8 @@ impl HeapData {
     fn release(&self, region: &Region<'_>, slab: Owned<'_>) {
         self.unlink(slab);
         let first = region.chunk_index(slab.start());
-        region.chunks().free(first, slab.class().slab_chunks());
+        region.free_chunks(first, slab.class().slab_chunks());
+        region.purge_if_due();
         // Prefer the lowest free word next time, so slabs stay packed towards the bottom.
         self.private.cursor.set(self.private.cursor.get().min(first / 64));
     }
@@ -783,7 +785,7 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
-        region.chunks().alloc(chunks, 1, 0).map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
+        region.alloc_chunks(chunks, 1, 0).map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
     }
 
     /// Moves a slab to the full list, or to the back of the active list.

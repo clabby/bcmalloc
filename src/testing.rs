@@ -67,7 +67,7 @@ pub(crate) struct Bitmap {
 impl Bitmap {
     /// Storage that tracks `len` chunks, all free.
     pub(crate) fn new(len: usize) -> Self {
-        let words = (0..Chunks::words_for(len)).map(|_| AtomicU64::new(0)).collect();
+        let words = (0..Chunks::storage_words(len)).map(|_| AtomicU64::new(0)).collect();
         Self { words, len }
     }
 
@@ -134,7 +134,7 @@ impl TestRegion {
     pub fn new(chunks: usize, heaps: usize) -> Self {
         assert!(chunks > 0, "a region needs at least one chunk");
         Self {
-            words: (0..Chunks::words_for(chunks)).map(|_| AtomicU64::new(0)).collect(),
+            words: (0..Chunks::storage_words(chunks)).map(|_| AtomicU64::new(0)).collect(),
             slabs: (0..chunks).map(|_| Slab::new()).collect(),
             heaps: (0..heaps).map(|_| HeapData::new()).collect(),
             memory: Buffer::new(chunks << CHUNK_SHIFT),
@@ -430,12 +430,28 @@ pub(crate) struct ChunkModel {
     bitmap: Bitmap,
     taken: Vec<bool>,
     live: Vec<(usize, usize)>,
+    /// Whether the chunk has ever been handed out, which is what makes it worth purging.
+    touched: Vec<bool>,
+    /// Whether a purge pass has given the chunk's pages back and nobody has claimed it since.
+    purged: Vec<bool>,
+    /// The clock of the model, in milliseconds, advanced by the purge passes.
+    now: u64,
+    /// The latest time that a chunk of each 64-chunk word was freed.
+    stamps: Vec<u64>,
 }
 
 impl ChunkModel {
     /// A model of `len` free chunks.
     pub(crate) fn new(len: usize) -> Self {
-        Self { bitmap: Bitmap::new(len), taken: std::vec![false; len], live: Vec::new() }
+        Self {
+            bitmap: Bitmap::new(len),
+            taken: std::vec![false; len],
+            live: Vec::new(),
+            touched: std::vec![false; len],
+            purged: std::vec![false; len],
+            now: 0,
+            stamps: std::vec![0; len.div_ceil(64)],
+        }
     }
 
     /// How many runs are live.
@@ -454,7 +470,19 @@ impl ChunkModel {
                 assert!(first + n <= self.taken.len(), "run is out of bounds");
                 assert!(self.taken[first..first + n].iter().all(|taken| !taken), "runs overlap");
                 self.taken[first..first + n].fill(true);
+                self.touched[first..first + n].fill(true);
                 self.live.push((first, n));
+                // Every purged chunk of the run must be reported, once.
+                let mut reported = Vec::new();
+                self.bitmap.chunks().take_purged(first, n, |run| reported.extend(run));
+                for (chunk, purged) in (first..first + n).zip(&mut self.purged[first..first + n]) {
+                    assert_eq!(
+                        reported.contains(&chunk),
+                        *purged,
+                        "chunk {chunk} was reported as purged wrongly"
+                    );
+                    *purged = false;
+                }
             }
             None => assert!(!self.has_room(n, align), "refused {n} chunks although they fit"),
         }
@@ -468,10 +496,43 @@ impl ChunkModel {
             return false;
         }
         let (first, n) = self.live.swap_remove(victim % self.live.len());
-        self.bitmap.chunks().free(first, n);
+        self.now += 1;
+        self.bitmap.chunks().free_at(first, n, self.now);
         self.taken[first..first + n].fill(false);
+        for word in first / 64..=(first + n - 1) / 64 {
+            self.stamps[word] = self.now;
+        }
         self.check();
         true
+    }
+
+    /// Runs one purge pass after advancing the clock by `elapsed` milliseconds, and checks that it
+    /// takes exactly the free, used chunks of words that have been quiet for the delay, and never a
+    /// chunk that is in use. Returns how many it took.
+    pub(crate) fn purge(&mut self, elapsed: u64) -> usize {
+        const DELAY: u64 = 5;
+        self.now += elapsed;
+        let mut visited = Vec::new();
+        let pending = self.bitmap.chunks().purge_pass(self.now, DELAY, |run| visited.extend(run));
+        let mut expected = 0;
+        for chunk in 0..self.taken.len() {
+            let dirty = !self.taken[chunk] && self.touched[chunk] && !self.purged[chunk];
+            let quiet = self.now.saturating_sub(self.stamps[chunk / 64]) >= DELAY;
+            assert_eq!(
+                visited.contains(&chunk),
+                dirty && quiet,
+                "chunk {chunk} was purged at the wrong time"
+            );
+            if dirty && quiet {
+                self.purged[chunk] = true;
+                expected += 1;
+            }
+        }
+        let waiting = (0..self.taken.len())
+            .any(|chunk| !self.taken[chunk] && self.touched[chunk] && !self.purged[chunk]);
+        assert_eq!(pending, waiting, "the pass misreports whether chunks are still waiting");
+        self.check();
+        expected
     }
 
     /// Whether a run of `n` chunks could be placed. Runs of up to 64 chunks stay inside one
@@ -502,7 +563,11 @@ pub fn run_chunk_ops(data: &[u8]) {
 /// Runs chunk operations read from `bytes` until they run out.
 fn interpret_chunks(model: &mut ChunkModel, bytes: &mut impl Iterator<Item = usize>) -> Option<()> {
     loop {
-        if bytes.next()? % 3 != 0 {
+        let op = bytes.next()? % 7;
+        if op == 6 {
+            let elapsed = bytes.next()? % 12;
+            model.purge(elapsed as u64);
+        } else if op < 4 {
             let n = match bytes.next()? % 4 {
                 0 => 1,
                 1 => 1 + bytes.next()? % 20,

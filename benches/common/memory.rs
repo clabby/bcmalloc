@@ -13,8 +13,10 @@ const SETTLE: Duration = Duration::from_millis(400);
 /// they are being used get the chance, and waits again.
 fn settle() {
     thread::sleep(SETTLE);
-    for _ in 0..10_000 {
-        drop(Block::new(64));
+    // A running program touches many size classes, which is what makes a lazy allocator look at
+    // its free memory.
+    for i in 0..10_000 {
+        drop(Block::new(16 << (i % 12)));
     }
     thread::sleep(SETTLE);
 }
