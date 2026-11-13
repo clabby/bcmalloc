@@ -1,0 +1,57 @@
+[package]
+name = "cwmalloc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A scalable global allocator that reserves its memory up front, for long-lived, highly concurrent programs."
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["allocator", "malloc", "global-allocator", "lock-free", "no-std"]
+categories = ["memory-management", "concurrency", "no-std"]
+exclude = ["/assets", "/fuzz", "/.github"]
+
+[features]
+default = [ "std" ]
+# Enables the `#[global_allocator]` front end, which needs thread-local storage from `std`.
+std = [ "libc/std" ]
+# Exposes the model-checking helpers in `cwmalloc::testing` (used by the fuzz targets).
+testing = [ "std" ]
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+mimalloc = "0.1"
+snmalloc-rs = "0.3"
+tikv-jemallocator = "0.6"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unnameable_types = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[lints.rustdoc]
+all = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+missing_const_for_fn = "warn"
+use_self = "warn"
+option_if_let_else = "warn"
+redundant_clone = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = "line-tables-only"
+
+[profile.bench]
+debug = "line-tables-only"

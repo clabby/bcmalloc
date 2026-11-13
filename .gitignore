@@ -1,0 +1,9 @@
+# Build output
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
+# macOS
+.DS_Store
