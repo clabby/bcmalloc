@@ -1,8 +1,8 @@
 //! A slab, which is a run of chunks carved into equal blocks of one size class.
 //!
 //! Every slab has a descriptor, kept outside the slab so that user memory is never metadata. The
-//! descriptor has two halves on separate cache lines. One half is state that only the owning heap
-//! touches. The other is state that any thread may touch to free a block.
+//! descriptor has two halves, each on cache lines of its own. One half is state that only the
+//! owning heap touches. The other is state that any thread may touch to free a block.
 //!
 //! ```text
 //!   slab memory, one size class (64-byte blocks here)
@@ -11,18 +11,19 @@
 //!   +-------+-------+-------+-------+-------+-------+-------+-------+--------------+
 //!   0                                             bumped --^                capacity
 //!
-//!   descriptor, cache line 1 (owner only)      descriptor, cache line 2 (shared)
+//!   descriptor, owner only                     descriptor, shared
 //!   +-------------------------------------+    +---------------------------------+
 //!   | free       -> block -> block -> nil |    | remote -> block -> block -> nil |
 //!   | local_free -> block -> nil          |    |           + FULL and QUEUED     |
-//!   | used, bumped, capacity, class       |    | owner, notified                 |
-//!   | next, prev, list                    |    +---------------------------------+
+//!   | free_len, local_count, bumped       |    | owner, notified                 |
+//!   | capacity, class, next, prev, list   |    +---------------------------------+
 //!   +-------------------------------------+
 //! ```
 //!
 //! # Free lists
 //!
-//! `free` is the list the allocator pops from, and popping it takes no atomics. `local_free`
+//! `free` holds the blocks for the next refill of the heap's hot list, which takes the whole list
+//! at once. The slab keeps the length of each list, so it never walks one to count it. `local_free`
 //! collects blocks freed by the owning thread. It is spliced into `free` when `free` runs dry, so
 //! the fast path never has to look at it. `remote` collects blocks freed by other threads. It is a
 //! push-only atomic stack that the owner empties in one swap, so it cannot suffer the ABA problem

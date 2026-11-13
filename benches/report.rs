@@ -1,6 +1,6 @@
 //! Runs every workload under every allocator and prints the comparison as Markdown.
 //!
-//! Usage is  cargo bench --bench report -- [options]  with these options.
+//! Usage is  cargo bench --bench report with these options after two dashes.
 //!
 //! | Option           | Effect                                                                  |
 //! | ---------------- | ----------------------------------------------------------------------- |

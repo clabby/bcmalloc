@@ -2,7 +2,7 @@
 
 <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.100%2B-orange.svg" alt="Rust 1.100+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
 
-A global allocator for long-lived, highly concurrent Rust programs. It reserves one region of address space up front and serves small blocks from thread-local heaps without atomic operations. A free from another thread costs one compare-and-swap. Memory freed by one size class is reused by every other, and the capacity you configure is a hard limit.
+A global allocator for long-lived, highly concurrent Rust programs. It reserves one region of address space up front and serves small blocks from thread-local heaps without atomic operations. A free from another thread costs one compare-and-swap. Memory freed by one size class is reused by every other, memory that stays idle goes back to the operating system, and the capacity you configure is a hard limit.
 
 Usage is one line. The region is reserved the first time anything allocates.
 
@@ -72,29 +72,32 @@ If the operating system refuses the default reservation, the global allocator re
 
 ## Benchmarks
 
-Millions of operations per second, and MiB for the last row. Each figure is the best of five runs on an Apple M4 Max with macOS 26.5 and Rust 1.100. The system allocator is macOS libmalloc. Run `just bench` to reproduce them.
+The suite has 43 workloads in eight groups, including producer and consumer rings, Larson, false sharing, standard collections, resizing and large blocks. Every workload runs in a fresh process, three times per allocator in a rotating order, and the best run counts. The table shows the geometric mean of each group relative to mimalloc, so above 1.00 is better for speed and for memory alike. The numbers come from an Apple M4 Max with macOS 26.5 and Rust 1.100, and the system allocator is macOS libmalloc. Run ~just bench~ to reproduce them.
 
-| Workload                      | system     | bcmalloc | mimalloc  | jemalloc   | snmalloc  |
-| ----------------------------- | ---------- | -------- | --------- | ---------- | --------- |
-| single-thread churn           | 36.6       | 63.5     | **122.4** | 112.3      | 119.1     |
-| 4-thread churn                | 39.7       | 230.9    | **462.3** | 435.9      | 341.2     |
-| 8-thread churn                | 64.8       | 393.2    | 594.7     | **841.0**  | 579.8     |
-| 16-thread churn               | 108.7      | 637.4    | 927.2     | **1192.2** | 810.9     |
-| 1-pair cross-thread free      | 29.4       | 35.9     | 25.4      | **61.9**   | 44.9      |
-| 4-pair cross-thread free      | 63.3       | 75.7     | 68.9      | **168.7**  | 129.7     |
-| vec growth                    | **1354.4** | 665.0    | 657.5     | 1252.3     | 858.9     |
-| binary trees                  | 66.0       | 109.2    | 123.6     | 59.3       | **139.1** |
-| large blocks                  | 0.2        | **0.2**  | 0.2       | 0.0        | 0.0       |
-| peak memory (lower is better) | 863.5      | 61.6     | 90.2      | **47.1**   | 66.5      |
+| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
+| ---------------------- | ------ | -------- | -------- | -------- | -------- |
+| speed, pair            | 0.47   | 2.18     | 1.00     | 0.65     | 0.73     |
+| speed, bulk            | 0.25   | 1.45     | 1.00     | 0.39     | 0.62     |
+| speed, churn           | 0.23   | 2.25     | 1.00     | 1.28     | 1.32     |
+| speed, sharing         | 0.54   | 1.91     | 1.00     | 2.00     | 1.43     |
+| speed, false sharing   | 0.49   | 1.00     | 1.00     | 1.00     | 1.00     |
+| speed, collections     | 0.61   | 1.21     | 1.00     | 0.66     | 1.09     |
+| speed, resizing        | 0.98   | 0.92     | 1.00     | 0.99     | 0.88     |
+| speed, large           | 0.94   | 1.16     | 1.00     | 0.15     | 0.14     |
+| speed, all workloads   | 0.46   | 1.64     | 1.00     | 0.86     | 0.92     |
+| speed, mean of groups  | 0.50   | 1.43     | 1.00     | 0.71     | 0.76     |
+| memory held afterwards | 3.45   | 9.59     | 1.00     | 1.07     | 6.88     |
+| peak resident memory   | 1.12   | 1.10     | 1.00     | 1.03     | 1.14     |
 
-bcmalloc is ahead of the system allocator on every row except vec growth and uses less memory than mimalloc. It is within a factor of 2.3 of the fastest allocator on every throughput row. It is slowest relative to the others on blocks between 512 B and 2 KiB spread over many slabs. DESIGN.md explains where the time goes.
+bcmalloc is the fastest allocator on 32 of the 43 workloads and within 5% of the fastest on three more. jemalloc is ahead when threads free blocks that other threads allocated, which covers the rings, the channels and the shared table, and when a single vector grows to millions of elements. mimalloc is ahead on random reallocation. After a 256 MiB burst is freed, bcmalloc holds 2.8 MiB, where mimalloc holds 261 and jemalloc 222. DESIGN.md has the full results, the eight losses, and the directions we would take next.
 
 ## Limits
 
 - Alignments above 64 KiB are refused, and the allocation fails.
 - A thread that finds all `max_heaps` heaps taken fails its allocations, which aborts the program.
 - The capacity is a hard limit. Nothing grows the region after start-up.
-- Linux and macOS are supported. Windows is not.
+- Linux and macOS are supported. Windows is not. Nothing has been run on Linux yet.
+- The standard library's `Allocator` trait needs Rust 1.100 or later, which is the minimum supported version.
 
 ## Testing
 

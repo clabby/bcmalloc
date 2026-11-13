@@ -1,6 +1,6 @@
 # How bcmalloc works
 
-**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions, and a free from another thread is one compare-and-swap. On an Apple M4 Max it allocates small blocks faster than mimalloc and jemalloc (144 against 121 and 131 million operations per second), and it uses less memory than mimalloc on our mixed benchmark (62 against 90 MiB). It is two to three times slower than the best allocator on blocks of 512 B to 2 KiB, and that is the first thing we would tune. This post walks through the design, the tests that keep it honest, and the numbers.
+**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions and without touching the slab it came from. On an Apple M4 Max it is the fastest of five allocators on 32 of 43 workloads, and 1.64 times faster than mimalloc by geometric mean (1.43 times when each of eight kinds of workload counts once). jemalloc is still faster when threads free each other's blocks and when one huge vector grows. bcmalloc returns idle memory to the operating system on a timer, so after a 256 MiB burst is freed it holds 2.8 MiB where mimalloc holds 261. This post walks through the design, the tests that keep it honest, the numbers, and the directions we think are worth taking next.
 
 ## 1. Introduction
 
@@ -28,7 +28,7 @@ The whole thing has five layers, and each one is small.
 
 ![Threads sit on heaps, heaps own slabs, slabs are runs of chunks, chunks live in one bitmap, and the bitmap describes one reservation](assets/layers.svg)
 
-**Figure 1.** The layers. A thread owns a heap, a heap owns slabs grouped by size class, and a slab is a run of 64 KiB chunks. A bitmap with one bit per chunk says which chunks are in use. Everything lives in one mapping.
+**Figure 1.** The layers. A thread owns a heap, a heap owns slabs grouped by size class, and a slab is a run of 64 KiB chunks. Bitmaps with one bit per chunk say which chunks are in use and which are idle. Everything lives in one mapping.
 
 ## 3. The region
 
@@ -38,19 +38,20 @@ The mapping holds the allocator's own metadata and the memory it hands out, laid
 
 ![A memory map of the reservation with its header, heap slots, slab descriptors, bitmap and chunks, and the arithmetic that turns a pointer into a descriptor](assets/region-map.svg)
 
-**Figure 2.** The reservation. The metadata is about 0.2% of the region. A pointer finds its slab descriptor with a subtraction, a shift and a mask.
+**Figure 2.** The reservation. The metadata is about 0.4% of the region. A pointer finds its slab descriptor with a subtraction, a shift and a mask.
 
 We did not start here. The first prototype was a `static` array, which is the obvious way to get a fixed heap. It works for small sizes and then falls over. A zeroed static of 6 GiB did not finish compiling in the several minutes we gave it, because the compiler evaluates the array. Reserving at run time with `mmap` has no such limit, and a test in the crate allocates 5 GiB from an 8 GiB region.
 
-Two parts of the OS interface differ between the supported platforms, and the platform layer hides both.
+A few parts of the OS interface differ between the supported platforms, and the platform layer hides them.
 
-| Operation | Linux                           | macOS                       |
-| --------- | ------------------------------- | --------------------------- |
-| reserve   | mmap with MAP_NORESERVE         | mmap with MAP_NORESERVE     |
-| huge page | madvise MADV_HUGEPAGE           | none, there is no THP       |
-| populate  | MADV_POPULATE_WRITE, else touch | touch every page            |
-| lock      | mlock                           | mlock                       |
-| discard   | MADV_DONTNEED, reads back zeros | MADV_FREE, lazy, not zeroed |
+| Operation | Linux                           | macOS                          |
+| --------- | ------------------------------- | ------------------------------ |
+| reserve   | mmap with MAP_NORESERVE         | mmap with MAP_NORESERVE        |
+| huge page | madvise MADV_HUGEPAGE           | none, there is no THP          |
+| populate  | MADV_POPULATE_WRITE, else touch | touch every page               |
+| lock      | mlock                           | mlock                          |
+| discard   | MADV_DONTNEED, reads back zeros | MADV_FREE_REUSABLE, not zeroed |
+| reuse     | nothing                         | MADV_FREE_REUSE                |
 
 The configuration decides how eager to be. `Commit::Lazy` touches nothing. `Commit::Populate` backs every page before the first allocation, and `Commit::Lock` also pins them. With those, a program can ask for TigerBeetle's posture directly. The memory is resident from the start, there are no page faults on the allocation path, and the capacity is a hard limit.
 
@@ -96,19 +97,27 @@ The slab is also what makes memory come back. A slab whose blocks are all free r
 
 ## 6. Heaps and the fast path
 
-A heap is a thread's private view of the region. For each size class it keeps a list of slabs that have room and a list of slabs that are full. Allocating pops the free list of the front slab. That is the entire fast path, and it uses no atomics.
+A heap is a thread's private view of the region. For each size class it keeps a hot list of blocks, a list of slabs that have room and a list of slabs that are full. Allocating pops the hot list. That is the entire fast path. It uses no atomics and it does not read the slab the block belongs to.
+
+Getting to that pop takes a handful of instructions and we counted them. A request of up to 8 KiB with the usual alignment goes through a table indexed by its size in 16 byte steps, which gives the size class in one load. The thread's heap comes from a slot in the thread's key table. On Apple silicon the allocator reads that slot directly through the thread pointer register, which is the load that the system's own routine does, without the call. The standard thread-local costs a call into the dynamic loader there, and removing it roughly doubled the speed of the smallest blocks. When the allocator creates its key it stores a marker through the public interface and reads it back through the register, and it refuses the key if the two disagree, so a change in the operating system's layout shows up as a failed allocation and not as corruption. Everywhere else the heap sits in an ordinary thread-local, and a key destructor gives the heap back when the thread exits.
 
 A slab has three lists and a frontier.
 
 ![A row of blocks in a slab with the free, local_free and remote lists threaded through them, and the descriptor split across two cache lines](assets/slab.svg)
 
-**Figure 6.** Anatomy of a slab. The blocks that have never been used are not on any list. The descriptor lives outside the slab and keeps the owner's fields on one cache line and the shared field on another.
+**Figure 6.** Anatomy of a slab. The blocks that have never been used are not on any list. The descriptor lives outside the slab and keeps the owner's fields on one line and the shared field on another, and each line is 128 bytes.
 
-The three lists exist for a reason. `free` is the list the allocator pops from. `local_free` collects blocks the owning thread freed, and it is spliced into `free` only when `free` is empty, so the fast path never looks at it. `remote` collects blocks freed by other threads. A slab hands out fresh blocks lazily, a few at a time from the bump frontier, so a new 4 MiB slab touches only the memory it uses.
+The three lists exist for a reason. `free` holds the blocks for the next refill. `local_free` collects blocks the owning thread freed, and it is spliced into `free` only when `free` is empty. `remote` collects blocks freed by other threads. A slab hands out fresh blocks lazily, a few at a time from the bump frontier, so a new 4 MiB slab touches only the memory it uses. The slab also keeps the length of each list, so it never has to walk one to know how many blocks it holds.
 
-When a slab runs dry the heap folds in the other lists, then extends the frontier, and only then parks the slab on the full list and moves on. When a class has no slab with room it adopts slabs that other threads have freed into, or takes a fresh one from the bitmap. A slab whose last block is freed goes back to the bitmap, except that each class keeps one so a block allocated and freed in a loop does not bounce a slab in and out.
+The hot list is what makes the fast path short. When it runs dry the heap folds in the other lists of the front slab, or extends the frontier, and then takes the slab's whole free list at once and makes it the hot list. From then on the slab counts those blocks as in use, which is true from its point of view, so handing them out one at a time costs the slab nothing. A slab is never parked, retired or handed back to the bitmap while its blocks are in a hot list, because the heap only moves a slab when its hot list is empty, and a flush returns the blocks first.
 
-A heap is a slot in the region and not a property of a thread. When a thread exits, its heap goes back to the pool with all its slabs, and the next thread to start takes it. Memory held by a departed thread never has to be handed over.
+When a slab runs dry the heap parks it on the full list and moves on. When a class has no slab with room it adopts slabs that other threads have freed into, or takes a fresh one from the bitmap. A slab whose last block is freed goes back to the bitmap, except that each class keeps one so a block allocated and freed in a loop does not bounce a slab in and out.
+
+Where a slab goes when a block comes back matters more than it looks. The first version put a full slab that got one block back at the front of the active list. The next allocation took that block, the slab was full again, and almost every operation moved a slab between lists. Now such a slab goes to the back. Allocation keeps draining the front slab, and by the time the returning slab reaches the front it has collected many blocks. That one change took single-thread churn on mixed sizes from 63 to 125 million operations per second.
+
+The other change with a surprising effect was padding. The descriptor was split into an owner half and a shared half on separate 64 byte lines, which is the textbook layout. The M4 has 128 byte lines, so both halves shared one, and every remote free took the line away from the owner. Aligning the halves to 128 bytes, and giving the heap slot the same treatment so that the unfull stack sits apart from the owner's lists, raised eight-thread Larson from 594 to 808 million operations per second with no other change. The crate pads to 128 bytes on aarch64 and x86-64, where adjacent lines are fetched together, and to 64 bytes elsewhere.
+
+A heap is a slot in the region and not a property of a thread. When a thread exits, its heap goes back to the pool with all its slabs and its hot lists, and the next thread to start takes it. Memory held by a departed thread never has to be handed over.
 
 ## 7. Freeing from another thread
 
@@ -128,59 +137,133 @@ The properties that fall out of this are worth saying plainly. The owner can onl
 
 We did not trust the argument. The remote word has loom models for the races that matter. Marking full races a remote free. Clearing the mark races a remote free. Two pushers race for the notification. A full heap-level model frees two blocks into a full slab from another thread while the owner allocates, and then checks that both blocks come back with no flush. To check that the models can fail, we broke the code on purpose. Replacing the compare-and-swap in the mark with a load and a store made loom report "marked full but nobody will notify the owner". Deleting the call that queues the slab made the heap model report that a freed block went missing.
 
-## 8. How it is checked
+The remote word is not touched once per free. A heap keeps, for each size class, a batch of the blocks it has freed into one slab of another heap. They are chained through their first words, and the chain is pushed with one compare-and-swap when the batch holds 16 KiB of blocks or 64 blocks, when a block of another slab of that class arrives, or when the heap is flushed or released. We added this after measuring a ring of threads that pass blocks to each other. Each remote free stored a link into a block that another core owned, and then a release compare-and-swap had to wait for that store, so every free paid a full cross-core miss. With a batch the stores are in flight together and one operation publishes them. The price is that blocks sit in a batch, and the owner cannot reuse them, until the batch is handed over. That is at most 16 KiB per class per heap, and a heap hands everything over when it is released.
 
-Concurrency bugs hide from tests that pass, so there are four independent layers and each has found something.
+## 8. Giving memory back
 
-| Tool    | What it covers                                                              | What it found                                        |
-| ------- | --------------------------------------------------------------------------- | ---------------------------------------------------- |
-| loom    | Every interleaving of the chunk bitmap, the slab word, and the heap handoff | Nothing new, but it caught every deliberate mutation |
-| Miri    | All unit tests, with strict provenance                                      | A misplaced cfg that only broke the Miri build       |
-| fuzzing | Random operation sequences against a model, across heaps                    | A single-chunk request that ignored its alignment    |
-| benches | Sixteen threads starting at once                                            | A heap claim that failed with free slots             |
+A program that frees a gigabyte and then runs for a month should not keep the gigabyte. The allocator hands free chunks back to the operating system on a clock, and it needs three small pieces of state to do that safely.
+
+Every bitmap word has a timestamp, which is the latest time that a chunk in it was freed. A second bitmap marks the chunks that were freed since they were last given back. A third marks the chunks whose pages are already gone. The clock runs from paths that are slow anyway, which are a slab refill, a slab release and a huge free. When it is due, and a flag says that some chunk may be waiting, one thread makes a pass over the words. A word whose newest free is at least 10 ms old has its idle chunks claimed with a compare-and-swap on the used word, the same operation that allocation uses, so a chunk in use can never be handed to the kernel. The pass advises the kernel about each claimed run, marks it as given back, and releases it. A program that stays quiet pays nothing, and a busy one pays a clock read now and then.
+
+The next claim of a purged chunk has to know. Allocation checks the given-back bitmap for the run it just claimed and, on macOS, tells the kernel that the pages are in use again. That matters because macOS has two ways to give pages back. The lazy one leaves them in the process's footprint until the system is short of memory. The reusable one takes them out of the footprint at once, and wants a matching call before reuse so that the accounting is right. Linux needs no second call, because discarded pages come back as zeros.
+
+A pass makes free chunks look allocated while it holds them, and that has a cost that tests found. If a pass holds every free chunk, an allocation that looks at the bitmap fails although memory is free. The allocator therefore does not report that the region is full until it has looked again with no pass overlapping the attempt, and two counters, one for passes running and one for passes finished, tell it whether any did. The retry looks at the bitmap on every round, so a pass that was descheduled cannot stop an allocation that other free chunks could serve.
+
+The result is the memory row of the benchmarks. After 256 MiB is allocated in 1 KiB blocks and every block is freed, bcmalloc holds 2.8 MiB 800 ms later. mimalloc holds 261 and jemalloc 222, and only snmalloc, at 5.5, is close.
+
+## 9. How it is checked
+
+Concurrency bugs hide from tests that pass, so there are five independent layers and each has found something.
+
+| Tool               | What it covers                                                                                      | What it found                                                                               |
+| ------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| loom               | Every interleaving of the chunk bitmap, the slab word with chain pushes, a purge pass, and its flag | A purge pass that made an allocation fail with memory free, and a flag that stranded memory |
+| Miri               | All unit tests, with strict provenance, on the portable thread lookup                               | A cached table pointer that kept the provenance of one descriptor                           |
+| fuzzing            | Random operation sequences against a model, with a validator that walks every list after each step  | A single-chunk request that ignored its alignment                                           |
+| benches            | Sixteen threads starting at once, and a fresh process for every workload                            | A heap claim that failed with free slots, and a fourfold slowdown of huge frees             |
+| independent review | Every revision, read-only, by a second model that writes its own reproductions                      | Two leaked heap claims, a retry that waited on a stalled pass, a race in the validator      |
+
+The validator deserves a sentence. After every few operations the test harness walks every slab list of every heap and checks that each counter equals the real length of its list, that no block appears twice anywhere, that every hot list belongs to its front slab, that the flags in each remote word agree with the list the slab is on, and that every batch holds blocks of one foreign slab. A deliberate mutation that forgot to reset a counter was caught at once, by an arithmetic overflow and by the validator. The validator reads only what the claimant may read. Review found a version that read another heap's private fields, which is a data race the moment two threads run, and it now works from the geometry of the region instead.
 
 The heap claim bug shows why one layer is not enough. Loom did not find it, because nothing modelled two threads claiming at once until the benchmark crashed. The first version limited its search to the slots that had been claimed so far plus one, so that thread start-up would not touch every slot. Two threads starting together both wanted the same next slot, and the loser was told no slot was free. It aborted the benchmark with a failed 64 KiB allocation. The loom model for it is two threads and two slots, and it fails on the old code every time. The fix is to scan from slot zero and stop at the first free slot, which touches at most one unused slot anyway.
 
 Every test uses the same helpers. A shadow model records each live block, checks alignment, bounds and overlap, and fills every block with a stamp that is verified when it is freed or reallocated. The same model drives the unit tests, the random-traffic test, and the fuzz target, so a failing fuzz input replays as a unit test. Several heaps are driven from one thread, which makes cross-heap frees deterministic. The real global allocator is also exercised end to end. The integration test binary runs the whole standard test harness on top of bcmalloc, with producer and consumer threads and a few thousand short-lived threads.
 
-Memory ordering is the other thing to state clearly. A chunk claim is an `Acquire` compare-and-swap, and a free is a `Release` `fetch_and`. A block is usually written by one thread, freed, and reused by another, and the release on the free and the acquire on the claim carry the first thread's writes to the second. The remote list uses the same pairing. A push is a `Release` compare-and-swap and the owner's take is an `Acquire`.
+Memory ordering is the other thing to state clearly. A chunk claim is an `Acquire` compare-and-swap, and a free is a `Release` `fetch_and`. A purge pass claims with `AcqRel`, so a thread that finds a chunk missing because of a pass also sees the counters of that pass. A block is usually written by one thread, freed, and reused by another, and the release on the free and the acquire on the claim carry the first thread's writes to the second. The remote list uses the same pairing. A push is a `Release` compare-and-swap and the owner's take is an `Acquire`.
 
-## 9. Results
+## 10. Results
 
-All numbers come from an Apple M4 Max with 12 performance and 4 efficiency cores, macOS 26.5 and Rust 1.100. Each is the best of five runs.
+All numbers come from an Apple M4 Max with 12 performance and 4 efficiency cores, macOS 26.5 and Rust 1.100. The suite has 43 workloads in eight groups, plus two that measure memory. Every workload runs in a fresh process, three times per allocator with the allocators taking turns in a rotating order, and the tables keep the best run. The system allocator is macOS libmalloc. ~just bench~ reproduces everything.
 
-![Grouped bars for nine workloads, one bar per allocator, scaled to the fastest, and a peak memory chart](assets/benchmarks.svg)
+![Bars for eight kinds of workload showing each allocator's speed relative to mimalloc, and a chart of the memory still held after a burst is freed](assets/benchmarks.svg)
 
-**Figure 8.** The benchmark suite against the system allocator, mimalloc, jemalloc and snmalloc.
+**Figure 8.** Speed relative to mimalloc, as the geometric mean of each group, and the memory still held after a burst is freed.
 
-The honest summary is that bcmalloc is competitive and not the fastest. It is ahead of macOS's system allocator everywhere except vec growth, it beats mimalloc on cross-thread frees and memory, and it is within a factor of 2.3 of the leader on every throughput row. It loses most on thread scaling of the mixed churn, where jemalloc pulls ahead at 8 and 16 threads, and on cross-thread frees, where jemalloc is about twice as fast.
+| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
+| ---------------------- | ------ | -------- | -------- | -------- | -------- |
+| speed, pair            | 0.47   | 2.18     | 1.00     | 0.65     | 0.73     |
+| speed, bulk            | 0.25   | 1.45     | 1.00     | 0.39     | 0.62     |
+| speed, churn           | 0.23   | 2.25     | 1.00     | 1.28     | 1.32     |
+| speed, sharing         | 0.54   | 1.91     | 1.00     | 2.00     | 1.43     |
+| speed, false sharing   | 0.49   | 1.00     | 1.00     | 1.00     | 1.00     |
+| speed, collections     | 0.61   | 1.21     | 1.00     | 0.66     | 1.09     |
+| speed, resizing        | 0.98   | 0.92     | 1.00     | 0.99     | 0.88     |
+| speed, large           | 0.94   | 1.16     | 1.00     | 0.15     | 0.14     |
+| speed, all workloads   | 0.46   | 1.64     | 1.00     | 0.86     | 0.92     |
+| speed, mean of groups  | 0.50   | 1.43     | 1.00     | 0.71     | 0.76     |
+| memory held afterwards | 3.45   | 9.59     | 1.00     | 1.07     | 6.88     |
+| peak resident memory   | 1.12   | 1.10     | 1.00     | 1.03     | 1.14     |
 
-The mixed churn number hides the more interesting result. We ran the same loop through every allocator with only one kind of block at a time.
+Above 1.00 is better than mimalloc, for speed and for memory alike. The all-workloads row counts every workload once, so a group with many workloads weighs more, and the mean-of-groups row counts every group once. The honest summary is that bcmalloc is the fastest allocator on 32 of the 43 workloads and within 5% of the fastest on three more. The two false-sharing workloads are a tie, because every modern allocator keeps threads off each other's cache lines, and they are there to show that nothing here splits one. The system allocator is about twice as slow on them.
 
-| Blocks         | bcmalloc | mimalloc | jemalloc  | snmalloc  |
-| -------------- | -------- | -------- | --------- | --------- |
-| 16 B to 128 B  | 143.7    | 121.3    | 130.9     | **211.2** |
-| 512 B to 2 KiB | 46.3     | 59.9     | **112.1** | 76.4      |
-| 4 KiB          | 79.2     | 22.7     | **122.8** | 23.0      |
+The wins are widest where the fast path and the cache lines matter.
 
-Millions of allocate-and-free pairs per second on one thread. Small blocks are where the design works as intended. The fast path is a few loads and a store, and it is faster than mimalloc and jemalloc. Mid-sized blocks are where it hurts. A slab of 2 KiB blocks holds 32 of them, and a loop that frees random blocks leaves every slab sparsely free. The front slab runs dry after a few allocations, so the slow path runs constantly. Each run of the slow path moves a slab between lists and does a compare-and-swap to mark it full, and each free into a full slab undoes that. jemalloc avoids this with bins and thread caches that decouple the allocation path from slab state. We have not done that yet, and it is the first thing we would tune.
+| Workload (millions of operations per second) | bcmalloc | mimalloc | jemalloc | snmalloc |
+| -------------------------------------------- | -------- | -------- | -------- | -------- |
+| allocate and free 16 B, one thread           | 415      | 233      | 151      | 361      |
+| allocate and free 1 KiB, one thread          | 290      | 171      | 144      | 224      |
+| mixed sizes with a live set, 1 thread        | 201      | 84       | 105      | 111      |
+| mixed sizes with a live set, 16 threads      | 2128     | 741      | 1269     | 844      |
+| Larson, 8 threads                            | 1233     | 699      | 793      | 509      |
+| binary trees                                 | 184      | 138      | 61       | 152      |
 
-Two other rows deserve an explanation. Peak memory is low, which we attribute to freed slabs returning to a pool that any class can use, though we have not isolated the cause. The large-block row is about 0.2 million operations per second for bcmalloc, mimalloc and the system allocator, and about 25 times lower for jemalloc and snmalloc. Our guess, which we have not verified, is that those two give pages back to the OS on every free, so the benchmark takes a page fault on every page it touches. bcmalloc only returns pages when asked, with `Region::trim`, which is the behaviour a program that reserves up front wants.
+The losses are in the remaining places, and there are eight of them.
 
-## 10. Limits and what comes next
+| Workload (millions of operations per second) | bcmalloc | Fastest       | Gap   |
+| -------------------------------------------- | -------- | ------------- | ----- |
+| ring of 8 threads passing batches            | 285      | jemalloc 593  | 2.1x  |
+| growing a vector of a million numbers        | 661      | jemalloc 1377 | 2.1x  |
+| channel with 4 producers and 4 consumers     | 104      | jemalloc 168  | 1.6x  |
+| realloc to random sizes                      | 8.6      | mimalloc 12.6 | 1.5x  |
+| shared table swapped by 8 threads            | 70       | jemalloc 118  | 1.7x  |
+| channel with 1 producer and 1 consumer       | 47       | jemalloc 63   | 1.3x  |
+| ring of 4 threads passing batches            | 308      | jemalloc 403  | 1.3x  |
+| hash map with replaced entries               | 14.3     | snmalloc 15.2 | 1.06x |
+
+Four of the losses are one story. In the ring, the channel and the shared table, threads free blocks that other threads allocated. jemalloc keeps such a block in the freeing thread's cache and reuses it there, so nothing ever travels back. bcmalloc sends every block home, now in batches, which cut the gap on the 8-thread ring from about four times to two, and it does not close. That explanation comes from how jemalloc is built and not from a profile of this run. Vector growth is the other large gap. bcmalloc allocates a new run and copies at every doubling. We believe jemalloc and the system allocator extend the block in place or move its pages, and we have not checked. We have not profiled the realloc workload at all.
+
+Three further rows are worth reading closely. Peak memory is about 10% below mimalloc over the whole suite. The two memory workloads are the ones where no allocator is ahead of the pack except by returning idle memory, and bcmalloc now does. The half-freed workload, where a random half of 128 MiB of small blocks is freed, shows 153 MiB for every allocator, because none of them can return memory from a slab that is only partly free. Finally the large-block row, where jemalloc and snmalloc are twenty times slower, is the same effect as before, and our guess is unchanged. They give pages back on every free and take a page fault on every page the benchmark touches. bcmalloc waits ten milliseconds, so a loop that frees and allocates the same big block never pays.
+
+The changes that bought the most are worth listing, because each was found by measuring and each looks obvious afterwards. The workload is named as the suite stood when we made the change, so the figures come from separate runs.
+
+| Change                                    | Workload                  | Before | After |
+| ----------------------------------------- | ------------------------- | ------ | ----- |
+| Requeue a returning slab at the back      | mixed churn, one thread   | 63     | 125   |
+| Pad descriptors and heap slots to 128 B   | Larson, 8 threads         | 594    | 808   |
+| Hot lists, size table, direct thread slot | allocate and free 16 B    | 195    | 410   |
+| Hand over remote frees in batches         | ring of 4 threads         | 229    | 308   |
+| Return idle chunks on a clock             | memory held after a burst | 261    | 2.8   |
+
+The last row is in MiB and the others are millions of operations per second.
+
+## 11. Limits and what comes next
 
 bcmalloc is a working allocator and not a finished one. These are the limits we know about.
 
 - Alignments above 64 KiB are refused.
 - A thread that finds every heap taken fails its allocations, which aborts the program. `max_heaps` is a design-time bound, like TigerBeetle's connection limit.
 - Allocations over 4 MiB claim several bitmap words and are obstruction-free, not lock-free.
-- The capacity is a hard limit, and a trim pass makes some chunks look allocated to other threads while it runs.
+- The capacity is a hard limit. A purge pass or a trim makes some chunks look allocated while it holds them, so a request that needs those chunks waits for the pass to finish. It does not fail.
+- A heap holds back up to 16 KiB of blocks per class that it freed into other heaps' slabs, until the batch fills, moves on or is flushed. A thread that goes quiet leaves them there until it exits.
+- Memory in a slab that is only partly free is never returned. No allocator in the suite does this, and the half-freed workload shows it.
+- Fresh pages are zero, but the allocator does not track that, so zeroed allocations always write zeros.
 - A slab abandoned by an exited thread stays with its heap until a new thread claims that heap or `trim` sweeps it.
-- Fresh pages are zero, but the allocator does not track that, so `alloc_zeroed` always writes zeros.
+- Nothing has run on Linux yet. The portable thread lookup that Linux uses is tested on macOS by forcing it with a build flag, and the Linux half of the platform layer has only unit tests that this machine could not run. The direct slot read exists for aarch64 macOS only.
+- Every number comes from one machine.
 
-Next we would tune the slab transitions, add a small per-thread cache in front of them, and batch remote frees by destination slab as BatchIt does[^batchit]. A per-CPU backend through restartable sequences would bound the heap count by the number of CPUs and not the number of threads. Giving the region a NUMA node, tracking zeroed pages, and handing back huge pages in 2 MiB units like Temeraire[^temeraire] all fit in the same structure.
+These are the directions we think are worth taking, in the order we would try them. Most have a measurement behind them, and the last two are ideas that we have not yet measured.
 
-How fast is fast enough? For the programs this is meant for, the answer is mostly in the tail and in the memory curve and not in the single-thread number. The structure here keeps both predictable. The bound is explicit, the hot path touches only the caller's memory, and every cross-thread interaction is one compare-and-swap on one word that a model checker has seen every interleaving of.
+1. **A cache of foreign blocks.** The ring, the channel and the shared table are all the same gap, 1.3 to 2.1 times behind jemalloc. A small bounded stack per class of blocks that belong to other heaps' slabs would let the freeing thread reuse them for its own allocations and spill the rest through the batch path that exists. The slab owner stays the same, so the remote protocol does not change. The costs are that those slabs stay pinned while their blocks are held and that the bound needs a policy. It needs loom models for the owner learning about a slab whose blocks are cached elsewhere, and a fuzz operation that frees across heaps with the cache full.
+2. **Moving pages instead of copying them for huge reallocations.** Growing a vector is 2.1 times behind. Linux has `mremap` and macOS has `mach_vm_remap`, either of which moves a run's pages to a new address in the region without a copy. Growing in place when the next chunks are free is cheaper still, but huge runs are placed from the high end of the region, which leaves no room after them, so that would change placement too. The Linux half cannot be checked on the machine we have.
+3. **The realloc path and the path above 8 KiB.** Random reallocation is 1.5 times behind mimalloc and we have not profiled it. Sizes above the table take a function call and the arithmetic classification, and the hash map workload is 6% behind snmalloc. A profile should say whether a second table, an inlined medium path or a cheaper same-class test is the right fix.
+4. **A per-CPU backend through restartable sequences on Linux.** It would bound the heap count by the number of CPUs and not the number of threads, which also removes the heap-exhaustion limit.
+5. **Tuning the purge clock.** The interval is 10 ms and the timestamp covers a whole bitmap word of 64 chunks. A finer stamp, claiming recently purged runs last so that they stay purged, and purging sooner when the region is nearly full are all cheap to try. On Linux the lazy discard may beat the eager one on the refault cost, and that needs measuring there.
+6. **Latency and not only throughput.** The suite measures operations per second. The tails, which are the point for a database or a consensus node, come from a refill, a frontier extension, a purge pass and the first allocation, and none of them is measured. The Apple counter ticks at 24 MHz, so per-operation timing needs batches.
+7. **Memory from partly used slabs.** Compaction in the style of Mesh[^mesh] could return memory that nothing here can, at the price of changing what a block's address means.
+8. **Zero tracking, NUMA and huge pages.** Remembering which chunks are still zero would let zeroed allocations from fresh memory skip the write. A region per NUMA node, and handing back huge pages in 2 MiB units like Temeraire[^temeraire], fit in the same structure.
+9. **Validation on Linux and x86-64.** Run the suite and the fuzz targets there, and add the direct slot read for x86-64 macOS if anyone needs it.
+
+How fast is fast enough? For the programs this is meant for, the answer is mostly in the tail and in the memory curve and not in the single-thread number. The structure here keeps both predictable. The bound is explicit, the hot path touches only the caller's memory, idle memory goes back on a clock, and every cross-thread interaction is one compare-and-swap on one word that a model checker has seen every interleaving of.
 
 [^tigerbeetle]: [A Database Without Dynamic Memory Allocation](https://tigerbeetle.com/blog/2022-10-12-a-database-without-dynamic-memory/) explains why TigerBeetle sizes everything from fixed limits at start-up and what that buys.
 [^mimalloc]: [mimalloc, a new, high-performance, scalable memory allocator for the modern era](https://www.microsoft.com/en-us/research/blog/mimalloc-a-high-performance-scalable-memory-allocator-for-the-modern-era/) describes the per-thread heaps, the three free lists per page and the cross-thread free list.
@@ -191,3 +274,4 @@ How fast is fast enough? For the programs this is meant for, the answer is mostl
 [^globalalloc]: The contract is in the documentation for [GlobalAlloc](https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html), including the rules on unwinding and re-entrance.
 [^batchit]: [BatchIt](https://www.microsoft.com/en-us/research/publication/batchit-optimizing-message-passing-allocators-for-producer-consumer-workloads-an-intellectual-abstract/) caches remote frees per slab so that frees to the same slab share one atomic operation.
 [^temeraire]: [Temeraire](https://www.usenix.org/conference/osdi21/presentation/hunter) is the hugepage-aware allocator in TCMalloc.
+[^mesh]: [Mesh](https://www.usenix.org/conference/pldi19/presentation/powers) compacts memory by merging pages whose live blocks do not overlap and remapping them.

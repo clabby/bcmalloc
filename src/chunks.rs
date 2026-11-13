@@ -45,6 +45,15 @@
 //!     single chunks grow up -->                        <-- runs of 8, 64, ... grow down
 //! ```
 //!
+//! # Giving memory back
+//!
+//! Next to the bitmap of used chunks are a bitmap of chunks that were freed since their pages were
+//! last given back, a bitmap of chunks whose pages are gone, and a timestamp for every word. A
+//! purge pass claims the dirty, free chunks of every word that has been quiet for the delay,
+//! through the same compare-and-swap that allocation uses, so it can never take a chunk in use. The
+//! caller returns the pages to the OS, and the next claim of a purged chunk learns that it must
+//! prepare them for use again.
+//!
 //! # Memory ordering
 //!
 //! Claims use `Acquire` and frees use `Release`. A block is usually written by one thread, freed,

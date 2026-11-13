@@ -1,8 +1,9 @@
 //! Per-thread heaps, which hold the allocation fast path and everything behind it.
 //!
 //! A [`Heap`] is one thread's private view of the region. It owns a set of slabs grouped by size
-//! class, and it serves most requests by popping a block off the front slab of the right class with
-//! no atomic operations at all.
+//! class, and it serves most requests by popping a block off the hot list of the right class with
+//! no atomic operations at all. The hot list holds blocks of the front active slab, which it takes
+//! from the slab a whole free list at a time.
 //!
 //! ```text
 //!   size class        active slabs (have room)                full slabs
@@ -17,9 +18,9 @@
 //!
 //! # Allocating
 //!
-//! 1. Pop the free list of the front active slab. This is the whole fast path.
-//! 2. If it is empty, fold in the local and remote free lists of the slab, or thread a few more
-//!    never-used blocks onto it.
+//! 1. Pop the hot list of the class. This is the whole fast path.
+//! 2. If it is empty, fold the local and remote free lists of the front active slab into its free
+//!    list, or thread a few more never-used blocks onto it, and make that list the hot list.
 //! 3. If the slab has nothing left, park it on the full list and try the next one. A slab that gets
 //!    a block back joins the active list at the back, so that allocation keeps draining the front
 //!    slab and a returning slab has collected many blocks by the time it is reached.
