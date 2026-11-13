@@ -34,7 +34,7 @@ use crate::{
     heap::{Heap, HeapData},
     size_class::{Class, Request, classify},
     slab::{Block, Slab},
-    sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     sys,
 };
 
@@ -97,8 +97,11 @@ pub struct Region<'a> {
     next_purge: AtomicU64,
     /// Whether any free chunk may still be waiting to be purged or to age towards it.
     aging: AtomicBool,
-    /// How many purge passes and trims are holding free chunks, which makes them look allocated.
-    purging: AtomicUsize,
+    /// How many purge passes and trims are holding free chunks right now, which makes the chunks
+    /// look allocated to everyone else.
+    purges_active: AtomicUsize,
+    /// How many purge passes and trims have finished.
+    purges_done: AtomicUsize,
 }
 
 // SAFETY: the raw pointer is an address into memory the region owns, and every shared structure
@@ -132,7 +135,8 @@ impl<'a> Region<'a> {
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
             aging: AtomicBool::new(false),
-            purging: AtomicUsize::new(0),
+            purges_active: AtomicUsize::new(0),
+            purges_done: AtomicUsize::new(0),
         }
     }
 
@@ -187,7 +191,7 @@ impl<'a> Region<'a> {
                 data.release_claim();
             }
         }
-        self.purging.fetch_add(1, Ordering::Release);
+        self.purges_active.fetch_add(1, Ordering::Release);
         self.chunks.drain(|run| {
             // SAFETY: the run is free and held by the drain while we advise on it.
             unsafe {
@@ -195,7 +199,8 @@ impl<'a> Region<'a> {
                 sys::discard(start, run.len() << CHUNK_SHIFT);
             }
         });
-        self.purging.fetch_sub(1, Ordering::Release);
+        self.purges_done.fetch_add(1, Ordering::Release);
+        self.purges_active.fetch_sub(1, Ordering::Release);
     }
 
     /// A snapshot of how full the region is.
@@ -219,17 +224,7 @@ impl<'a> Region<'a> {
     pub(crate) fn alloc_chunks(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
         let first = match self.chunks.alloc(n, align, hint) {
             Some(first) => first,
-            None => {
-                // Free chunks that a purge pass holds look allocated for a moment. Wait for the
-                // pass to finish and look again before reporting that the region is full.
-                if self.purging.load(Ordering::Acquire) == 0 {
-                    return None;
-                }
-                while self.purging.load(Ordering::Acquire) != 0 {
-                    core::hint::spin_loop();
-                }
-                self.chunks.alloc(n, align, hint)?
-            }
+            None => self.alloc_chunks_after_purge(n, align, hint)?,
         };
         self.chunks.take_purged(first, n, |run| {
             // SAFETY: the run is inside the region and belongs to us since the claim above.
@@ -241,6 +236,29 @@ impl<'a> Region<'a> {
             }
         });
         Some(first)
+    }
+
+    /// Looks again for chunks after a failed claim, in case a purge pass was holding the free
+    /// ones. The region is only reported full when no pass overlapped a failed attempt.
+    #[cold]
+    fn alloc_chunks_after_purge(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
+        loop {
+            while self.purges_active.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
+            let done = self.purges_done.load(Ordering::Acquire);
+            if let Some(first) = self.chunks.alloc(n, align, hint) {
+                return Some(first);
+            }
+            // The attempt may have failed because of chunks that a pass claimed. Seeing such a
+            // claim synchronises with the pass, so after this fence its counters are visible.
+            fence(Ordering::Acquire);
+            if self.purges_active.load(Ordering::Acquire) == 0 &&
+                self.purges_done.load(Ordering::Acquire) == done
+            {
+                return None;
+            }
+        }
     }
 
     /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge.
@@ -281,7 +299,7 @@ impl<'a> Region<'a> {
     pub(crate) fn purge_pass(&self, now: u64) {
         // Clear the flag first so that a free that races with the pass sets it again.
         self.aging.store(false, Ordering::Relaxed);
-        self.purging.fetch_add(1, Ordering::Release);
+        self.purges_active.fetch_add(1, Ordering::Release);
         let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
             // SAFETY: the pass holds the run, so no allocation overlaps it.
             unsafe {
@@ -291,7 +309,8 @@ impl<'a> Region<'a> {
                 );
             }
         });
-        self.purging.fetch_sub(1, Ordering::Release);
+        self.purges_done.fetch_add(1, Ordering::Release);
+        self.purges_active.fetch_sub(1, Ordering::Release);
         if pending {
             self.aging.store(true, Ordering::Relaxed);
         }
