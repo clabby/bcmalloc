@@ -208,6 +208,8 @@ struct Private {
     _line: [CacheLine; 0],
     id: Cell<u32>,
     refills: Cell<u32>,
+    /// Set while the inbox is being read, so that nothing reads it again from inside.
+    draining: Cell<bool>,
     /// How many bytes of capacity the bins have grown by, against [`GROWTH_BUDGET`].
     grown: Cell<usize>,
     /// The start of the managed memory, the slab descriptors and the chunk map of the region this
@@ -266,6 +268,7 @@ impl HeapData {
                 _line: [],
                 id: Cell::new(0),
                 refills: Cell::new(0),
+                draining: Cell::new(false),
                 grown: Cell::new(0),
                 base: Cell::new(ptr::null_mut()),
                 map: Cell::new(ptr::null()),
@@ -581,12 +584,11 @@ impl HeapData {
     unsafe fn refill(&self, class: Class) -> *mut Block {
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
-        if !self.shared.inbox.load(Ordering::Relaxed).is_null() {
-            // SAFETY: the caller holds the claim.
-            unsafe { self.drain_inbox(region) };
-            if let Some(block) = self.pop(class) {
-                return block;
-            }
+        // SAFETY: the caller holds the claim.
+        if unsafe { self.read_mail(region) } &&
+            let Some(block) = self.pop(class)
+        {
+            return block;
         }
         // SAFETY: as above.
         unsafe { self.maintain(region) };
@@ -849,6 +851,9 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn free_full(&self, block: *mut Block, class: Class) {
+        // A thread that only frees never refills, so this is where it takes in its mail.
+        // SAFETY: the caller holds the claim.
+        unsafe { self.read_mail(self.region()) };
         if self.note_miss(class, OVERFLOW) && self.push(class, block) {
             return;
         }
@@ -985,6 +990,13 @@ impl HeapData {
         let region = unsafe { self.region() };
         let size = class.block_size();
         let outbox = &self.private.outboxes[owner as usize % OUTBOXES];
+        if outbox.message.get().is_null() {
+            // Messages come back to their sender once read, and a thread that only frees would
+            // otherwise never take them in and keep allocating new ones. Reading the inbox may
+            // send blocks too, so the outbox is looked at only after it.
+            // SAFETY: the caller holds the claim.
+            unsafe { self.read_mail(region) };
+        }
         let mut message = outbox.message.get();
         if !message.is_null() && outbox.dest.get() != owner {
             // SAFETY: the caller holds the claim.
@@ -1063,6 +1075,24 @@ impl HeapData {
             return ptr::null_mut();
         }
         self.pop(MESSAGE_CLASS).map_or(ptr::null_mut(), <*mut Block>::cast)
+    }
+
+    /// Reads the inbox if anything waits there and it is not being read already. Returns whether
+    /// it read anything.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and must not be in the middle of returning blocks to one of
+    /// this heap's slabs, which reading the inbox may also do.
+    unsafe fn read_mail(&self, region: &Region<'_>) -> bool {
+        if self.private.draining.get() || self.shared.inbox.load(Ordering::Relaxed).is_null() {
+            return false;
+        }
+        self.private.draining.set(true);
+        // SAFETY: forwarded.
+        unsafe { self.drain_inbox(region) };
+        self.private.draining.set(false);
+        true
     }
 
     /// Takes everything in the inbox and files each block in its bin, or in its slab if the bin is
@@ -1767,6 +1797,24 @@ mod test {
         let again = alloc_many(&owner, layout, 500);
         assert_eq!(used(&region), baseline, "the owner must recycle what the other heap freed");
         free_all(&owner, layout, again);
+    }
+
+    #[test]
+    fn a_heap_that_only_frees_takes_back_its_messages() {
+        // Found by mimalloc-bench's xmalloc-test. A consumer sends blocks home in messages of its
+        // own, which come back to it once read. A consumer that never allocates used to leave them
+        // in its inbox and keep allocating new ones.
+        let test = TestRegion::new(256, 2);
+        let region = test.region();
+        let (producer, consumer) = (region.heap().unwrap(), region.heap().unwrap());
+        let layout = layout(HOMEBOUND, 8);
+        for _ in 0..iterations(400) {
+            let blocks = alloc_many(&producer, layout, 2000);
+            free_all(&consumer, layout, blocks);
+        }
+        producer.validate();
+        consumer.validate();
+        assert!(used(&region) < 32 * CHUNK_SIZE, "{} chunks in use", used(&region) / CHUNK_SIZE);
     }
 
     #[test]
