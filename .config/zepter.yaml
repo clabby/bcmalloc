@@ -1,0 +1,34 @@
+version:
+  format: 1
+  # Minimum zepter version that is expected to work. This is just for printing a nice error
+  # message when someone tries to use an older version.
+  binary: 1.80.0
+
+workflows:
+  check:
+    - [
+        "lint",
+        # Check that this crate activates the features of its dependencies.
+        "propagate-feature",
+        "--features=std",
+        # Do not add a feature section only because a dependency exposes that feature.
+        "--left-side-feature-missing=ignore",
+        # Ignore dependencies outside the workspace, which we cannot change.
+        "--left-side-outside-workspace=ignore",
+        # Only check normal dependencies. Propagating to dev-dependencies breaks compilation.
+        "--dep-kinds=normal:check,dev:ignore",
+        "--show-path",
+        "--quiet",
+      ]
+  default:
+    # Running `zepter` with no subcommand checks and fixes.
+    - [$check.0, "--fix"]
+
+help:
+  text: |
+    cwmalloc uses the Zepter CLI to detect problems with Cargo features, such as missing propagation.
+
+    One or more checks failed. You can try to fix them by installing zepter
+    (`cargo install zepter --locked`) and running `zepter` in the repository root.
+  links:
+    - "https://github.com/ggwpez/zepter"
