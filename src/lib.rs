@@ -5,6 +5,7 @@
 #[macro_use]
 extern crate std;
 
+mod cache;
 mod chunks;
 mod config;
 #[cfg(all(feature = "std", not(loom)))]

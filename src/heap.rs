@@ -56,6 +56,7 @@
 use core::{alloc::Layout, cell::Cell, fmt, marker::PhantomData, ptr, ptr::NonNull};
 
 use crate::{
+    cache::CacheLine,
     region::Region,
     size_class::{CLASSES, Class, Request, classify},
     slab::{Block, List, Owned, Slab},
@@ -69,25 +70,36 @@ struct Lists {
     full: Cell<*const Slab>,
 }
 
+/// What other threads touch in a heap slot, kept on a line of its own.
+struct Shared {
+    _line: [CacheLine; 0],
+    claimed: AtomicBool,
+    unfull: AtomicPtr<Slab>,
+}
+
+/// What only the claimant touches in a heap slot.
+struct Private {
+    _line: [CacheLine; 0],
+    id: Cell<u32>,
+    cursor: Cell<usize>,
+    classes: [Lists; CLASSES],
+}
+
 /// The state of one heap slot in a region.
 ///
 /// Everything but `claimed` and `unfull` belongs to whichever thread has claimed the slot. An
 /// all-zero value is a valid, unclaimed, empty heap.
-#[repr(align(64))]
 pub(crate) struct HeapData {
-    claimed: AtomicBool,
-    id: Cell<u32>,
-    cursor: Cell<usize>,
-    unfull: AtomicPtr<Slab>,
-    classes: [Lists; CLASSES],
+    shared: Shared,
+    private: Private,
 }
 
 impl fmt::Debug for HeapData {
     /// Formats only what other threads may read. The rest belongs to the claimant.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HeapData")
-            .field("claimed", &self.claimed)
-            .field("unfull", &self.unfull)
+            .field("claimed", &self.shared.claimed)
+            .field("unfull", &self.shared.unfull)
             .finish_non_exhaustive()
     }
 }
@@ -101,48 +113,55 @@ impl HeapData {
     #[allow(clippy::missing_const_for_fn, reason = "loom atomics have no const constructors")]
     pub(crate) fn new() -> Self {
         Self {
-            claimed: AtomicBool::new(false),
-            id: Cell::new(0),
-            cursor: Cell::new(0),
-            unfull: AtomicPtr::new(ptr::null_mut()),
-            classes: [const {
-                Lists {
-                    active: Cell::new(ptr::null()),
-                    active_last: Cell::new(ptr::null()),
-                    full: Cell::new(ptr::null()),
-                }
-            }; CLASSES],
+            shared: Shared {
+                _line: [],
+                claimed: AtomicBool::new(false),
+                unfull: AtomicPtr::new(ptr::null_mut()),
+            },
+            private: Private {
+                _line: [],
+                id: Cell::new(0),
+                cursor: Cell::new(0),
+                classes: [const {
+                    Lists {
+                        active: Cell::new(ptr::null()),
+                        active_last: Cell::new(ptr::null()),
+                        full: Cell::new(ptr::null()),
+                    }
+                }; CLASSES],
+            },
         }
     }
 
     /// Tries to claim this slot as heap number `id`.
     pub(crate) fn claim(&self, id: u32) -> bool {
-        let won = !self.claimed.load(Ordering::Relaxed) &&
-            self.claimed
+        let won = !self.shared.claimed.load(Ordering::Relaxed) &&
+            self.shared
+                .claimed
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok();
         if won {
-            self.id.set(id);
+            self.private.id.set(id);
         }
         won
     }
 
     /// Gives the slot up for another thread to claim.
     pub(crate) fn release_claim(&self) {
-        self.claimed.store(false, Ordering::Release);
+        self.shared.claimed.store(false, Ordering::Release);
     }
 
     pub(crate) fn is_claimed(&self) -> bool {
-        self.claimed.load(Ordering::Relaxed)
+        self.shared.claimed.load(Ordering::Relaxed)
     }
 
     /// The stack of slabs that other threads have freed into while they were full.
     pub(crate) const fn unfull(&self) -> &AtomicPtr<Slab> {
-        &self.unfull
+        &self.shared.unfull
     }
 
     const fn lists(&self, class: Class) -> &Lists {
-        &self.classes[class.index()]
+        &self.private.classes[class.index()]
     }
 
     const fn head(&self, class: Class, list: List) -> &Cell<*const Slab> {
@@ -177,7 +196,7 @@ impl HeapData {
     #[cold]
     unsafe fn alloc_slow(&self, region: &Region<'_>, class: Class) -> *mut u8 {
         loop {
-            if !self.unfull.load(Ordering::Relaxed).is_null() {
+            if !self.shared.unfull.load(Ordering::Relaxed).is_null() {
                 // SAFETY: the caller holds the claim.
                 unsafe { self.drain_notified(region) };
             }
@@ -206,17 +225,17 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let Some(first) = region.chunks().alloc(chunks, chunks, self.cursor.get()) else {
+        let Some(first) = region.chunks().alloc(chunks, chunks, self.private.cursor.get()) else {
             return false;
         };
         let slab = region.slab(first);
         // SAFETY: the chunks were just allocated to us, so nobody else uses this descriptor.
         let owned = unsafe { slab.owned() };
         // SAFETY: the chunks are a slab-sized, slab-aligned run that is ours alone.
-        unsafe { owned.init(self.id.get(), class, region.chunk_ptr(first)) };
+        unsafe { owned.init(self.private.id.get(), class, region.chunk_ptr(first)) };
         self.push_front(owned, List::Active);
         if chunks == 1 {
-            self.cursor.set(first / 64);
+            self.private.cursor.set(first / 64);
         }
         true
     }
@@ -243,7 +262,7 @@ impl HeapData {
 
     /// Processes every slab that remote frees have notified us about.
     unsafe fn drain_notified(&self, region: &Region<'_>) {
-        let mut next = Slab::take_enqueued(&self.unfull);
+        let mut next = Slab::take_enqueued(&self.shared.unfull);
         // SAFETY: a queued slab cannot be recycled before it is popped, so the pointer is valid.
         while let Some(slab) = unsafe { next.as_ref() } {
             next = slab.next_enqueued();
@@ -310,7 +329,7 @@ impl HeapData {
         let first = region.chunk_index(slab.start());
         region.chunks().free(first, slab.class().slab_chunks());
         // Prefer the lowest free word next time, so slabs stay packed towards the bottom.
-        self.cursor.set(self.cursor.get().min(first / 64));
+        self.private.cursor.set(self.private.cursor.get().min(first / 64));
     }
 
     /// Hands every empty slab back to the chunk allocator, folding in pending frees first.
@@ -498,7 +517,7 @@ impl<'r> Heap<'r> {
         match classify(layout) {
             Some(Request::Small(class)) => {
                 let slab = self.region.slab_of(ptr, class);
-                if slab.owner() == self.data.id.get() {
+                if slab.owner() == self.data.private.id.get() {
                     // SAFETY: we own the slab, hold the claim, and the caller vouches for the
                     // block.
                     unsafe {
@@ -576,7 +595,11 @@ impl Drop for Heap<'_> {
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use core::{alloc::Layout, mem::MaybeUninit, ptr::NonNull};
+    use core::{
+        alloc::Layout,
+        mem::{MaybeUninit, align_of, offset_of, size_of},
+        ptr::NonNull,
+    };
     use std::vec::Vec;
 
     use super::*;
@@ -605,6 +628,16 @@ mod test {
             // SAFETY: the blocks were allocated with this layout and are freed once.
             unsafe { heap.dealloc(block, layout) };
         }
+    }
+
+    #[test]
+    fn a_heap_slot_keeps_what_other_threads_write_on_its_own_line() {
+        let line = align_of::<CacheLine>();
+        assert_eq!(align_of::<HeapData>(), line);
+        assert_eq!(offset_of!(HeapData, shared) % line, 0);
+        assert_eq!(offset_of!(HeapData, private) % line, 0);
+        assert_ne!(offset_of!(HeapData, shared), offset_of!(HeapData, private));
+        assert_eq!(size_of::<HeapData>() % line, 0);
     }
 
     #[test]

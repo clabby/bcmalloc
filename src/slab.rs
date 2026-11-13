@@ -61,6 +61,7 @@
 use core::{cell::Cell, fmt, ptr};
 
 use crate::{
+    cache::CacheLine,
     size_class::Class,
     sync::{AtomicPtr, AtomicU32, Ordering},
 };
@@ -116,8 +117,8 @@ pub(crate) enum List {
 }
 
 /// Descriptor state that only the owning heap reads or writes.
-#[repr(align(64))]
 struct Local {
+    _line: [CacheLine; 0],
     free: Cell<*mut Block>,
     local_free: Cell<*mut Block>,
     next: Cell<*const Slab>,
@@ -132,8 +133,8 @@ struct Local {
 
 /// Descriptor state any thread may touch.
 #[derive(Debug)]
-#[repr(align(64))]
 struct Shared {
+    _line: [CacheLine; 0],
     remote: AtomicPtr<Block>,
     owner: AtomicU32,
     notified: AtomicPtr<Slab>,
@@ -166,6 +167,7 @@ impl Slab {
     pub(crate) fn new() -> Self {
         Self {
             local: Local {
+                _line: [],
                 free: Cell::new(ptr::null_mut()),
                 local_free: Cell::new(ptr::null_mut()),
                 next: Cell::new(ptr::null()),
@@ -178,6 +180,7 @@ impl Slab {
                 list: Cell::new(List::None),
             },
             shared: Shared {
+                _line: [],
                 remote: AtomicPtr::new(ptr::null_mut()),
                 owner: AtomicU32::new(0),
                 notified: AtomicPtr::new(ptr::null_mut()),
@@ -470,8 +473,20 @@ impl<'a> Owned<'a> {
 mod test {
     use std::vec::Vec;
 
+    use core::mem::{align_of, offset_of, size_of};
+
     use super::*;
     use crate::testing::Buffer;
+
+    #[test]
+    fn a_descriptor_keeps_what_other_threads_write_on_its_own_line() {
+        let line = align_of::<CacheLine>();
+        assert_eq!(align_of::<Slab>(), line);
+        assert_eq!(size_of::<Slab>(), 2 * line);
+        assert_eq!(offset_of!(Slab, local) % line, 0);
+        assert_eq!(offset_of!(Slab, shared) % line, 0);
+        assert_ne!(offset_of!(Slab, local), offset_of!(Slab, shared));
+    }
 
     /// A slab of `class` over its own memory, with the descriptor initialised.
     struct Fixture {
