@@ -73,43 +73,56 @@ If the operating system refuses the default reservation, the global allocator re
 
 ## Benchmarks
 
-The suite has 43 workloads in eight groups, including producer and consumer rings, Larson, false sharing, standard collections, resizing and large blocks. Every workload runs in a fresh process, three times per allocator in a rotating order, and the best run counts. The tables show the geometric mean of each group relative to mimalloc, so above 1.00 is better for speed and for memory alike. Run `just bench` to reproduce them.
+There are two sets of benchmarks. The development suite has 51 synthetic workloads in eight groups, from single-thread loops to producer and consumer rings, and it is what changes are tuned against. The held-out set is never tuned against: real Rust programs built on serde_json, regex, syn, hyper and tokio, and the C programs of [mimalloc-bench](https://github.com/daanx/mimalloc-bench) run with bcmalloc preloaded. Every Rust workload runs ten times per allocator in a rotating order, each run in a fresh process, and the tables show medians relative to mimalloc, so above 1.00 is better for speed and for memory alike. `just bench`, `just bench-apps` and `just mimalloc-bench` reproduce them.
 
-On an Apple M4 Max with macOS 26.5 and Rust 1.100, where the system allocator is libmalloc:
-
-| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
-| ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 0.51   | 3.17     | 1.00     | 0.50     | 1.55     |
-| speed, bulk            | 0.28   | 1.35     | 1.00     | 0.40     | 0.73     |
-| speed, churn           | 0.25   | 2.36     | 1.00     | 1.36     | 1.59     |
-| speed, sharing         | 0.56   | 2.94     | 1.00     | 2.12     | 1.56     |
-| speed, false sharing   | 0.47   | 0.99     | 1.00     | 0.71     | 1.00     |
-| speed, collections     | 0.67   | 1.22     | 1.00     | 0.65     | 1.12     |
-| speed, resizing        | 0.89   | 1.04     | 1.00     | 0.99     | 0.88     |
-| speed, large           | 0.99   | 1.16     | 1.00     | 0.15     | 0.12     |
-| speed, all workloads   | 0.49   | 1.95     | 1.00     | 0.82     | 1.15     |
-| speed, mean of groups  | 0.52   | 1.60     | 1.00     | 0.67     | 0.88     |
-| memory held afterwards | 3.46   | 7.60     | 1.00     | 0.98     | 6.88     |
-| peak resident memory   | 1.05   | 1.00     | 1.00     | 0.99     | 1.11     |
-
-On a 32-core AMD EPYC 9354P with Ubuntu 24.04, kernel 7.0 and Rust 1.100, where the system allocator is glibc 2.39. Memory is the resident set there, which is not the macOS footprint, so compare allocators within one table and not the machines with each other.
+The development suite on an Apple M4 Max with macOS 26.5 and Rust 1.100, where the system allocator is libmalloc:
 
 | Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
 | ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 1.07   | 2.72     | 1.00     | 0.66     | 1.68     |
-| speed, bulk            | 0.12   | 1.13     | 1.00     | 0.33     | 0.55     |
-| speed, churn           | 0.80   | 2.18     | 1.00     | 1.77     | 1.83     |
-| speed, sharing         | 0.32   | 2.21     | 1.00     | 2.17     | 1.08     |
-| speed, false sharing   | 0.99   | 1.00     | 1.00     | 0.98     | 1.00     |
-| speed, collections     | 0.58   | 1.04     | 1.00     | 0.71     | 0.95     |
-| speed, resizing        | 1.02   | 1.10     | 1.00     | 0.60     | 0.90     |
-| speed, large           | 0.44   | 1.08     | 1.00     | 0.08     | 0.23     |
-| speed, all workloads   | 0.61   | 1.71     | 1.00     | 0.86     | 1.12     |
-| speed, mean of groups  | 0.55   | 1.44     | 1.00     | 0.64     | 0.88     |
-| memory held afterwards | 33.70  | 7.48     | 1.00     | 0.98     | 1.01     |
-| peak resident memory   | 2.20   | 1.08     | 1.00     | 1.85     | 1.50     |
+| speed, pair            | 0.55   | 3.95     | 1.00     | 0.54     | 1.70     |
+| speed, bulk            | 0.27   | 1.50     | 1.00     | 0.43     | 0.79     |
+| speed, churn           | 0.29   | 2.42     | 1.00     | 1.46     | 1.60     |
+| speed, sharing         | 0.55   | 3.03     | 1.00     | 2.18     | 1.60     |
+| speed, false sharing   | 0.86   | 1.00     | 1.00     | 0.77     | 1.00     |
+| speed, collections     | 0.71   | 1.24     | 1.00     | 0.67     | 1.20     |
+| speed, resizing        | 1.00   | 1.02     | 1.00     | 0.92     | 0.85     |
+| speed, large           | 0.98   | 1.06     | 1.00     | 0.14     | 0.11     |
+| speed, all workloads   | 0.52   | 2.07     | 1.00     | 0.88     | 1.22     |
+| speed, mean of groups  | 0.59   | 1.66     | 1.00     | 0.69     | 0.89     |
+| speed, cold            | 0.52   | 2.04     | 1.00     | 0.87     | 1.23     |
+| latency, p99           | 0.53   | 3.21     | 1.00     | 2.38     | 1.66     |
+| memory held afterwards | 2.29   | 3.11     | 1.00     | 0.96     | 3.90     |
+| peak resident memory   | 0.98   | 0.99     | 1.00     | 0.99     | 1.09     |
 
-On macOS bcmalloc is the fastest allocator on 37 of the 43 workloads and within 5% of the fastest on four more. On Linux it is the fastest on 25 and within 5% on seven more. jemalloc is ahead on the channels, where a consumer frees blocks it never reuses, and on macOS when one vector grows to millions of elements. On Linux glibc is ahead on single very large blocks and on vector growth, and snmalloc by under 15% on the smallest blocks of a single thread and on rewriting a tree. After a 256 MiB burst is freed, bcmalloc holds under 5 MiB on both machines, where mimalloc and jemalloc hold about 260. DESIGN.md explains the design and has the charts.
+On a 32-core AMD EPYC 9354P with Ubuntu 24.04, kernel 7.0 and Rust 1.100, where the system allocator is glibc 2.39:
+
+| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
+| ---------------------- | ------ | -------- | -------- | -------- | -------- |
+| speed, pair            | 1.05   | 3.11     | 1.00     | 0.64     | 1.73     |
+| speed, bulk            | 0.13   | 1.15     | 1.00     | 0.33     | 0.57     |
+| speed, churn           | 0.82   | 2.21     | 1.00     | 1.65     | 1.70     |
+| speed, sharing         | 0.32   | 2.27     | 1.00     | 2.16     | 1.08     |
+| speed, false sharing   | 0.89   | 1.00     | 1.00     | 1.00     | 1.00     |
+| speed, collections     | 0.61   | 1.01     | 1.00     | 0.72     | 0.94     |
+| speed, resizing        | 1.02   | 1.06     | 1.00     | 0.60     | 0.90     |
+| speed, large           | 0.44   | 1.09     | 1.00     | 0.08     | 0.23     |
+| speed, all workloads   | 0.62   | 1.76     | 1.00     | 0.88     | 1.14     |
+| speed, mean of groups  | 0.55   | 1.46     | 1.00     | 0.63     | 0.88     |
+| speed, cold            | 0.62   | 1.76     | 1.00     | 0.86     | 1.08     |
+| latency, p99           | 0.94   | 3.04     | 1.00     | 1.67     | 2.00     |
+| memory held afterwards | 11.88  | 3.12     | 1.00     | 1.06     | 1.10     |
+| peak resident memory   | 2.20   | 1.11     | 1.00     | 1.86     | 1.50     |
+
+The held-out programs:
+
+| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc | tcmalloc |
+| --- | --- | --- | --- | --- | --- | --- |
+| speed, Rust programs, macOS | 0.91 | 1.03 | 1.00 | 0.92 | 1.00 | - |
+| speed, Rust programs, Linux | 0.82 | 1.11 | 1.00 | 1.04 | 1.04 | - |
+| speed, mimalloc-bench, Linux | 0.74 | 0.99 | 1.00 | 0.86 | 0.96 | 0.64 |
+| memory, mimalloc-bench, Linux | 1.06 | 0.51 | 1.00 | 0.83 | 0.84 | 0.77 |
+
+On the synthetic suite bcmalloc leads by a wide margin on both machines. On the held-out programs the margin is small. It is the fastest on the Rust programs on both machines, by 3% over the next allocator on macOS and 7% on Linux, and it ties mimalloc for speed on mimalloc-bench while holding about twice its memory at peak. DESIGN.md has the per-program tables and explains the design.
 
 ## Limits
 

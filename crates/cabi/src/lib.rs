@@ -40,15 +40,28 @@ fn layout(size: usize, align: usize) -> Option<Layout> {
 /// Sets errno for the calling thread.
 fn set_errno(code: c_int) {
     // SAFETY: the errno location is valid for the calling thread.
+    unsafe { *errno_location() = code };
+}
+
+/// The calling thread's errno.
+fn errno_location() -> *mut c_int {
+    // SAFETY: the errno location is valid for the calling thread.
     #[cfg(target_os = "linux")]
     unsafe {
-        *libc::__errno_location() = code;
+        libc::__errno_location()
     }
     // SAFETY: as above.
     #[cfg(target_os = "macos")]
     unsafe {
-        *libc::__error() = code;
+        libc::__error()
     }
+}
+
+/// The size of a memory page, which valloc and pvalloc align to.
+fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page).unwrap_or(4096).max(1)
 }
 
 /// Allocates `size` bytes aligned to `align`, setting errno to ENOMEM on failure.
@@ -175,8 +188,12 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, siz
     if !align.is_power_of_two() || !align.is_multiple_of(size_of::<*mut c_void>()) {
         return libc::EINVAL;
     }
+    // posix_memalign reports failure through its result and leaves errno alone.
+    // SAFETY: the errno location is valid for the calling thread.
+    let saved = unsafe { *errno_location() };
     let block = allocate(size, align);
     if block.is_null() {
+        set_errno(saved);
         return libc::ENOMEM;
     }
     // SAFETY: the caller passes a writable pointer.
@@ -191,17 +208,22 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, siz
 /// Callable from C with the usual contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
-    allocate(size, 4096)
+    allocate(size, page_size())
 }
 
-/// The obsolete `pvalloc`, page aligned and rounded up to whole pages.
+/// The obsolete `pvalloc`, page aligned and rounded up to whole pages, at least one.
 ///
 /// # Safety
 ///
 /// Callable from C with the usual contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
-    allocate(size.next_multiple_of(4096), 4096)
+    let page = page_size();
+    let Some(rounded) = size.max(1).checked_next_multiple_of(page) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    allocate(rounded, page)
 }
 
 /// glibc's `malloc_usable_size`: how many bytes the block really holds.

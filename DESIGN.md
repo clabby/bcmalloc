@@ -31,7 +31,7 @@ bcmalloc is built from techniques that other allocators have proven, put togethe
 
 ## 2. Background
 
-Rust gives a global allocator a small contract[^globalalloc].
+Rust gives a global allocator a small contract[^globalalloc]. A small C library in the repository also exposes the allocator as malloc and free, for preloading into C programs. A C free carries no size, so it reads the block's class, or a huge block's length, from the chunk map described below.
 
 - Every free carries the layout that the block was allocated with.
 - The allocator must never unwind, and it must not allocate while it allocates. A lot of the standard library allocates, so the allocator stays on the thread-local storage and atomics that are documented not to.
@@ -159,13 +159,15 @@ A free reads the chunk map entry of the block, which names the heap that owns it
 
 The messages carry pointers and are not lists threaded through the blocks. A list would make the sender write into each freed block, whose cache line usually sits in the owner's core, and the owner would then read every block in turn to find the next. With messages, the only memory that moves between cores is the message itself, one line per eight blocks.
 
-The inbox is a stack that any thread pushes onto and that only its owner empties, with one swap. Nothing is ever popped by anyone else, so the stack cannot suffer the ABA problem. The owner reads it when a bin runs dry, which is when it needs blocks, and files each pointer into its bin, or into its slab if the bin is full. The chunk map tells it the class of each block. The message itself is then freed like any other block.
+The inbox is a stack that any thread pushes onto and that only its owner empties, with one swap. Nothing is ever popped by anyone else, so the stack cannot suffer the ABA problem. The owner reads it when a bin runs dry, which is when it needs blocks, and also when a bin overflows and before it starts a message of its own, so that a thread that only frees still gets its messages back. It files each pointer into its bin, or into its slab if the bin is full. The chunk map tells it the class of each block. The message itself is then freed like any other block.
 
 Two properties make this safe. A block in a message still counts as in use in its slab, so the slab cannot be released and its chunk map entry cannot change while the block is on its way. And a heap slot outlives its threads: a heap whose thread has exited keeps its inbox, and the next thread to claim the slot, or a call to `trim`, reads it.
 
 ## 8. Reallocation
 
 A small block keeps its place when the new size fits in it and wastes at most half of it, which is the rule mimalloc uses[^mimalloc]. A free takes the class from the chunk map and not from the layout, so a block that a realloc kept is still freed as what it is. A huge block that shrinks gives back the chunks past its new end, and one that grows claims the chunks right after it if they are free. Everything else is a new block and a copy.
+
+A heap keeps up to four freed huge blocks of at most 8 MiB, still claimed in the chunk bitmap, and hands one out again to the next request of the same size. A program that frees and allocates big buffers in a loop then skips the bitmap's atomics and the purge clock. Blocks nobody asks for go back at the heap's next maintenance steps, and a flush returns them at once.
 
 ## 9. Giving memory back
 
@@ -226,53 +228,116 @@ These are the costs.
 - Allocations over 4 MiB claim several bitmap words and are obstruction-free, not lock-free.
 - The capacity is a hard limit. A purge pass or a trim makes some chunks look allocated while it holds them, so a request that needs those chunks waits for the pass to finish. It does not fail.
 - A heap holds blocks in its bins and outboxes until it needs them, fills a message, or is flushed. A thread that goes quiet keeps them until it exits or calls `flush_thread`. The bins of one heap hold at most their initial capacity plus 2 MiB.
+- Each heap keeps up to 16 MiB of freed huge blocks for reuse until its maintenance steps or a flush return them. A thread that only allocates huge blocks never runs maintenance, so only a flush or its exit returns them.
 - Memory in a slab that is only partly free is never returned, and with huge pages neither is a huge page that is partly in use, except by `trim`.
 - Fresh pages are zero, but the allocator does not track that, so zeroed allocations always write zeros.
 - The NUMA parts are fixed when the region is created, and a heap keeps the node of the CPU its thread first ran on.
 
 ## 13. Results
 
-The benchmark suite has 43 workloads in eight groups, including producer and consumer rings, Larson, false sharing, standard collections, resizing and large blocks, plus two that measure memory. Every workload runs in a fresh process, three times per allocator with the allocators taking turns in a rotating order, and the best run counts. `just bench` reproduces everything.
+There are two sets of benchmarks. The development suite has 51 synthetic workloads in eight groups, including producer and consumer rings, Larson, false sharing, standard collections, resizing, large blocks, latency percentiles and memory after a burst, and it is what changes are tuned against. The held-out set is never tuned against. It has real Rust programs, built on serde_json, regex, syn, a hyper server and tokio channels, and the C programs of mimalloc-bench run with bcmalloc preloaded through its C interface. Every Rust workload runs ten times per allocator, with the allocators taking turns in a rotating order and each run in a fresh process, and the tables show medians. The cold row measures the first pass of each workload and the others the steady state. `just bench`, `just bench-apps` and `just mimalloc-bench` reproduce everything.
 
-![Bars for eight kinds of workload showing each allocator's speed relative to mimalloc on macOS and on Linux, and a chart of the memory still held after a burst is freed](assets/benchmarks.svg)
+![Bars for eight kinds of workload showing each allocator's speed relative to mimalloc on macOS and on Linux, and bars for the held-out programs](assets/benchmarks.svg)
 
-**Figure 9.** Speed relative to mimalloc, as the geometric mean of each group, on both machines, and the memory still held after a burst is freed.
+**Figure 9.** Speed relative to mimalloc, as the geometric mean of each group, on both machines, and the held-out programs.
 
-On an Apple M4 Max with macOS 26.5, where the system allocator is libmalloc:
+The development suite on an Apple M4 Max with macOS 26.5, where the system allocator is libmalloc:
 
 | Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
 | ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 0.51   | 3.17     | 1.00     | 0.50     | 1.55     |
-| speed, bulk            | 0.28   | 1.35     | 1.00     | 0.40     | 0.73     |
-| speed, churn           | 0.25   | 2.36     | 1.00     | 1.36     | 1.59     |
-| speed, sharing         | 0.56   | 2.94     | 1.00     | 2.12     | 1.56     |
-| speed, false sharing   | 0.47   | 0.99     | 1.00     | 0.71     | 1.00     |
-| speed, collections     | 0.67   | 1.22     | 1.00     | 0.65     | 1.12     |
-| speed, resizing        | 0.89   | 1.04     | 1.00     | 0.99     | 0.88     |
-| speed, large           | 0.99   | 1.16     | 1.00     | 0.15     | 0.12     |
-| speed, all workloads   | 0.49   | 1.95     | 1.00     | 0.82     | 1.15     |
-| speed, mean of groups  | 0.52   | 1.60     | 1.00     | 0.67     | 0.88     |
-| memory held afterwards | 3.46   | 7.60     | 1.00     | 0.98     | 6.88     |
-| peak resident memory   | 1.05   | 1.00     | 1.00     | 0.99     | 1.11     |
+| speed, pair            | 0.55   | 3.95     | 1.00     | 0.54     | 1.70     |
+| speed, bulk            | 0.27   | 1.50     | 1.00     | 0.43     | 0.79     |
+| speed, churn           | 0.29   | 2.42     | 1.00     | 1.46     | 1.60     |
+| speed, sharing         | 0.55   | 3.03     | 1.00     | 2.18     | 1.60     |
+| speed, false sharing   | 0.86   | 1.00     | 1.00     | 0.77     | 1.00     |
+| speed, collections     | 0.71   | 1.24     | 1.00     | 0.67     | 1.20     |
+| speed, resizing        | 1.00   | 1.02     | 1.00     | 0.92     | 0.85     |
+| speed, large           | 0.98   | 1.06     | 1.00     | 0.14     | 0.11     |
+| speed, all workloads   | 0.52   | 2.07     | 1.00     | 0.88     | 1.22     |
+| speed, mean of groups  | 0.59   | 1.66     | 1.00     | 0.69     | 0.89     |
+| speed, cold            | 0.52   | 2.04     | 1.00     | 0.87     | 1.23     |
+| latency, p99           | 0.53   | 3.21     | 1.00     | 2.38     | 1.66     |
+| memory held afterwards | 2.29   | 3.11     | 1.00     | 0.96     | 3.90     |
+| peak resident memory   | 0.98   | 0.99     | 1.00     | 0.99     | 1.09     |
 
 On an AMD EPYC 9354P with 32 cores and Linux 7.0 with transparent huge pages, where the system allocator is glibc 2.39:
 
 | Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
 | ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 1.07   | 2.72     | 1.00     | 0.66     | 1.68     |
-| speed, bulk            | 0.12   | 1.13     | 1.00     | 0.33     | 0.55     |
-| speed, churn           | 0.80   | 2.18     | 1.00     | 1.77     | 1.83     |
-| speed, sharing         | 0.32   | 2.21     | 1.00     | 2.17     | 1.08     |
-| speed, false sharing   | 0.99   | 1.00     | 1.00     | 0.98     | 1.00     |
-| speed, collections     | 0.58   | 1.04     | 1.00     | 0.71     | 0.95     |
-| speed, resizing        | 1.02   | 1.10     | 1.00     | 0.60     | 0.90     |
-| speed, large           | 0.44   | 1.08     | 1.00     | 0.08     | 0.23     |
-| speed, all workloads   | 0.61   | 1.71     | 1.00     | 0.86     | 1.12     |
-| speed, mean of groups  | 0.55   | 1.44     | 1.00     | 0.64     | 0.88     |
-| memory held afterwards | 33.70  | 7.48     | 1.00     | 0.98     | 1.01     |
-| peak resident memory   | 2.20   | 1.08     | 1.00     | 1.85     | 1.50     |
+| speed, pair            | 1.05   | 3.11     | 1.00     | 0.64     | 1.73     |
+| speed, bulk            | 0.13   | 1.15     | 1.00     | 0.33     | 0.57     |
+| speed, churn           | 0.82   | 2.21     | 1.00     | 1.65     | 1.70     |
+| speed, sharing         | 0.32   | 2.27     | 1.00     | 2.16     | 1.08     |
+| speed, false sharing   | 0.89   | 1.00     | 1.00     | 1.00     | 1.00     |
+| speed, collections     | 0.61   | 1.01     | 1.00     | 0.72     | 0.94     |
+| speed, resizing        | 1.02   | 1.06     | 1.00     | 0.60     | 0.90     |
+| speed, large           | 0.44   | 1.09     | 1.00     | 0.08     | 0.23     |
+| speed, all workloads   | 0.62   | 1.76     | 1.00     | 0.88     | 1.14     |
+| speed, mean of groups  | 0.55   | 1.46     | 1.00     | 0.63     | 0.88     |
+| speed, cold            | 0.62   | 1.76     | 1.00     | 0.86     | 1.08     |
+| latency, p99           | 0.94   | 3.04     | 1.00     | 1.67     | 2.00     |
+| memory held afterwards | 11.88  | 3.12     | 1.00     | 1.06     | 1.10     |
+| peak resident memory   | 2.20   | 1.11     | 1.00     | 1.86     | 1.50     |
 
-Above 1.00 is better than mimalloc, for speed and for memory alike. The all-workloads row counts every workload once, and the mean-of-groups row counts every group once. On macOS bcmalloc is the fastest allocator on 37 of the 43 workloads and within 5% of the fastest on four more. It trails jemalloc when one vector grows to millions of elements and on the channel with four producers. On Linux it is the fastest on 25 and within 5% on seven more. jemalloc is ahead on the channels, where the consumer frees blocks it never reuses. glibc is ahead on single very large blocks and on growing a large vector, and snmalloc by under 15% on the smallest blocks of a single thread and on the tree rewrite. After a 256 MiB burst is freed, bcmalloc holds under 5 MiB on both machines, where mimalloc and jemalloc hold about 260.
+Above 1.00 is better than mimalloc, for speed, latency and memory alike.
+
+The Rust programs on macOS, in megabytes, thousands of requests or millions of messages per second. Bold marks the best median and every median whose 95% bootstrap interval overlaps it.
+
+| Workload                | system    | bcmalloc   | mimalloc   | jemalloc  | snmalloc   |
+| ----------------------- | --------- | ---------- | ---------- | --------- | ---------- |
+| json (MB/s)             | 250.7     | **284.1**  | **291.9**  | 241.3     | **296.9**  |
+| regex (MB/s)            | 1436.7    | **1502.3** | **1503.1** | 1435.8    | **1511.5** |
+| syn (MB/s)              | 15.9      | **20.6**   | 19.3       | 15.9      | 18.9       |
+| http (kreq/s)           | **207.0** | **223.4**  | **223.4**  | **215.1** | **210.6**  |
+| tokio channels (Mmsg/s) | 3.99      | **4.61**   | 4.08       | **4.35**  | **4.40**   |
+
+The same programs on Linux:
+
+| Workload                | system | bcmalloc   | mimalloc | jemalloc | snmalloc   |
+| ----------------------- | ------ | ---------- | -------- | -------- | ---------- |
+| json (MB/s)             | 131.8  | **193.3**  | 187.8    | 171.8    | 181.7      |
+| regex (MB/s)            | 987.1  | **1043.6** | 1039.3   | 1027.1   | **1046.3** |
+| syn (MB/s)              | 7.18   | **10.4**   | 9.90     | 9.11     | 9.68       |
+| http (kreq/s)           | 101.3  | **123.5**  | 115.1    | 120.5    | 118.5      |
+| tokio channels (Mmsg/s) | 1.23   | **2.07**   | 1.41     | 1.92     | 1.76       |
+
+mimalloc-bench on Linux, in seconds as the median of three runs, lower is better. tcmalloc is the one from mimalloc-bench's own build. Bold marks the fastest. The last two rows are geometric means of mimalloc's figure over each allocator's, so above 1.00 is better, and the memory row compares peak resident memory.
+
+| Test | system | bcmalloc | mimalloc | jemalloc | snmalloc | tcmalloc |
+| --- | --- | --- | --- | --- | --- | --- |
+| alloc-test1 | 3.27 | 2.72 | 2.55 | 2.59 | 2.59 | **2.54** |
+| alloc-testN | 2.94 | 2.53 | **2.30** | 2.32 | 2.35 | 2.46 |
+| barnes | 2.24 | **2.15** | 2.25 | 2.25 | 2.24 | 2.25 |
+| cache-scratch1 | **1.05** | **1.05** | **1.05** | **1.05** | **1.05** | 1.06 |
+| cache-scratchN | **0.03** | **0.03** | **0.03** | **0.03** | **0.03** | **0.03** |
+| cache-thrash1 | **1.05** | **1.05** | **1.05** | **1.05** | **1.05** | **1.05** |
+| cache-thrashN | **0.03** | **0.03** | **0.03** | **0.03** | **0.03** | **0.03** |
+| cfrac | 3.53 | 3.39 | 3.17 | 3.27 | **3.15** | 3.21 |
+| espresso | 3.91 | 3.53 | 3.47 | 3.54 | **3.43** | 3.45 |
+| glibc-simple | 2.11 | 1.69 | 1.61 | 1.90 | 1.61 | **1.52** |
+| glibc-thread | 0.33 | 0.22 | 0.20 | 0.21 | **0.19** | 0.47 |
+| gs | 0.23 | **0.22** | 0.23 | 0.24 | 0.25 | 0.23 |
+| larsonN | 1.69 | 1.21 | **1.06** | 1.24 | 1.22 | 1.19 |
+| larsonN-sized | 1.68 | 1.18 | **1.05** | 1.13 | 1.20 | 1.13 |
+| leanN | 10.90 | **8.90** | 9.47 | 9.16 | 9.01 | 9.80 |
+| linux | **0.12** | 0.15 | 0.13 | 0.14 | 0.13 | 0.27 |
+| lua | 0.79 | **0.76** | 0.78 | 0.79 | 0.77 | 0.80 |
+| malloc-large | 2.06 | **1.31** | 1.36 | 15.11 | 3.51 | 1.45 |
+| mleak10 | **0.14** | **0.14** | **0.14** | 0.15 | **0.14** | **0.14** |
+| mleak100 | 1.39 | 1.42 | 1.40 | 1.45 | 1.41 | **1.37** |
+| mstressN | 1.28 | **0.54** | 0.74 | 1.07 | 0.76 | 1.01 |
+| rbstress1 | **2.79** | 2.82 | 2.82 | **2.79** | 2.81 | 2.81 |
+| rbstressN | 3.03 | 3.03 | 3.05 | 3.03 | 3.03 | **3.02** |
+| redis | 3.28 | 3.22 | 3.20 | 3.74 | **3.12** | 3.30 |
+| rocksdb | 4.41 | **4.22** | 4.34 | 4.27 | 4.34 | 4.29 |
+| rptestN | 0.99 | 0.38 | 0.28 | 0.44 | **0.23** | 0.65 |
+| sh6benchN | 0.24 | **0.06** | 0.07 | 0.10 | 0.10 | 0.13 |
+| sh8benchN | 0.64 | 0.19 | **0.18** | 0.27 | 0.19 | 6.45 |
+| xmalloc-testN | 0.94 | 0.18 | 0.24 | **0.17** | 0.19 | 60.57 |
+| speed against mimalloc | 0.74 | 0.99 | 1.00 | 0.86 | 0.96 | 0.64 |
+| memory against mimalloc | 1.06 | 0.51 | 1.00 | 0.83 | 0.84 | 0.77 |
+
+The held-out set changes the picture. On the Rust programs bcmalloc is the fastest on both machines, but only by 3% on macOS and 7% on Linux, because real programs spend most of their time outside the allocator. On mimalloc-bench it ties mimalloc for speed and is ahead of jemalloc, snmalloc and tcmalloc, but it holds about twice as much memory at peak as mimalloc. The largest gaps in memory are in programs that start many threads, such as glibc-thread, alloc-test and lean, where every heap keeps its bins, an empty slab per class and its cached huge blocks.
 
 [^tigerbeetle]: [A Database Without Dynamic Memory Allocation](https://tigerbeetle.com/blog/2022-10-12-a-database-without-dynamic-memory/) explains why TigerBeetle sizes everything from fixed limits at start-up and what that buys.
 [^llfree]: [LLFree, scalable and optionally-persistent page-frame allocation](https://www.usenix.org/conference/atc23/presentation/wrenger) is a lock-free frame allocator whose every transaction is a single atomic change of a single cache line.
