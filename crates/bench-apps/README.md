@@ -1,8 +1,8 @@
 # Benchmark apps
 
-This crate holds real Rust programs that run under the same allocators as the main benchmarks. They are a held-out set. The allocator is never tuned against them. They exist to catch tuning that helps the synthetic loops of the main crate and does nothing for ordinary programs.
+This crate holds real Rust programs that run under the same allocators as the synthetic benchmarks in crates/bench. They are a held-out set. The allocator is never tuned against them. They exist to catch tuning that helps the synthetic loops and does nothing for ordinary programs.
 
-The crate has its own empty `[workspace]` table, so it stays out of the build of the main crate. It depends on bcmalloc by path and on the same competitors, mimalloc, snmalloc and jemalloc, plus the application crates.
+It is a member of the workspace that is never published. It depends on bcmalloc and on the same competitors, mimalloc, snmalloc and jemalloc, plus the application crates. `just bench-apps` runs it with the benchmark driver, which takes the same options as `just bench`.
 
 ## Workloads
 
@@ -23,9 +23,9 @@ Every workload prints a cold line, the first pass in a fresh process, and a warm
 Build every binary, then run one workload by hand with the binary of the allocator you want. There is one binary per allocator: system, bcmalloc, mimalloc, jemalloc and snmalloc.
 
 ```sh
-cargo bench --no-run --manifest-path bench-apps/Cargo.toml
-cargo bench --manifest-path bench-apps/Cargo.toml --bench bcmalloc -- --workload json
-cargo bench --manifest-path bench-apps/Cargo.toml --bench mimalloc -- --workload "tokio channels" --quick
+cargo bench -p bcmalloc-bench-apps --no-run
+cargo bench -p bcmalloc-bench-apps --bench bcmalloc -- --workload json
+cargo bench -p bcmalloc-bench-apps --bench mimalloc -- --workload "tokio channels" --quick
 ```
 
 The binaries speak version 2 of the benchmark protocol.
@@ -43,4 +43,4 @@ bcmalloc	json	cold	287.756	MB/s	54.8
 bcmalloc	json	warm	284.666	MB/s	54.8
 ```
 
-Each run is a new process, so build the binaries once and start them as often as you like. Cargo prints their paths under `bench-apps/target/release/build/` when it builds them.
+Each run is a new process, so build the binaries once and start them as often as you like. Cargo prints their paths under `target/release/build/` when it builds them.

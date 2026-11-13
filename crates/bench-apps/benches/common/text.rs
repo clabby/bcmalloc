@@ -26,7 +26,7 @@ impl Rng {
     }
 
     /// An element of a non-empty slice.
-    pub(crate) fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    pub(crate) const fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len())]
     }
 }

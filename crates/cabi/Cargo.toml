@@ -1,0 +1,19 @@
+[package]
+name = "bcmalloc-cabi"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The C allocation interface of bcmalloc, as a library to preload."
+
+[lib]
+name = "bcmalloc_c"
+crate-type = ["cdylib"]
+
+[dependencies]
+bcmalloc = { workspace = true, features = ["std"] }
+libc = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

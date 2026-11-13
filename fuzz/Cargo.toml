@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bcmalloc = { path = "..", features = ["testing"] }
+bcmalloc = { path = "../crates/bcmalloc", features = ["testing"] }
 
 [[bin]]
 name = "heap_ops"

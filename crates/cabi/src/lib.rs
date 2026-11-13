@@ -4,7 +4,7 @@
 //! is preloaded:
 //!
 //! ```text
-//! LD_PRELOAD=cabi/target/release/libbcmalloc.so ./program
+//! LD_PRELOAD=target/cabi/release/libbcmalloc_c.so ./program
 //! ```
 //!
 //! Every function forwards to one [`Bcmalloc`] with its default configuration. C frees carry no

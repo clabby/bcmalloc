@@ -46,6 +46,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -204,10 +205,10 @@ fn main() {
     choose_primary(&mut workloads, &results);
 
     let tsv = to_tsv(&results);
-    let _ = fs::create_dir_all("target");
-    let _ = fs::write("target/bench.tsv", &tsv);
+    let _ = fs::create_dir_all(workspace().join("target"));
+    let _ = fs::write(workspace().join("target/bench.tsv"), &tsv);
     if let Some(path) = value_of("--save") &&
-        let Err(error) = fs::write(&path, &tsv)
+        let Err(error) = fs::write(workspace().join(&path), &tsv)
     {
         eprintln!("cannot save to {path}: {error}");
     }
@@ -310,10 +311,12 @@ fn taskset_available(list: &str) -> bool {
 fn build(manifest: Option<&str>) -> BTreeMap<String, String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut command = Command::new(cargo);
-    command.args(["bench", "--no-run", "--message-format=json"]);
-    if let Some(path) = manifest {
-        command.args(["--manifest-path", path]);
-    }
+    command.args(["bench", "--no-run", "--message-format=json", "--manifest-path"]);
+    // A relative manifest path is taken from the root of the workspace, where the recipes run.
+    command.arg(manifest.map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        |path| workspace().join(path),
+    ));
     let output = command.stderr(Stdio::inherit()).output().expect("cargo runs");
     let mut binaries = BTreeMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -330,6 +333,13 @@ fn build(manifest: Option<&str>) -> BTreeMap<String, String> {
         }
     }
     binaries
+}
+
+/// The root of the workspace, two levels above this crate. Paths given on the command line are
+/// taken from there, because the driver runs in this crate's directory. Absolute paths stay as
+/// they are, since joining an absolute path replaces the base.
+fn workspace() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// The binary names with the known allocators first, in their usual order.
@@ -434,7 +444,7 @@ fn to_tsv(results: &Results) -> String {
 
 /// Reads a samples file. The old files have five fields and no run, which count as warm.
 fn read_tsv(path: &str) -> Results {
-    let text = fs::read_to_string(path).unwrap_or_else(|error| {
+    let text = fs::read_to_string(workspace().join(path)).unwrap_or_else(|error| {
         eprintln!("cannot read {path}: {error}");
         std::process::exit(2);
     });

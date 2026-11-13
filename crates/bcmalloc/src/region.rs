@@ -528,7 +528,7 @@ impl<'a> Region<'a> {
 ///
 /// The owner sits in the low 32 bits, so the free path reads it with one load and a truncation.
 /// The top bit marks a huge block. Frees through the Rust interfaces know a huge block by its
-/// layout. The entry is what lets a C [`free`] without a size tell the two apart.
+/// layout. The entry is what lets a C `free` without a size tell the two apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Entry(pub(crate) u64);
 

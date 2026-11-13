@@ -1,0 +1,42 @@
+[package]
+name = "bcmalloc-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The synthetic benchmark suite of bcmalloc and the driver that runs it and the bench apps."
+
+[dependencies]
+bcmalloc = { workspace = true, features = ["std"] }
+libc = { workspace = true, features = ["std"] }
+mimalloc.workspace = true
+snmalloc-rs.workspace = true
+tikv-jemallocator.workspace = true
+
+[[bench]]
+name = "system"
+harness = false
+
+[[bench]]
+name = "bcmalloc"
+harness = false
+
+[[bench]]
+name = "mimalloc"
+harness = false
+
+[[bench]]
+name = "jemalloc"
+harness = false
+
+[[bench]]
+name = "snmalloc"
+harness = false
+
+[[bench]]
+name = "report"
+harness = false
+
+[lints]
+workspace = true

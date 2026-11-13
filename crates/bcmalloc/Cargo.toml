@@ -1,0 +1,27 @@
+[package]
+name = "bcmalloc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A scalable global allocator that reserves its memory up front, for long-lived, highly concurrent programs."
+readme = "README.md"
+keywords = ["allocator", "malloc", "global-allocator", "lock-free", "no-std"]
+categories = ["memory-management", "concurrency", "no-std"]
+
+[features]
+default = [ "std" ]
+# Enables the `#[global_allocator]` front end, which needs thread-local storage from `std`.
+std = [ "libc/std" ]
+# Exposes the model-checking helpers in `bcmalloc::testing` (used by the fuzz targets).
+testing = [ "std" ]
+
+[dependencies]
+libc.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true
