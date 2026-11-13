@@ -91,12 +91,31 @@ The suite has 43 workloads in eight groups, including producer and consumer ring
 
 bcmalloc is the fastest allocator on 32 of the 43 workloads and within 5% of the fastest on three more. jemalloc is ahead when threads free blocks that other threads allocated, which covers the rings, the channels and the shared table, and when a single vector grows to millions of elements. mimalloc is ahead on random reallocation. After a 256 MiB burst is freed, bcmalloc holds 2.8 MiB, where mimalloc holds 261 and jemalloc 222. DESIGN.md has the full results, the eight losses, and the directions we would take next.
 
+The same suite has also run on Linux, on a 32-core AMD EPYC 9354P with simultaneous multithreading off, Ubuntu 24.04 with kernel 7.0, and Rust 1.100. The system allocator there is glibc 2.39. Memory is measured as the resident set, which is not the macOS footprint, so the two tables compare allocators on one machine and not the machines with each other.
+
+| Linux, compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
+| ----------------------------- | ------ | -------- | -------- | -------- | -------- |
+| speed, pair                   | 1.11   | 1.47     | 1.00     | 0.83     | 0.79     |
+| speed, bulk                   | 0.13   | 0.65     | 1.00     | 0.32     | 0.51     |
+| speed, churn                  | 0.79   | 1.83     | 1.00     | 1.57     | 1.78     |
+| speed, sharing                | 0.32   | 1.00     | 1.00     | 2.03     | 1.07     |
+| speed, false sharing          | 0.88   | 1.00     | 1.00     | 0.99     | 1.00     |
+| speed, collections            | 0.58   | 0.93     | 1.00     | 0.71     | 0.95     |
+| speed, resizing               | 1.03   | 0.95     | 1.00     | 0.59     | 0.89     |
+| speed, large                  | 0.44   | 0.97     | 1.00     | 0.07     | 0.22     |
+| speed, all workloads          | 0.61   | 1.17     | 1.00     | 0.86     | 0.93     |
+| speed, mean of groups         | 0.55   | 1.05     | 1.00     | 0.63     | 0.78     |
+| memory held afterwards        | 33.70  | 14.93    | 1.00     | 0.98     | 1.01     |
+| peak resident memory          | 2.24   | 2.11     | 1.00     | 1.87     | 1.97     |
+
+On Linux bcmalloc is the fastest on 11 of the 41 speed workloads and within 5% of the fastest on five more. The lead over mimalloc is smaller than on macOS, at 1.17 over all workloads. snmalloc is ahead when one thread allocates and frees blocks up to 16 KiB, mimalloc on bulk frees, and jemalloc again on the rings, the channels and the shared table. After the 256 MiB burst bcmalloc holds 1.2 MiB, where mimalloc holds 260 and glibc 0.2.
+
 ## Limits
 
 - Alignments above 64 KiB are refused, and the allocation fails.
 - A thread that finds all `max_heaps` heaps taken fails its allocations, which aborts the program.
 - The capacity is a hard limit. Nothing grows the region after start-up.
-- Linux and macOS are supported. Windows is not. Nothing has been run on Linux yet.
+- Linux and macOS are supported. Windows is not. On Linux, the tests and benchmarks have run on one x86-64 machine.
 - The standard library's `Allocator` trait needs Rust 1.100 or later, which is the minimum supported version.
 
 ## Testing

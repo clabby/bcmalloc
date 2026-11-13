@@ -149,6 +149,10 @@ pub(crate) unsafe fn discard(ptr: NonNull<u8>, len: usize) {
 /// # Safety
 ///
 /// The range must lie within a live reservation and belong to the caller.
+#[cfg_attr(
+    not(all(target_os = "macos", not(miri))),
+    allow(clippy::missing_const_for_fn, reason = "only macOS makes a system call here")
+)]
 pub(crate) unsafe fn reuse(ptr: NonNull<u8>, len: usize) {
     #[cfg(all(target_os = "macos", not(miri)))]
     // SAFETY: forwarded from the caller.

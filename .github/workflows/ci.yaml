@@ -129,7 +129,10 @@ jobs:
           workspaces: fuzz
           cache-on-failure: true
       - uses: taiki-e/install-action@just
-      - uses: taiki-e/install-action@cargo-fuzz
+      # The action has no tag for cargo-fuzz, so it is named as a tool and installed by fallback.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Fuzz the chunk allocator
         run: just fuzz chunk_ops 60
       - name: Fuzz the heaps

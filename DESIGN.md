@@ -1,6 +1,6 @@
 # How bcmalloc works
 
-**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions and without touching the slab it came from. On an Apple M4 Max it is the fastest of five allocators on 32 of 43 workloads, and 1.64 times faster than mimalloc by geometric mean (1.43 times when each of eight kinds of workload counts once). jemalloc is still faster when threads free each other's blocks and when one huge vector grows. bcmalloc returns idle memory to the operating system on a timer, so after a 256 MiB burst is freed it holds 2.8 MiB where mimalloc holds 261. This post walks through the design, the tests that keep it honest, the numbers, and the directions we think are worth taking next.
+**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions and without touching the slab it came from. On an Apple M4 Max it is the fastest of five allocators on 32 of 43 workloads, and 1.64 times faster than mimalloc by geometric mean (1.43 times when each of eight kinds of workload counts once). On a 32-core AMD EPYC under Linux the lead is smaller, 1.17 times (1.05). jemalloc is still faster when threads free each other's blocks and when one huge vector grows. bcmalloc returns idle memory to the operating system on a timer, so after a 256 MiB burst is freed it holds 2.8 MiB where mimalloc holds 261. This post walks through the design, the tests that keep it honest, the numbers, and the directions we think are worth taking next.
 
 ## 1. Introduction
 
@@ -173,7 +173,7 @@ Memory ordering is the other thing to state clearly. A chunk claim is an `Acquir
 
 ## 10. Results
 
-All numbers come from an Apple M4 Max with 12 performance and 4 efficiency cores, macOS 26.5 and Rust 1.100. The suite has 43 workloads in eight groups, plus two that measure memory. Every workload runs in a fresh process, three times per allocator with the allocators taking turns in a rotating order, and the tables keep the best run. The system allocator is macOS libmalloc. ~just bench~ reproduces everything.
+Unless a table says Linux, the numbers come from an Apple M4 Max with 12 performance and 4 efficiency cores, macOS 26.5 and Rust 1.100. The suite has 43 workloads in eight groups, plus two that measure memory. Every workload runs in a fresh process, three times per allocator with the allocators taking turns in a rotating order, and the tables keep the best run. The system allocator is macOS libmalloc. ~just bench~ reproduces everything.
 
 ![Bars for eight kinds of workload showing each allocator's speed relative to mimalloc, and a chart of the memory still held after a burst is freed](assets/benchmarks.svg)
 
@@ -236,6 +236,55 @@ The changes that bought the most are worth listing, because each was found by me
 
 The last row is in MiB and the others are millions of operations per second.
 
+The same suite has since run on Linux, on an AMD EPYC 9354P with 32 cores and simultaneous multithreading off, 377 GiB of memory, Ubuntu 24.04 with kernel 7.0, and Rust 1.100. The system allocator there is glibc 2.39. Another user's single-threaded process kept one core busy for the whole run. Memory on Linux is the resident set from `/proc/self/statm` and the peak from `getrusage`, which count pages differently from the macOS footprint, so compare the memory rows within a table and not across the two.
+
+| Linux, compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
+| ----------------------------- | ------ | -------- | -------- | -------- | -------- |
+| speed, pair                   | 1.11   | 1.47     | 1.00     | 0.83     | 0.79     |
+| speed, bulk                   | 0.13   | 0.65     | 1.00     | 0.32     | 0.51     |
+| speed, churn                  | 0.79   | 1.83     | 1.00     | 1.57     | 1.78     |
+| speed, sharing                | 0.32   | 1.00     | 1.00     | 2.03     | 1.07     |
+| speed, false sharing          | 0.88   | 1.00     | 1.00     | 0.99     | 1.00     |
+| speed, collections            | 0.58   | 0.93     | 1.00     | 0.71     | 0.95     |
+| speed, resizing               | 1.03   | 0.95     | 1.00     | 0.59     | 0.89     |
+| speed, large                  | 0.44   | 0.97     | 1.00     | 0.07     | 0.22     |
+| speed, all workloads          | 0.61   | 1.17     | 1.00     | 0.86     | 0.93     |
+| speed, mean of groups         | 0.55   | 1.05     | 1.00     | 0.63     | 0.78     |
+| memory held afterwards        | 33.70  | 14.93    | 1.00     | 0.98     | 1.01     |
+| peak resident memory          | 2.24   | 2.11     | 1.00     | 1.87     | 1.97     |
+
+bcmalloc is the fastest on 11 of the 41 speed workloads and within 5% of the fastest on five more. It is 1.17 times faster than mimalloc over all workloads and 1.05 times when each group counts once, where macOS gave 1.64 and 1.43. The peak-memory row flatters every allocator against mimalloc because a mimalloc process starts at about 6 MiB resident where the others start at 2.4, and that dominates the many small workloads.
+
+The wins that carry over are churn, Larson and the medium sizes.
+
+| Linux workload (millions of operations per second) | bcmalloc | mimalloc | jemalloc | snmalloc |
+| -------------------------------------------------- | -------- | -------- | -------- | -------- |
+| mixed sizes with a live set, 1 thread              | 95.4     | 58.0     | 78.3     | 87.0     |
+| mixed sizes with a live set, 16 threads            | 1466     | 499      | 1179     | 1359     |
+| Larson, 8 threads                                  | 594      | 425      | 544      | 537      |
+| allocate and free 64 KiB, one thread               | 82.3     | 55.4     | 6.7      | 3.2      |
+| linked list                                        | 162      | 156      | 72.9     | 125      |
+
+The losses are more numerous than on macOS. This table lists every one where the gap is above 25%.
+
+| Linux workload (millions of operations per second) | bcmalloc | Fastest       | Gap  |
+| -------------------------------------------------- | -------- | ------------- | ---- |
+| ring of 4 threads passing batches                  | 24.8     | jemalloc 114  | 4.6x |
+| ring of 8 threads passing batches                  | 49.7     | jemalloc 213  | 4.3x |
+| allocate and free 16 KiB, one thread               | 82.4     | snmalloc 192  | 2.3x |
+| channel with 4 producers and 4 consumers           | 16.5     | jemalloc 38.3 | 2.3x |
+| allocate and free 4 KiB, one thread                | 87.6     | snmalloc 192  | 2.2x |
+| channel with 1 producer and 1 consumer             | 4.5      | jemalloc 9.8  | 2.1x |
+| shared table swapped by 8 threads                  | 31.5     | jemalloc 60.7 | 1.9x |
+| allocate and free 1 KiB, one thread                | 155      | snmalloc 289  | 1.9x |
+| free 32 B blocks in shuffled order                 | 54.1     | mimalloc 89.1 | 1.6x |
+| allocate and free 16 B, one thread                 | 200      | snmalloc 291  | 1.5x |
+| hash map with replaced entries                     | 5.7      | mimalloc 8.1  | 1.4x |
+| realloc to random sizes                            | 6.2      | mimalloc 8.4  | 1.4x |
+| growing a vector of a million numbers              | 1375     | system 1827   | 1.3x |
+
+Two things changed shape. The single-thread fast path lost most of its lead, with the pair group at 1.47 against 2.18 on macOS and the bulk group at 0.65 against 1.45, and snmalloc is the fastest at every pair size up to 16 KiB. On Linux the heap is found through an ordinary thread-local and not the direct slot read that aarch64 macOS uses, but the CPU is different too, so this run cannot say which of the two is responsible, and we have not profiled it. The remote-free gap also widened, to 4.3 times on the 8-thread ring, and we have not profiled that either. Vector growth now trails glibc. jemalloc, which led it on macOS, is 4.9 times slower than bcmalloc here. We believe glibc moves the pages of large blocks with `mremap`, which is the second direction below.
+
 ## 11. Limits and what comes next
 
 bcmalloc is a working allocator and not a finished one. These are the limits we know about.
@@ -248,20 +297,20 @@ bcmalloc is a working allocator and not a finished one. These are the limits we 
 - Memory in a slab that is only partly free is never returned. No allocator in the suite does this, and the half-freed workload shows it.
 - Fresh pages are zero, but the allocator does not track that, so zeroed allocations always write zeros.
 - A slab abandoned by an exited thread stays with its heap until a new thread claims that heap or `trim` sweeps it.
-- Nothing has run on Linux yet. The portable thread lookup that Linux uses is tested on macOS by forcing it with a build flag, and the Linux half of the platform layer has only unit tests that this machine could not run. The direct slot read exists for aarch64 macOS only.
-- Every number comes from one machine.
+- Linux has run on one x86-64 machine, where the unit, integration and documentation tests pass, both fuzz targets survive a one-minute smoke run, and the benchmark suite completes. The direct slot read exists for aarch64 macOS only, so Linux uses the portable thread lookup.
+- The numbers come from two machines, one for each operating system.
 
 These are the directions we think are worth taking, in the order we would try them. Most have a measurement behind them, and the last two are ideas that we have not yet measured.
 
 1. **A cache of foreign blocks.** The ring, the channel and the shared table are all the same gap, 1.3 to 2.1 times behind jemalloc. A small bounded stack per class of blocks that belong to other heaps' slabs would let the freeing thread reuse them for its own allocations and spill the rest through the batch path that exists. The slab owner stays the same, so the remote protocol does not change. The costs are that those slabs stay pinned while their blocks are held and that the bound needs a policy. It needs loom models for the owner learning about a slab whose blocks are cached elsewhere, and a fuzz operation that frees across heaps with the cache full.
-2. **Moving pages instead of copying them for huge reallocations.** Growing a vector is 2.1 times behind. Linux has `mremap` and macOS has `mach_vm_remap`, either of which moves a run's pages to a new address in the region without a copy. Growing in place when the next chunks are free is cheaper still, but huge runs are placed from the high end of the region, which leaves no room after them, so that would change placement too. The Linux half cannot be checked on the machine we have.
+2. **Moving pages instead of copying them for huge reallocations.** Growing a vector is 2.1 times behind jemalloc on macOS and 1.3 times behind glibc on Linux. Linux has `mremap` and macOS has `mach_vm_remap`, either of which moves a run's pages to a new address in the region without a copy. Growing in place when the next chunks are free is cheaper still, but huge runs are placed from the high end of the region, which leaves no room after them, so that would change placement too.
 3. **The realloc path and the path above 8 KiB.** Random reallocation is 1.5 times behind mimalloc and we have not profiled it. Sizes above the table take a function call and the arithmetic classification, and the hash map workload is 6% behind snmalloc. A profile should say whether a second table, an inlined medium path or a cheaper same-class test is the right fix.
 4. **A per-CPU backend through restartable sequences on Linux.** It would bound the heap count by the number of CPUs and not the number of threads, which also removes the heap-exhaustion limit.
 5. **Tuning the purge clock.** The interval is 10 ms and the timestamp covers a whole bitmap word of 64 chunks. A finer stamp, claiming recently purged runs last so that they stay purged, and purging sooner when the region is nearly full are all cheap to try. On Linux the lazy discard may beat the eager one on the refault cost, and that needs measuring there.
 6. **Latency and not only throughput.** The suite measures operations per second. The tails, which are the point for a database or a consensus node, come from a refill, a frontier extension, a purge pass and the first allocation, and none of them is measured. The Apple counter ticks at 24 MHz, so per-operation timing needs batches.
 7. **Memory from partly used slabs.** Compaction in the style of Mesh[^mesh] could return memory that nothing here can, at the price of changing what a block's address means.
 8. **Zero tracking, NUMA and huge pages.** Remembering which chunks are still zero would let zeroed allocations from fresh memory skip the write. A region per NUMA node, and handing back huge pages in 2 MiB units like Temeraire[^temeraire], fit in the same structure.
-9. **Validation on Linux and x86-64.** Run the suite and the fuzz targets there, and add the direct slot read for x86-64 macOS if anyone needs it.
+9. **Validation on Linux and x86-64.** The tests, a short fuzz run and the benchmark suite have run on one x86-64 Linux machine. Fuzz there for longer, profile the fast-path gap that the Linux tables show, and add the direct slot read for x86-64 macOS if anyone needs it.
 
 How fast is fast enough? For the programs this is meant for, the answer is mostly in the tail and in the memory curve and not in the single-thread number. The structure here keeps both predictable. The bound is explicit, the hot path touches only the caller's memory, idle memory goes back on a clock, and every cross-thread interaction is one compare-and-swap on one word that a model checker has seen every interleaving of.
 
