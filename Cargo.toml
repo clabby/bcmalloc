@@ -9,7 +9,7 @@ license = "Apache-2.0"
 readme = "README.md"
 keywords = ["allocator", "malloc", "global-allocator", "lock-free", "no-std"]
 categories = ["memory-management", "concurrency", "no-std"]
-exclude = ["/assets", "/fuzz", "/.github"]
+exclude = ["/assets", "/fuzz", "/.github", "/bench-apps", "/cabi"]
 
 [features]
 default = [ "std" ]
