@@ -44,7 +44,7 @@ pub const MAX_ALIGN: usize = CHUNK_SIZE;
 pub const MAX_SMALL: usize = 512 << 10;
 
 /// Requests of up to this many bytes are classified by a table lookup.
-pub(crate) const TABLE_MAX: usize = 1024;
+pub(crate) const TABLE_MAX: usize = 8192;
 
 /// The number of size classes.
 pub(crate) const CLASSES: usize = 104;
@@ -241,6 +241,14 @@ mod test {
     fn the_table_agrees_with_the_arithmetic() {
         for size in 0..=TABLE_MAX {
             assert_eq!(Class::from_table(size), Class::for_size(size), "{size}");
+        }
+    }
+
+    #[test]
+    fn table_classes_have_one_chunk_slabs() {
+        // The inlined free path finds a descriptor by chunk index alone, which needs this.
+        for size in 0..=TABLE_MAX {
+            assert_eq!(Class::from_table(size).slab_chunks(), 1, "{size}");
         }
     }
 
