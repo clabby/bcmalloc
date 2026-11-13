@@ -54,6 +54,17 @@
 //! caller returns the pages to the OS, and the next claim of a purged chunk learns that it must
 //! prepare them for use again.
 //!
+//! Pages are given back in granules of a fixed number of chunks. With transparent huge pages a
+//! granule is one 2 MiB page, 32 chunks, and a pass only takes a granule whose every chunk is free.
+//! Returning part of a huge page would split it into small pages, which costs the TLB reach that
+//! huge pages exist for. This is the rule Temeraire follows in TCMalloc.
+//!
+//! # Placement within a word
+//!
+//! A word of 64 chunks covers two huge pages. When a run fits in either half, it goes to the half
+//! that is already fuller, so that allocations pack into partly used huge pages and leave empty
+//! ones empty, where a purge can take them whole.
+//!
 //! # Memory ordering
 //!
 //! Claims use `Acquire` and frees use `Release`. A block is usually written by one thread, freed,
@@ -86,6 +97,8 @@ pub(crate) struct Chunks<'a> {
     /// For each word, the latest time that one of its chunks was freed, in milliseconds.
     stamps: &'a [AtomicU64],
     len: usize,
+    /// How many chunks are purged together, a power of two of at most 64.
+    granule: usize,
 }
 
 impl<'a> Chunks<'a> {
@@ -99,18 +112,21 @@ impl<'a> Chunks<'a> {
         4 * Self::words_for(chunks)
     }
 
-    /// Wraps zeroed bitmap storage that tracks `len` chunks.
+    /// Wraps zeroed bitmap storage that tracks `len` chunks, purging `granule` aligned chunks at
+    /// a time. `granule` must be a power of two of at most 64.
     ///
     /// # Panics
     ///
-    /// Panics if `words` is shorter than [`Chunks::storage_words`] for `len`.
-    pub(crate) fn new(words: &'a [AtomicU64], len: usize) -> Self {
+    /// Panics if `words` is shorter than [`Chunks::storage_words`] for `len`, or `granule` is not
+    /// a power of two of at most 64.
+    pub(crate) fn with_granule(words: &'a [AtomicU64], len: usize, granule: usize) -> Self {
+        assert!(granule.is_power_of_two() && granule <= WORD, "bad purge granule {granule}");
         let each = Self::words_for(len);
         assert!(words.len() >= 4 * each, "bitmap too short for {len} chunks");
         let (used, rest) = words.split_at(each);
         let (dirty, rest) = rest.split_at(each);
         let (purged, rest) = rest.split_at(each);
-        Self { used, dirty, purged, stamps: &rest[..each], len }
+        Self { used, dirty, purged, stamps: &rest[..each], len, granule }
     }
 
     /// The number of chunks tracked.
@@ -202,10 +218,10 @@ impl<'a> Chunks<'a> {
         }
     }
 
-    /// One pass of the purge clock at time `now` in milliseconds. Free chunks of a word whose
-    /// latest free is at least `delay` old are claimed and handed to `visit` in maximal runs.
-    /// Returns whether free chunks that still hold pages remain, because their word was freed into
-    /// too recently.
+    /// One pass of the purge clock at time `now` in milliseconds. Free granules with a dirty chunk,
+    /// in a word whose latest free is at least `delay` old, are claimed and handed to `visit` in
+    /// maximal runs. Returns whether such granules remain because their word was freed into too
+    /// recently. Dirty chunks in a granule that is partly in use wait until it is wholly free.
     ///
     /// Only chunks that this pass has claimed are visited, so `visit` may return their pages to the
     /// OS without risk to a live allocation. The claims are release operations, so a thread that
@@ -224,17 +240,16 @@ impl<'a> Chunks<'a> {
                 continue;
             }
             if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < delay {
-                pending |= self.dirty[w].load(Ordering::Relaxed) &
-                    !self.used[w].load(Ordering::Relaxed) &
-                    valid !=
-                    0;
+                let free = !self.used[w].load(Ordering::Relaxed) & valid;
+                pending |= self.purgeable(free, self.dirty[w].load(Ordering::Relaxed), valid) != 0;
                 continue;
             }
-            // Claim the dirty chunks that are still free. A dirty chunk in use was reclaimed after
-            // it was freed and becomes dirty again when it is freed.
+            // Claim the free granules that hold a dirty chunk. A dirty chunk in use was reclaimed
+            // after it was freed and becomes dirty again when it is freed.
             let mut seen = self.used[w].load(Ordering::Relaxed);
             let claimed = loop {
-                let want = self.dirty[w].load(Ordering::Relaxed) & valid & !seen;
+                let want =
+                    self.purgeable(!seen & valid, self.dirty[w].load(Ordering::Relaxed), valid);
                 if want == 0 {
                     break 0;
                 }
@@ -262,6 +277,24 @@ impl<'a> Chunks<'a> {
             }
         }
         pending
+    }
+
+    /// The chunks of a word that a purge would take: every granule that is entirely `free` and has
+    /// a `dirty` chunk. A granule that runs past the end of the region counts its valid part.
+    const fn purgeable(&self, free: u64, dirty: u64, valid: u64) -> u64 {
+        if self.granule == 1 {
+            return dirty & free & valid;
+        }
+        let mut want = 0;
+        let mut offset = 0;
+        while offset < WORD {
+            let mask = run_mask(self.granule, offset) & valid;
+            if mask != 0 && free & mask == mask && dirty & mask != 0 {
+                want |= mask;
+            }
+            offset += self.granule;
+        }
+        want
     }
 
     /// Hands the purged runs among the `n` chunks from `first`, which the caller has just claimed,
@@ -304,9 +337,7 @@ impl<'a> Chunks<'a> {
             if starts == 0 {
                 return None;
             }
-            let offset =
-                if highest { 63 - starts.leading_zeros() } else { starts.trailing_zeros() };
-            let offset = offset as usize;
+            let offset = pick_start(starts, seen, highest);
             match word.compare_exchange_weak(
                 seen,
                 seen | run_mask(n, offset),
@@ -380,6 +411,27 @@ impl<'a> Chunks<'a> {
 /// A mask of `n` one bits starting at bit `offset`.
 const fn run_mask(n: usize, offset: usize) -> u64 {
     if n == WORD { u64::MAX } else { ((1 << n) - 1) << offset }
+}
+
+/// Chooses where a run starts among `starts`, given the word's `used` bits. A start in the fuller
+/// half of the word wins, and within a half, or when the halves are equally full, the highest start
+/// if `highest` and the lowest otherwise.
+const fn pick_start(starts: u64, used: u64, highest: bool) -> usize {
+    const LOW: u64 = u32::MAX as u64;
+    let (low, high) = (starts & LOW, starts & !LOW);
+    let starts = if low != 0 && high != 0 {
+        let (low_used, high_used) = ((used & LOW).count_ones(), (used & !LOW).count_ones());
+        if low_used > high_used {
+            low
+        } else if high_used > low_used {
+            high
+        } else {
+            starts
+        }
+    } else {
+        starts
+    };
+    (if highest { 63 - starts.leading_zeros() } else { starts.trailing_zeros() }) as usize
 }
 
 /// The set of positions where a run of `n` free bits begins at a multiple of `align`.
@@ -597,9 +649,17 @@ mod test {
 
     #[test]
     fn matches_a_reference_model_under_random_traffic() {
-        let mut model = ChunkModel::new(300);
-        let mut rng = Rng::new(42);
-        for _ in 0..iterations(20_000) {
+        for granule in [1, 32] {
+            let mut model = ChunkModel::with_granule(300, granule);
+            let mut rng = Rng::new(42);
+            for _ in 0..iterations(20_000) {
+                random_step(&mut model, &mut rng);
+            }
+        }
+    }
+
+    fn random_step(model: &mut ChunkModel, rng: &mut Rng) {
+        {
             if rng.below(100) < 4 {
                 model.purge(rng.below(12) as u64);
             } else if model.live() == 0 || rng.below(100) < 55 {
@@ -615,6 +675,40 @@ mod test {
                 model.free(rng.below(1 << 20));
             }
         }
+    }
+
+    #[test]
+    fn a_huge_page_is_purged_only_when_all_of_it_is_free() {
+        let bitmap = Bitmap::with_granule(64, 32);
+        let chunks = bitmap.chunks();
+        let singles: Vec<_> = (0..33).map(|_| chunks.alloc(1, 1, 0).unwrap()).collect();
+        assert_eq!(singles, (0..33).collect::<Vec<_>>());
+        // Free all but one chunk of the first huge page, and the one chunk of the second.
+        for &chunk in &singles[1..] {
+            chunks.free_at(chunk, 1, 0);
+        }
+        let mut purged = Vec::new();
+        assert!(!chunks.purge_pass(100, 10, |run| purged.push(run)));
+        assert_eq!(purged.len(), 1, "only the wholly free huge page goes back");
+        assert_eq!(purged[0], 32..64);
+        chunks.free_at(0, 1, 100);
+        purged.clear();
+        chunks.purge_pass(200, 10, |run| purged.push(run));
+        assert_eq!(purged.first(), Some(&(0..32)));
+    }
+
+    #[test]
+    fn single_chunks_fill_the_fuller_huge_page_of_a_word_first() {
+        let bitmap = Bitmap::new(64);
+        let chunks = bitmap.chunks();
+        assert_eq!(chunks.alloc(8, 8, 0), Some(56), "the run takes the top of the word");
+        // The high half holds the run, so singles fill it before they start on the empty low half.
+        for chunk in 32..56 {
+            assert_eq!(chunks.alloc(1, 1, 0), Some(chunk));
+        }
+        assert_eq!(chunks.alloc(1, 1, 0), Some(0), "the high half is full");
+        chunks.free_at(40, 1, 0);
+        assert_eq!(chunks.alloc(1, 1, 0), Some(40), "the high half is fuller than the low one");
     }
 }
 

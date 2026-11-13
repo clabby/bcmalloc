@@ -6,13 +6,18 @@
 //! | ---------------- | ----------------------------------------------------------------------- |
 //! | --quick          | Do a quarter of the work in every workload.                             |
 //! | --rounds N       | Run each workload N times per allocator and keep the best. Default 3.   |
-//! | --filter TEXT    | Run only workloads whose name or group contains TEXT.                   |
+//! | --filter A,B     | Run only workloads whose name or group contains one of the texts.       |
 //! | --only A,B       | Run only the named allocators.                                          |
 //! | --baseline A     | The allocator that the summary compares against. Default mimalloc.      |
+//! | --perf           | Count hardware events of every run with perf stat (Linux).              |
 //!
 //! Each run is a fresh process, so no workload sees the heap that an earlier one left behind. The
 //! allocators take turns within every round, in a rotating order, so that drift in the machine
 //! hits all of them alike. The raw rows go to target/bench.tsv.
+//!
+//! With --perf each run is wrapped in perf stat, and the counters are printed after its result.
+//! They cover the whole process, which includes the warm-up run of the workload. Set
+//! BCMALLOC_PERF to the command to use, for instance "sudo perf", when perf needs privileges.
 
 use std::{
     collections::BTreeMap,
@@ -47,6 +52,7 @@ fn main() {
         args.iter().position(|arg| arg == flag).and_then(|at| args.get(at + 1)).cloned()
     };
     let quick = args.iter().any(|arg| arg == "--quick");
+    let perf = args.iter().any(|arg| arg == "--perf");
     let rounds: usize = value_of("--rounds").and_then(|v| v.parse().ok()).unwrap_or(3);
     let filter = value_of("--filter");
     let baseline = value_of("--baseline").unwrap_or_else(|| "mimalloc".to_string());
@@ -66,9 +72,12 @@ fn main() {
         for workload in &workloads {
             for turn in 0..allocators.len() {
                 let allocator = allocators[(turn + round) % allocators.len()];
-                let Some(cell) = run(&binaries[allocator], &workload.name, quick) else { continue };
+                let Some((cell, counters)) = run(&binaries[allocator], &workload.name, quick, perf)
+                else {
+                    continue;
+                };
                 eprintln!(
-                    "round {round} {allocator:>9} {:<26} {:>12.2} {}",
+                    "round {round} {allocator:>9} {:<26} {:>12.2} {}{counters}",
                     workload.name, cell.value, workload.unit
                 );
                 let key = (allocator.to_string(), workload.name.clone());
@@ -138,7 +147,9 @@ fn list(binary: &str, filter: Option<&str>) -> Vec<Workload> {
         .filter_map(|line| {
             let mut fields = line.split('\t');
             let (group, name, unit) = (fields.next()?, fields.next()?, fields.next()?);
-            let wanted = filter.is_none_or(|text| name.contains(text) || group.contains(text));
+            let wanted = filter.is_none_or(|texts| {
+                texts.split(',').any(|text| name.contains(text) || group.contains(text))
+            });
             wanted.then(|| Workload {
                 group: group.to_string(),
                 name: name.to_string(),
@@ -148,8 +159,21 @@ fn list(binary: &str, filter: Option<&str>) -> Vec<Workload> {
         .collect()
 }
 
-fn run(binary: &str, workload: &str, quick: bool) -> Option<Cell> {
-    let mut command = Command::new(binary);
+/// The events that --perf counts.
+const PERF_EVENTS: &str =
+    "task-clock,cycles,instructions,page-faults,L1-dcache-load-misses,dTLB-load-misses";
+
+/// Runs one workload in a fresh process. Returns the result and, with `perf`, a line of counters.
+fn run(binary: &str, workload: &str, quick: bool, perf: bool) -> Option<(Cell, String)> {
+    let mut command = if perf {
+        let launcher = std::env::var("BCMALLOC_PERF").unwrap_or_else(|_| "perf".to_string());
+        let mut words = launcher.split_whitespace();
+        let mut command = Command::new(words.next()?);
+        command.args(words).args(["stat", "-x", ",", "-e", PERF_EVENTS, "--", binary]);
+        command
+    } else {
+        Command::new(binary)
+    };
     command.args(["--workload", workload]);
     if quick {
         command.arg("--quick");
@@ -158,7 +182,18 @@ fn run(binary: &str, workload: &str, quick: bool) -> Option<Cell> {
     let text = String::from_utf8_lossy(&output.stdout);
     let fields: Vec<_> = text.lines().last()?.split('\t').collect();
     let [_, _, value, _, peak] = fields[..] else { return None };
-    Some(Cell { value: value.parse().ok()?, peak_mib: peak.parse().ok()? })
+    let cell = Cell { value: value.parse().ok()?, peak_mib: peak.parse().ok()? };
+    let mut counters = String::new();
+    if perf {
+        // perf stat -x writes value,unit,event,... for every event.
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            let fields: Vec<_> = line.split(',').collect();
+            if let [value, _, event, ..] = fields[..] {
+                counters += &format!("  {event}={value}");
+            }
+        }
+    }
+    Some((cell, counters))
 }
 
 fn print_groups(

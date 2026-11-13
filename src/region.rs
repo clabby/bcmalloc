@@ -45,6 +45,10 @@ const PURGE_INTERVAL_MS: u64 = 10;
 /// The alignment of the managed memory, which is the size of the largest slab.
 const SLAB_ALIGN: usize = 64 * CHUNK_SIZE;
 
+/// The chunks in one transparent huge page of 2 MiB, which is the unit the purge clock gives back
+/// when the region asks for huge pages.
+const HUGE_PAGE_CHUNKS: usize = (2 << 20) / CHUNK_SIZE;
+
 /// Why a region could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -119,17 +123,20 @@ impl<'a> Region<'a> {
     ///   as long as `'a`, and used by nothing else.
     /// * `words` must be zeroed bitmap storage for `chunk_count` chunks, `slabs` must hold
     ///   `chunk_count` unused descriptors, and `heaps` unclaimed heap slots.
+    /// * `purge_granule` is how many chunks the purge clock gives back together, a power of two of
+    ///   at most 64 that `base` is aligned to in chunks.
     pub(crate) unsafe fn from_parts(
         base: *mut u8,
         words: &'a [AtomicU64],
         chunk_count: usize,
         slabs: &'a [Slab],
         heaps: &'a [HeapData],
+        purge_granule: usize,
     ) -> Self {
         debug_assert_eq!(slabs.len(), chunk_count);
         Self {
             base,
-            chunks: Chunks::new(words, chunk_count),
+            chunks: Chunks::with_granule(words, chunk_count, purge_granule),
             slabs,
             heaps,
             claimed_mark: AtomicUsize::new(0),
@@ -459,7 +466,14 @@ impl Mapping {
                 at(geometry.words).cast::<AtomicU64>(),
                 Chunks::storage_words(chunks),
             );
-            let region = Region::from_parts(at(geometry.data), words, chunks, slabs, heap_slots);
+            // With huge pages, giving back less than a whole one would split it.
+            let granule = if config.wants_huge_pages() && cfg!(target_os = "linux") {
+                HUGE_PAGE_CHUNKS
+            } else {
+                1
+            };
+            let region =
+                Region::from_parts(at(geometry.data), words, chunks, slabs, heap_slots, granule);
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
         }
 

@@ -62,18 +62,25 @@ pub const fn iterations(native: usize) -> usize {
 pub(crate) struct Bitmap {
     words: Vec<AtomicU64>,
     len: usize,
+    granule: usize,
 }
 
 impl Bitmap {
     /// Storage that tracks `len` chunks, all free.
+    #[cfg(test)]
     pub(crate) fn new(len: usize) -> Self {
+        Self::with_granule(len, 1)
+    }
+
+    /// Storage that tracks `len` chunks, all free, purged `granule` chunks at a time.
+    pub(crate) fn with_granule(len: usize, granule: usize) -> Self {
         let words = (0..Chunks::storage_words(len)).map(|_| AtomicU64::new(0)).collect();
-        Self { words, len }
+        Self { words, len, granule }
     }
 
     /// The allocator over this storage.
     pub(crate) fn chunks(&self) -> Chunks<'_> {
-        Chunks::new(&self.words, self.len)
+        Chunks::with_granule(&self.words, self.len, self.granule)
     }
 }
 
@@ -153,6 +160,7 @@ impl TestRegion {
                 self.chunks,
                 &self.slabs,
                 &self.heaps,
+                1,
             )
         }
     }
@@ -438,19 +446,22 @@ pub(crate) struct ChunkModel {
     now: u64,
     /// The latest time that a chunk of each 64-chunk word was freed.
     stamps: Vec<u64>,
+    /// How many chunks the purge takes together.
+    granule: usize,
 }
 
 impl ChunkModel {
-    /// A model of `len` free chunks.
-    pub(crate) fn new(len: usize) -> Self {
+    /// A model of `len` free chunks that are purged `granule` at a time.
+    pub(crate) fn with_granule(len: usize, granule: usize) -> Self {
         Self {
-            bitmap: Bitmap::new(len),
+            bitmap: Bitmap::with_granule(len, granule),
             taken: std::vec![false; len],
             live: Vec::new(),
             touched: std::vec![false; len],
             purged: std::vec![false; len],
             now: 0,
             stamps: std::vec![0; len.div_ceil(64)],
+            granule,
         }
     }
 
@@ -503,29 +514,43 @@ impl ChunkModel {
     }
 
     /// Runs one purge pass after advancing the clock by `elapsed` milliseconds, and checks that it
-    /// takes exactly the free, used chunks of words that have been quiet for the delay, and never a
-    /// chunk that is in use. Returns how many it took.
+    /// takes exactly the wholly free granules that hold a dirty chunk in words that have been quiet
+    /// for the delay, and never a chunk that is in use. Returns how many chunks it took.
     pub(crate) fn purge(&mut self, elapsed: u64) -> usize {
         const DELAY: u64 = 5;
         self.now += elapsed;
         let mut visited = Vec::new();
         let pending = self.bitmap.chunks().purge_pass(self.now, DELAY, |run| visited.extend(run));
+        let len = self.taken.len();
+        let groups: Vec<_> = (0..len)
+            .step_by(self.granule)
+            .map(|start| start..(start + self.granule).min(len))
+            .filter(|group| {
+                group.clone().all(|chunk| !self.taken[chunk]) &&
+                    group.clone().any(|chunk| self.touched[chunk] && !self.purged[chunk])
+            })
+            .collect();
         let mut expected = 0;
-        for chunk in 0..self.taken.len() {
-            let dirty = !self.taken[chunk] && self.touched[chunk] && !self.purged[chunk];
-            let quiet = self.now.saturating_sub(self.stamps[chunk / 64]) >= DELAY;
-            assert_eq!(
-                visited.contains(&chunk),
-                dirty && quiet,
-                "chunk {chunk} was purged at the wrong time"
-            );
-            if dirty && quiet {
-                self.purged[chunk] = true;
-                expected += 1;
+        let mut waiting = false;
+        let mut taken = std::vec![false; len];
+        for group in groups {
+            if self.now.saturating_sub(self.stamps[group.start / 64]) >= DELAY {
+                for chunk in group {
+                    taken[chunk] = true;
+                    self.purged[chunk] = true;
+                    expected += 1;
+                }
+            } else {
+                waiting = true;
             }
         }
-        let waiting = (0..self.taken.len())
-            .any(|chunk| !self.taken[chunk] && self.touched[chunk] && !self.purged[chunk]);
+        for (chunk, &purge) in taken.iter().enumerate() {
+            assert_eq!(
+                visited.contains(&chunk),
+                purge,
+                "chunk {chunk} was purged at the wrong time"
+            );
+        }
         assert_eq!(pending, waiting, "the pass misreports whether chunks are still waiting");
         self.check();
         expected
@@ -552,7 +577,9 @@ impl ChunkModel {
 pub fn run_chunk_ops(data: &[u8]) {
     let mut bytes = data.iter().map(|&byte| usize::from(byte));
     let Some(len) = bytes.next() else { return };
-    let mut model = ChunkModel::new(1 + len % 400);
+    // The top bit of the first byte selects huge page granules of 32 chunks.
+    let granule = if len & 0x80 != 0 { 32 } else { 1 };
+    let mut model = ChunkModel::with_granule(1 + len % 400, granule);
     let _ = interpret_chunks(&mut model, &mut bytes);
 }
 

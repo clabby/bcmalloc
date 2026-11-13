@@ -34,9 +34,15 @@ pub struct Config {
 }
 
 impl Config {
-    /// The defaults are 64 GiB of address space, 4096 heaps and lazy commit.
+    /// The defaults are 64 GiB of address space, 4096 heaps, lazy commit, and transparent huge
+    /// pages on Linux.
     pub const fn new() -> Self {
-        Self { capacity: 64 << 30, max_heaps: 4096, huge_pages: false, commit: Commit::Lazy }
+        Self {
+            capacity: 64 << 30,
+            max_heaps: 4096,
+            huge_pages: cfg!(target_os = "linux"),
+            commit: Commit::Lazy,
+        }
     }
 
     /// Sets the size of the managed region in bytes, rounded down to a multiple of 64 KiB.
@@ -60,7 +66,13 @@ impl Config {
         self
     }
 
-    /// Asks Linux to back the region with transparent huge pages. Other platforms ignore it.
+    /// Asks Linux to back the region with transparent huge pages, which is the default there. Other
+    /// platforms ignore it.
+    ///
+    /// Huge pages cut the cost of address translation for programs whose working set is larger
+    /// than the TLB covers with small pages. Idle memory then goes back to the system one whole
+    /// 2 MiB page at a time, so a region that is lightly used throughout holds more memory than it
+    /// would with small pages.
     #[must_use]
     pub const fn huge_pages(mut self, enabled: bool) -> Self {
         self.huge_pages = enabled;

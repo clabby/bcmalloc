@@ -55,6 +55,7 @@ bench-build:
     cargo bench --no-run
 
 # Run every workload under every allocator and print the comparison. Options are --quick,
-# --rounds N, --filter TEXT and --baseline ALLOCATOR. The raw rows go to target/bench.tsv.
+# --rounds N, --filter TEXT, --only A,B, --baseline ALLOCATOR and --perf, which counts hardware
+# events with perf stat on Linux. The raw rows go to target/bench.tsv.
 bench *args='':
     cargo bench --bench report -- $@

@@ -61,12 +61,12 @@ assert_eq!(numbers.iter().sum::<u32>(), 499_500);
 
 ## Configuration
 
-| Option       | Default | What it does                                                      |
-| ------------ | ------- | ----------------------------------------------------------------- |
-| `capacity`   | 64 GiB  | Size of the region. It is address space until memory is touched.  |
-| `max_heaps`  | 4096    | How many threads can allocate at once.                            |
-| `commit`     | `Lazy`  | `Populate` backs every page now and `Lock` also pins them in RAM. |
-| `huge_pages` | off     | Asks Linux for transparent huge pages. macOS ignores it.          |
+| Option       | Default | What it does                                                         |
+| ------------ | ------- | -------------------------------------------------------------------- |
+| `capacity`   | 64 GiB  | Size of the region. It is address space until memory is touched.     |
+| `max_heaps`  | 4096    | How many threads can allocate at once.                               |
+| `commit`     | `Lazy`  | `Populate` backs every page now and `Lock` also pins them in RAM.    |
+| `huge_pages` | on      | Backs the region with transparent huge pages on Linux. macOS has none. |
 
 If the operating system refuses the default reservation, the global allocator retries with half the capacity down to 256 MiB.
 
