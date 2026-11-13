@@ -242,3 +242,29 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
         .and_then(|block| ALLOCATOR.block_layout(block))
         .map_or(0, |layout| layout.size())
 }
+
+/// Writes the allocator's metrics to standard error. Built with the `metrics` feature.
+#[cfg(feature = "metrics")]
+#[unsafe(no_mangle)]
+pub extern "C" fn bcmalloc_print_metrics() {
+    if let Some(metrics) = ALLOCATOR.metrics() {
+        let report = std::format!("{metrics}");
+        // SAFETY: the buffer is valid for its length, and a short write only loses the report.
+        unsafe { libc::write(2, report.as_ptr().cast(), report.len()) };
+    }
+}
+
+/// Prints the metrics at exit when `BCMALLOC_SHOW_METRICS` is set, as `MIMALLOC_SHOW_STATS` does.
+#[cfg(all(feature = "metrics", target_os = "linux"))]
+extern "C" fn print_metrics_at_exit() {
+    // SAFETY: the name is a valid C string, and the environment is not changing at exit.
+    if !unsafe { libc::getenv(c"BCMALLOC_SHOW_METRICS".as_ptr()) }.is_null() {
+        bcmalloc_print_metrics();
+    }
+}
+
+/// Runs [`print_metrics_at_exit`] among the library's destructors.
+#[cfg(all(feature = "metrics", target_os = "linux"))]
+#[used]
+#[unsafe(link_section = ".fini_array")]
+static PRINT_METRICS_AT_EXIT: extern "C" fn() = print_metrics_at_exit;

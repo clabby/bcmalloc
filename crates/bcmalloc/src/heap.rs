@@ -124,6 +124,14 @@ const HUGE_CACHE: usize = 4;
 const HUGE_CACHE_BLOCK: usize = 8 << 20;
 const HUGE_CACHE_BYTES: usize = 16 << 20;
 
+/// Counts a slow-path event of the heap when metrics are compiled in.
+macro_rules! count {
+    ($heap:expr, $event:ident, $n:expr) => {
+        #[cfg(feature = "metrics")]
+        $heap.private.events.add(crate::metrics::Event::$event, $n as u64);
+    };
+}
+
 /// How many chunks of filled slabs a heap holds before its chunks come from the zone of
 /// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
 /// little memory each, whose huge pages would be mostly empty.
@@ -168,6 +176,11 @@ struct Bin {
     misses: Cell<u8>,
     /// Whether this bin may hold blocks of other heaps' slabs.
     anywhere: Cell<bool>,
+    /// Blocks of the class this heap has handed out and freed, on the bin's line.
+    #[cfg(feature = "metrics")]
+    allocs: crate::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    frees: crate::metrics::Counter,
 }
 
 /// Blocks of other heaps' slabs that this heap has freed and not posted yet, all for one heap.
@@ -197,6 +210,9 @@ struct Lists {
     active: Cell<*const Slab>,
     active_last: Cell<*const Slab>,
     full: Cell<*const Slab>,
+    /// How many slabs of the class the heap holds.
+    #[cfg(feature = "metrics")]
+    slabs: crate::metrics::Counter,
 }
 
 /// What other threads touch in a heap slot, kept on a line of its own.
@@ -241,6 +257,8 @@ struct Private {
     outboxes: [Outbox; OUTBOXES],
     kept: [Cell<Kept>; HUGE_CACHE],
     classes: [Lists; CLASSES],
+    #[cfg(feature = "metrics")]
+    events: crate::metrics::HeapEvents,
 }
 
 /// The state of one heap slot in a region.
@@ -298,6 +316,10 @@ impl HeapData {
                         capacity: Cell::new(0),
                         misses: Cell::new(0),
                         anywhere: Cell::new(false),
+                        #[cfg(feature = "metrics")]
+                        allocs: crate::metrics::Counter::new(),
+                        #[cfg(feature = "metrics")]
+                        frees: crate::metrics::Counter::new(),
                     }
                 }; CLASSES],
                 slots: Cell::new(ptr::null_mut()),
@@ -314,10 +336,27 @@ impl HeapData {
                         active: Cell::new(ptr::null()),
                         active_last: Cell::new(ptr::null()),
                         full: Cell::new(ptr::null()),
+                        #[cfg(feature = "metrics")]
+                        slabs: crate::metrics::Counter::new(),
                     }
                 }; CLASSES],
+                #[cfg(feature = "metrics")]
+                events: crate::metrics::HeapEvents::new(),
             },
         }
+    }
+
+    /// The allocations, frees and slabs this heap slot has counted for `class`.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn class_counts(&self, class: Class) -> (u64, u64, u64) {
+        let bin = self.bin(class);
+        (bin.allocs.get(), bin.frees.get(), self.lists(class).slabs.get())
+    }
+
+    /// The slow-path counts of this heap slot.
+    #[cfg(feature = "metrics")]
+    pub(crate) const fn events(&self) -> &crate::metrics::HeapEvents {
+        &self.private.events
     }
 
     /// Tries to claim this slot as heap number `id` of the region.
@@ -345,16 +384,20 @@ impl HeapData {
     /// Makes the heap take its chunks from the part of the region of NUMA node `node`.
     fn settle_on(&self, region: &Region<'_>, node: usize) {
         self.private.node.set(node);
-        let home = region.home(self.part(region, false));
+        let home = region.home(self.slab_part(region, Class::from_index(0)));
         if !home.contains(&self.private.cursor.get()) {
             self.private.cursor.set(home.start);
         }
     }
 
-    /// The part of the region this heap's next chunks come from, in the zone of transparent huge
-    /// pages if `huge` or if the heap is big enough. See [`Region::part`].
-    const fn part(&self, region: &Region<'_>, huge: bool) -> usize {
-        let huge = huge || self.private.held.get() >= HUGE_ZONE_CHUNKS;
+    /// The part of the region the next slab of `class` comes from. See [`Region::part`].
+    ///
+    /// Only single-chunk slabs of a big heap go to the zone of transparent huge pages. They fill
+    /// quickly and pack next to each other, so the huge pages they touch are dense. A slab of
+    /// several chunks holds few blocks and is often mostly untouched, and a huge page fault
+    /// would back all of it.
+    const fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
+        let huge = class.slab_chunks() == 1 && self.private.held.get() >= HUGE_ZONE_CHUNKS;
         region.part(self.private.node.get(), huge)
     }
 
@@ -408,6 +451,7 @@ impl HeapData {
         }
         self.private.grown.set(self.private.grown.get() + bytes);
         self.set_capacity(class, grown);
+        count!(self, BinsGrown, 1);
         true
     }
 
@@ -521,6 +565,8 @@ impl HeapData {
             return None;
         }
         bin.top.set(top.wrapping_add(1));
+        #[cfg(feature = "metrics")]
+        bin.allocs.add(1);
         // SAFETY: slots between the top and the end of a bin hold blocks.
         Some(unsafe { *top })
     }
@@ -622,6 +668,7 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn refill(&self, class: Class) -> *mut Block {
+        count!(self, Refills, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
         // SAFETY: the caller holds the claim.
@@ -687,6 +734,7 @@ impl HeapData {
                         unsafe { self.flush_bin(class, shrunk) };
                     }
                     self.set_capacity(class, shrunk);
+                    count!(self, BinsShrunk, 1);
                     let bytes = (capacity - shrunk) * class.block_size();
                     self.private.grown.set(self.private.grown.get() - bytes);
                 }
@@ -744,13 +792,16 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let part = self.part(region, false);
+        let part = self.slab_part(region, class);
         let home = region.home(part);
         let cursor = self.private.cursor.get();
         let cursor = if home.contains(&cursor) { cursor } else { home.start };
         let Some(first) = region.alloc_chunks(chunks, chunks, cursor, part) else {
             return false;
         };
+        count!(self, SlabsAdded, 1);
+        #[cfg(feature = "metrics")]
+        self.lists(class).slabs.add(1);
         region.set_owner(first, chunks, self.private.id.get(), class);
         let slab = region.slab(first);
         // SAFETY: the chunks were just allocated to us, so nobody else uses this descriptor.
@@ -790,6 +841,7 @@ impl HeapData {
                 let first = region.chunk_index(ptr.as_ptr());
                 if wants <= had {
                     if wants < had {
+                        count!(self, HugeBytesFreed, (had - wants) << CHUNK_SHIFT);
                         region.set_huge(first, wants);
                         region.free_chunks(first + wants, had - wants);
                         region.purge_if_due();
@@ -797,6 +849,7 @@ impl HeapData {
                     return ptr.as_ptr();
                 }
                 if region.grow_in_place(first, had, wants) {
+                    count!(self, HugeBytesAllocated, (wants - had) << CHUNK_SHIFT);
                     region.set_huge(first, wants);
                     return ptr.as_ptr();
                 }
@@ -850,6 +903,8 @@ impl HeapData {
             return unsafe { region.dealloc(ptr, layout) };
         };
         let bytes = chunks << CHUNK_SHIFT;
+        count!(self, HugeFrees, 1);
+        count!(self, HugeBytesFreed, bytes);
         if bytes <= HUGE_CACHE_BLOCK {
             let held: usize =
                 self.private.kept.iter().map(|kept| kept.get().chunks << CHUNK_SHIFT).sum();
@@ -914,6 +969,8 @@ impl HeapData {
     #[inline(always)]
     unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
         let class = entry.class();
+        #[cfg(feature = "metrics")]
+        self.bin(class).frees.add(1);
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
         // the program's requests.
@@ -1071,6 +1128,7 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn send(&self, block: *mut Block, class: Class, owner: u32) {
+        count!(self, BlocksSent, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
         let size = class.block_size();
@@ -1143,6 +1201,7 @@ impl HeapData {
                 }
             }
             _ => {
+                count!(self, MessagesPosted, 1);
                 outbox.message.set(ptr::null_mut());
                 // SAFETY: the message is a block of ours, given up here.
                 unsafe { dest.post(message.cast(), message.cast()) };
@@ -1188,6 +1247,9 @@ impl HeapData {
     /// The caller must hold the claim.
     unsafe fn drain_inbox(&self, region: &Region<'_>) {
         let mut node = self.shared.inbox.swap(ptr::null_mut(), Ordering::Acquire);
+        if !node.is_null() {
+            count!(self, MailReads, 1);
+        }
         while !node.is_null() {
             let raw = node.map_addr(|addr| addr & !SINGLE);
             // SAFETY: inbox nodes are blocks given to us, linked through their first words, and the
@@ -1217,6 +1279,7 @@ impl HeapData {
     /// The caller must hold the claim, and the block must be an in-use block of one of this heap's
     /// slabs, which is given up.
     unsafe fn file(&self, region: &Region<'_>, block: *mut Block) {
+        count!(self, BlocksFiled, 1);
         let entry = self.entry_of(block.cast());
         debug_assert_eq!(
             entry.owner(),
@@ -1282,6 +1345,9 @@ impl HeapData {
     /// Returns an empty slab's chunks to the chunk allocator.
     fn release(&self, region: &Region<'_>, slab: Owned<'_>) {
         self.unlink(slab);
+        count!(self, SlabsReleased, 1);
+        #[cfg(feature = "metrics")]
+        self.lists(slab.class()).slabs.sub(1);
         let first = region.chunk_index(slab.start());
         let chunks = slab.class().slab_chunks();
         if slab.was_filled() {
@@ -1291,7 +1357,7 @@ impl HeapData {
         region.purge_if_due();
         // Prefer the lowest free word of the home part next time, so slabs stay packed towards the
         // bottom of it.
-        if region.home(self.part(region, false)).contains(&(first / 64)) {
+        if region.home(self.slab_part(region, Class::from_index(0))).contains(&(first / 64)) {
             self.private.cursor.set(self.private.cursor.get().min(first / 64));
         }
     }
@@ -1329,17 +1395,31 @@ impl HeapData {
                 kept.set(Kept::NONE);
                 // The next kept block of this size has been asked for, so it stays a while.
                 self.mark_kept_reused(chunks);
+                count!(self, HugeCacheHits, 1);
+                self.count_huge_alloc(chunks);
                 return region.chunk_ptr(block.first);
             }
         }
         // A block of a huge page or more is all touched by most programs, so it gains from huge
-        // pages whatever the size of the heap.
-        let part = self.part(region, chunks >= HUGE_PAGE_CHUNKS);
+        // pages whatever the size of the heap. Smaller ones may be touched only in part.
+        let part = region.part(self.private.node.get(), chunks >= HUGE_PAGE_CHUNKS);
         let Some(first) = region.alloc_chunks(chunks, 1, 0, part) else {
             return ptr::null_mut();
         };
+        self.count_huge_alloc(chunks);
         region.set_huge(first, chunks);
         region.chunk_ptr(first)
+    }
+
+    /// Counts a huge block of `chunks` chunks handed out.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        allow(clippy::unused_self, clippy::missing_const_for_fn, reason = "it counts nothing")
+    )]
+    fn count_huge_alloc(&self, chunks: usize) {
+        count!(self, HugeAllocs, 1);
+        count!(self, HugeBytesAllocated, chunks << CHUNK_SHIFT);
+        let _ = chunks;
     }
 
     /// Marks the kept huge blocks of `chunks` chunks as wanted.
@@ -2226,8 +2306,10 @@ mod test {
         assert!(first.iter().all(|&block| chunk(block) < 128), "a small heap uses small pages");
         let later = alloc_many(&big, blocks, 8 * 16);
         assert!(chunk(*later.last().unwrap()) >= 128, "a big heap moves to the huge page zone");
-        let medium = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
-        assert!(chunk(medium) < 128, "a block smaller than a huge page follows its heap");
+        let sparse = big.alloc(layout(20 << 10, 8)).unwrap();
+        assert!(chunk(sparse) < 128, "a slab of several chunks of a big heap uses small pages");
+        let run = big.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(run) < 128, "so does a block smaller than a huge page");
         let large = small.alloc(layout(HUGE_PAGE_CHUNKS * CHUNK_SIZE, 8)).unwrap();
         assert!(chunk(large) >= 128, "a block of a huge page or more uses huge pages");
         for block in first.into_iter().chain(later) {

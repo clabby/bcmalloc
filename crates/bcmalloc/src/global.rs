@@ -125,6 +125,13 @@ impl Bcmalloc {
         self.existing().map(Region::stats)
     }
 
+    /// A snapshot of the allocator's metrics, or `None` if nothing has been allocated yet. See
+    /// [`Region::metrics`].
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<crate::Metrics> {
+        self.existing().map(Region::metrics)
+    }
+
     /// Returns the memory of idle heaps and free chunks to the operating system. See
     /// [`Region::trim`] for what that costs.
     pub fn trim(&self) {

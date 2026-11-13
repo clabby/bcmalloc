@@ -12,6 +12,8 @@ mod config;
 #[cfg(all(feature = "std", not(loom)))]
 mod global;
 mod heap;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod region;
 mod size_class;
 mod slab;
@@ -26,5 +28,7 @@ pub use config::{Commit, Config};
 #[cfg(all(feature = "std", not(loom)))]
 pub use global::Bcmalloc;
 pub use heap::Heap;
+#[cfg(feature = "metrics")]
+pub use metrics::{ClassMetrics, Events, Metrics};
 pub use region::{Error, Mapping, Region, Stats};
 pub use size_class::{MAX_ALIGN, MAX_SMALL};

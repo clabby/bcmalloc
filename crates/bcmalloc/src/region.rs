@@ -117,6 +117,8 @@ pub struct Region<'a> {
     purges_active: AtomicUsize,
     /// How many purge passes and trims have finished.
     purges_done: AtomicUsize,
+    #[cfg(feature = "metrics")]
+    counters: crate::metrics::RegionCounters,
 }
 
 // SAFETY: the raw pointer is an address into memory the region owns, and every shared structure
@@ -185,6 +187,8 @@ impl<'a> Region<'a> {
             aging: AtomicBool::new(false),
             purges_active: AtomicUsize::new(0),
             purges_done: AtomicUsize::new(0),
+            #[cfg(feature = "metrics")]
+            counters: crate::metrics::RegionCounters::new(),
         }
     }
 
@@ -215,11 +219,19 @@ impl<'a> Region<'a> {
     pub unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
         match classify(layout) {
             Some(Request::Small(_)) => {
-                let owner = self.entry(self.chunk_index(ptr.as_ptr())).owner();
+                let entry = self.entry(self.chunk_index(ptr.as_ptr()));
+                #[cfg(feature = "metrics")]
+                self.counters.frees[entry.class().index()].add(1);
+                let owner = entry.owner();
                 // SAFETY: the caller gives the block up, and the chunk map names its owner.
                 unsafe { self.heap_slot(owner).post_block(ptr.as_ptr().cast()) };
             }
             Some(Request::Huge { chunks }) => {
+                #[cfg(feature = "metrics")]
+                {
+                    self.counters.huge_frees.add(1);
+                    self.counters.huge_bytes_freed.add((chunks << CHUNK_SHIFT) as u64);
+                }
                 self.free_chunks(self.chunk_index(ptr.as_ptr()), chunks);
                 self.purge_if_due();
             }
@@ -272,6 +284,55 @@ impl<'a> Region<'a> {
         }
     }
 
+    /// A snapshot of the allocator's metrics, summed over every heap slot that has been claimed.
+    /// It costs a pass over those slots and the chunk bitmap, so call it now and then, not on a
+    /// hot path. See [`Metrics`](crate::Metrics).
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> crate::Metrics {
+        use crate::metrics::Event;
+        let claimed = self.claimed_mark.load(Ordering::Acquire);
+        let heaps = &self.heaps[..claimed];
+        let counters = &self.counters;
+        let classes = crate::metrics::class_metrics(|class| {
+            let unbound = counters.frees[class.index()].get();
+            heaps
+                .iter()
+                .map(|heap| heap.class_counts(class))
+                .fold((0, unbound, 0), |(allocs, frees, slabs), (a, f, s)| {
+                    (allocs + a, frees + f, slabs.wrapping_add(s))
+                })
+        });
+        let sum = |event| heaps.iter().map(|heap| heap.events().get(event)).sum::<u64>();
+        let huge_allocated = sum(Event::HugeBytesAllocated);
+        let huge_freed = sum(Event::HugeBytesFreed) + counters.huge_bytes_freed.get();
+        let stats = self.stats();
+        crate::Metrics {
+            capacity: stats.capacity,
+            chunk_bytes: stats.capacity - stats.free,
+            heaps_claimed: claimed,
+            heaps_in_use: stats.heaps_in_use,
+            huge_live_bytes: huge_allocated.saturating_sub(huge_freed),
+            classes,
+            events: crate::metrics::Events {
+                refills: sum(Event::Refills),
+                slabs_added: sum(Event::SlabsAdded),
+                slabs_released: sum(Event::SlabsReleased),
+                blocks_sent: sum(Event::BlocksSent),
+                messages_posted: sum(Event::MessagesPosted),
+                mail_reads: sum(Event::MailReads),
+                blocks_filed: sum(Event::BlocksFiled),
+                huge_allocs: sum(Event::HugeAllocs),
+                huge_frees: sum(Event::HugeFrees) + counters.huge_frees.get(),
+                huge_cache_hits: sum(Event::HugeCacheHits),
+                bins_grown: sum(Event::BinsGrown),
+                bins_shrunk: sum(Event::BinsShrunk),
+                purge_passes: counters.purge_passes.get(),
+                chunks_purged: counters.chunks_purged.get(),
+                chunks_reused: counters.chunks_reused.get(),
+            },
+        }
+    }
+
     /// Whether `ptr` points into this region's managed memory.
     pub fn contains(&self, ptr: *const u8) -> bool {
         let offset = ptr.addr().wrapping_sub(self.base.addr());
@@ -298,6 +359,8 @@ impl<'a> Region<'a> {
             None => self.alloc_chunks_after_purge(n, align, hint, home)?,
         };
         self.chunks.take_purged(first, n, |run| {
+            #[cfg(feature = "metrics")]
+            self.counters.chunks_reused.add(run.len() as u64);
             // SAFETY: the run is inside the region and belongs to us since the claim above.
             unsafe {
                 sys::reuse(
@@ -363,6 +426,8 @@ impl<'a> Region<'a> {
             core::hint::spin_loop();
         }
         self.chunks.take_purged(start, more, |run| {
+            #[cfg(feature = "metrics")]
+            self.counters.chunks_reused.add(run.len() as u64);
             // SAFETY: the run is inside the region and belongs to us since the claim above.
             unsafe {
                 sys::reuse(
@@ -447,7 +512,11 @@ impl<'a> Region<'a> {
         // acquires the bits of every free that set it.
         self.aging.swap(false, Ordering::Acquire);
         self.purges_active.fetch_add(1, Ordering::Release);
+        #[cfg(feature = "metrics")]
+        self.counters.purge_passes.add(1);
         let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
+            #[cfg(feature = "metrics")]
+            self.counters.chunks_purged.add(run.len() as u64);
             // SAFETY: the pass holds the run, so no allocation overlaps it.
             unsafe {
                 sys::discard(
