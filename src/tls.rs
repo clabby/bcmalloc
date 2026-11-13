@@ -79,6 +79,12 @@ pub(crate) fn get(key: Key) -> *const HeapData {
     slot::get(key)
 }
 
+/// As [`get`], but where the fast lookup cannot tell, it asks pthread. The fast paths call [`get`]
+/// and come here only when that returns null, so they make no call of their own.
+pub(crate) fn lookup(key: Key) -> *const HeapData {
+    slot::lookup(key)
+}
+
 /// Binds the heap as this thread's under the key, so that the key destructor releases it when the
 /// thread exits. Returns false, and binds nothing, if the system refuses the value.
 pub(crate) fn bind(key: Key, data: &'static HeapData) -> bool {
@@ -139,6 +145,10 @@ mod slot {
         unsafe { *table().add(key) }
     }
 
+    pub(super) fn lookup(key: Key) -> *const HeapData {
+        get(key)
+    }
+
     pub(super) const fn set(_key: Key, _data: &HeapData) {}
 
     pub(super) const fn clear() {}
@@ -177,14 +187,11 @@ mod slot {
     #[inline(always)]
     pub(super) fn get(key: Key) -> *const HeapData {
         let (bound, data) = CURRENT.with(Cell::get);
-        if bound == key { data } else { switch(key) }
+        if bound == key { data } else { ptr::null() }
     }
 
-    /// Looks the heap up through pthread and makes it the latest. It is never inlined, so that the
-    /// fast paths that call it need no stack frame of their own.
-    #[cold]
-    #[inline(never)]
-    fn switch(key: Key) -> *const HeapData {
+    /// Looks the heap up through pthread and makes it the latest.
+    pub(super) fn lookup(key: Key) -> *const HeapData {
         if key == super::NO_KEY {
             return ptr::null();
         }

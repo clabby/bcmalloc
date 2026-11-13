@@ -132,6 +132,21 @@ impl Bcmalloc {
         }
     }
 
+    /// Hands back the blocks that the calling thread's heap keeps for reuse: its bins, its
+    /// outboxes and what other threads sent it, and then its empty slabs.
+    ///
+    /// A thread that is about to go quiet for a while calls this so that its cached memory is not
+    /// held while it sleeps, as jemalloc offers with its thread cache flush. Heaps of exited
+    /// threads are handed back on their own, and [`trim`](Self::trim) covers heaps nobody holds.
+    pub fn flush_thread(&self) {
+        // SAFETY: a thread's bound heap is claimed by that thread alone, and so is its region.
+        if let (Some(data), Some(region)) = (unsafe { self.bound_heap().as_ref() }, self.existing())
+        {
+            // SAFETY: as above.
+            unsafe { data.flush(region) };
+        }
+    }
+
     /// The region if it exists.
     fn existing(&self) -> Option<&'static Region<'static>> {
         // SAFETY: a non-null pointer is a leaked mapping, which lives for the rest of the program.
@@ -200,10 +215,16 @@ impl Default for Bcmalloc {
 }
 
 impl Bcmalloc {
-    /// This thread's heap, or null if it has not bound one.
+    /// This thread's heap, or null if it has not bound one or the fast lookup cannot tell.
     #[inline(always)]
     fn thread_heap(&self) -> *const HeapData {
         tls::get(self.key.load(Ordering::Relaxed))
+    }
+
+    /// This thread's heap, or null if it has not bound one. This is the slow lookup that settles
+    /// what [`thread_heap`](Self::thread_heap) could not.
+    fn bound_heap(&self) -> *const HeapData {
+        tls::lookup(self.key.load(Ordering::Relaxed))
     }
 
     /// The key under which threads bind their heap, created on first use.
@@ -247,6 +268,11 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn alloc_unbound(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
+            // SAFETY: as above.
+            return unsafe { data.alloc(layout) };
+        }
         let Some(region) = self.region() else { return ptr::null_mut() };
         if let Some(data) = self.bind(region) {
             // SAFETY: binding claimed the heap for this thread.
@@ -259,6 +285,11 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn dealloc_unbound(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
+            // SAFETY: as above, and the caller vouches for the block.
+            return unsafe { data.dealloc(ptr, layout) };
+        }
         let Some(region) = self.existing() else { return };
         if let Some(data) = self.bind(region) {
             // SAFETY: binding claimed the heap for this thread, and the caller vouches for the
@@ -274,6 +305,11 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn realloc_unbound(&self, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
+            // SAFETY: as above, and the caller vouches for the block and the size.
+            return unsafe { data.realloc(ptr, layout, new_size) };
+        }
         let Some(region) = self.existing() else { return ptr::null_mut() };
         if let Some(data) = self.bind(region) {
             // SAFETY: binding claimed the heap for this thread, and the caller vouches for the
@@ -374,6 +410,23 @@ mod test {
         // SAFETY: the block came from this allocator with this layout.
         unsafe { allocator.deallocate(empty.cast(), Layout::from_size_align(0, 32).unwrap()) };
         assert!(allocator.stats().is_none());
+    }
+
+    #[test]
+    fn flushing_a_thread_returns_what_its_heap_kept() {
+        let allocator = instance();
+        std::thread::spawn(move || {
+            let blocks: Vec<_> =
+                (0..1000).map(|i| Box::new_in([i as u8; 100], allocator)).collect();
+            drop(blocks);
+            let held = allocator.stats().unwrap();
+            assert!(held.free < held.capacity, "the heap keeps some blocks and a slab");
+            allocator.flush_thread();
+            let after = allocator.stats().unwrap();
+            assert_eq!(after.free, after.capacity, "everything went back to the region");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

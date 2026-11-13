@@ -470,7 +470,8 @@ impl Entry {
 
     /// The size class of the slab.
     pub(crate) const fn class(self) -> Class {
-        Class::from_index((self.0 >> 32) as u8 as usize)
+        // SAFETY: entries are only ever written by [`Entry::new`] from a class.
+        unsafe { Class::from_index_unchecked((self.0 >> 32) as u8 as usize) }
     }
 }
 

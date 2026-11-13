@@ -197,6 +197,16 @@ impl Class {
         Self(index as u8)
     }
 
+    /// The class with table index `index`, without the check.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be below [`CLASSES`].
+    pub(crate) const unsafe fn from_index_unchecked(index: usize) -> Self {
+        debug_assert!(index < CLASSES);
+        Self(index as u8)
+    }
+
     /// The smallest class whose blocks hold `size` bytes. `size` must be at most [`MAX_SMALL`].
     pub(crate) const fn for_size(size: usize) -> Self {
         debug_assert!(size <= MAX_SMALL);

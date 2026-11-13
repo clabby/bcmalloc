@@ -321,7 +321,7 @@ impl HeapData {
 
     /// Sets how many blocks the bin of `class` may hold. It must hold no more than that already.
     fn set_capacity(&self, class: Class, capacity: usize) {
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         debug_assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
         bin.capacity.set(capacity as u16);
         bin.full.set(self.bin_end(class).wrapping_sub(capacity).addr() as u16);
@@ -331,7 +331,7 @@ impl HeapData {
     /// alternates between running dry and overflowing, which is how TCMalloc sizes its per-CPU
     /// caches. Returns whether the bin grew.
     fn note_miss(&self, class: Class, kind: u8) -> bool {
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         let last = bin.misses.get() & (UNDERFLOW | OVERFLOW);
         bin.misses.set(kind | MISSED);
         let capacity = usize::from(bin.capacity.get());
@@ -441,10 +441,18 @@ impl HeapData {
         Entry(unsafe { &*self.private.map.get().add(index) }.load(Ordering::Relaxed))
     }
 
+    /// The bin of `class`. Classes are always in range, so the fast paths skip the bounds check.
+    #[inline(always)]
+    fn bin(&self, class: Class) -> &Bin {
+        debug_assert!(class.index() < CLASSES);
+        // SAFETY: every class index is below `CLASSES`, the length of the array.
+        unsafe { self.private.bins.get_unchecked(class.index()) }
+    }
+
     /// Pops a block off the bin of `class`.
     #[inline(always)]
     fn pop(&self, class: Class) -> Option<*mut Block> {
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         let top = bin.top.get();
         if top.addr() as u16 == bin.empty.get() {
             return None;
@@ -457,7 +465,7 @@ impl HeapData {
     /// Pushes a block onto the bin of `class`, or returns false if the bin is full.
     #[inline(always)]
     fn push(&self, class: Class, block: *mut Block) -> bool {
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         let top = bin.top.get();
         if top.addr() as u16 == bin.full.get() {
             return false;
@@ -472,7 +480,7 @@ impl HeapData {
     /// How many blocks the bin of `class` holds.
     fn bin_len(&self, class: Class) -> usize {
         let end = self.bin_end(class);
-        (end.addr() - self.private.bins[class.index()].top.get().addr()) / size_of::<usize>()
+        (end.addr() - self.bin(class).top.get().addr()) / size_of::<usize>()
     }
 
     /// Allocates memory for the layout, returning null if the region is out of room or the layout
@@ -599,7 +607,7 @@ impl HeapData {
     /// room. The blocks come out of each slab in address order, and the bin hands them out in
     /// the same order.
     fn fill(&self, region: &Region<'_>, class: Class) -> usize {
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         let want = (usize::from(bin.capacity.get()) / 2).max(1);
         // The bin is empty, so its top is its end. Blocks are written upwards from `want` slots
         // below the end, lowest address first, so that the bin hands them out in address order.
@@ -737,9 +745,7 @@ impl HeapData {
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
         // the program's requests.
-        if entry.owner() != self.private.id.get() &&
-            !self.private.bins[class.index()].anywhere.get()
-        {
+        if entry.owner() != self.private.id.get() && !self.bin(class).anywhere.get() {
             // SAFETY: forwarded.
             return unsafe { self.send(block, class, entry.owner()) };
         }
@@ -762,7 +768,7 @@ impl HeapData {
             return;
         }
         loop {
-            let keep = usize::from(self.private.bins[class.index()].capacity.get()) / 2;
+            let keep = usize::from(self.bin(class).capacity.get()) / 2;
             // SAFETY: forwarded.
             unsafe { self.flush_bin(class, keep) };
             if self.push(class, block) {
@@ -780,7 +786,7 @@ impl HeapData {
     unsafe fn flush_bin(&self, class: Class, keep: usize) {
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
-        let bin = &self.private.bins[class.index()];
+        let bin = self.bin(class);
         let len = self.bin_len(class);
         if len <= keep {
             return;

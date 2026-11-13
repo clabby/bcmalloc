@@ -334,6 +334,7 @@ impl<'a> Returns<'a> {
             self.store();
             self.word = word;
         }
+        debug_assert_eq!(self.mask & 1 << (index % 64), 0, "a block came back twice");
         self.mask |= 1 << (index % 64);
         self.count += 1;
     }
