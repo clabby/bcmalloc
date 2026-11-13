@@ -89,19 +89,38 @@ const BLOCK_SIZES: [u32; CLASSES] = {
 /// has 128-byte lines, and x86-64 keeps coherence in 64-byte lines.
 const LINE: usize = if cfg!(target_arch = "aarch64") { 128 } else { 64 };
 
-/// How many block pointers a heap's bin of class index `i` holds. Small blocks get many and big
-/// blocks few, so that a full bin of a small class holds about 32 KiB and one of a class above
-/// 8 KiB about 64 KiB.
-const fn bin_capacity_of(i: usize) -> usize {
+/// How many block pointers a heap's bin of class index `i` starts out holding at most. Small blocks
+/// get many and big blocks few, so that a full bin of a small class holds about 32 KiB and one of a
+/// class above 8 KiB about 64 KiB.
+const fn bin_initial_of(i: usize) -> usize {
     let size = block_size_of(i);
-    let (bytes, min, max) = if size <= TABLE_MAX { (32 << 10, 8, 128) } else { (64 << 10, 1, 8) };
-    let count = bytes / size;
-    if count < min {
-        min
-    } else if count > max {
-        max
+    if size <= TABLE_MAX {
+        clamp((32 << 10) / size, 8, 128)
     } else {
-        count
+        clamp((64 << 10) / size, 1, 8)
+    }
+}
+
+/// How many block pointers the bin of class index `i` may grow to hold. A bin grows when the
+/// program alternates between emptying it and filling it, so that bursts of a few hundred blocks
+/// stay in the bin, as TCMalloc grows its per-CPU caches.
+const fn bin_max_of(i: usize) -> usize {
+    let size = block_size_of(i);
+    if size <= TABLE_MAX {
+        clamp((128 << 10) / size, 8, 512)
+    } else {
+        clamp((128 << 10) / size, 1, 16)
+    }
+}
+
+/// `value` limited to `low..=high`.
+const fn clamp(value: usize, low: usize, high: usize) -> usize {
+    if value < low {
+        low
+    } else if value > high {
+        high
+    } else {
+        value
     }
 }
 
@@ -112,21 +131,23 @@ const BIN_STARTS: ([u16; CLASSES], usize) = {
     let mut i = 0;
     while i < CLASSES {
         starts[i] = total as u16;
-        total += bin_capacity_of(i);
+        total += bin_max_of(i);
         i += 1;
     }
     (starts, total)
 };
 
-/// The capacity of each class's bin, as a table so that it costs a load and not a division.
-const BIN_CAPACITIES: [u16; CLASSES] = {
-    let mut capacities = [0; CLASSES];
+/// The initial and the largest capacity of each class's bin, as tables so that they cost a load
+/// and not a division.
+const BIN_CAPACITIES: ([u16; CLASSES], [u16; CLASSES]) = {
+    let (mut initial, mut max) = ([0; CLASSES], [0; CLASSES]);
     let mut i = 0;
     while i < CLASSES {
-        capacities[i] = bin_capacity_of(i) as u16;
+        initial[i] = bin_initial_of(i) as u16;
+        max[i] = bin_max_of(i) as u16;
         i += 1;
     }
-    capacities
+    (initial, max)
 };
 
 /// The number of block pointers in all the bins of one heap.
@@ -188,9 +209,14 @@ impl Class {
         Self((8 + (top_bit - 7) * 8 + step) as u8)
     }
 
-    /// How many block pointers the bin of this class holds.
-    pub(crate) const fn bin_capacity(self) -> usize {
-        BIN_CAPACITIES[self.0 as usize] as usize
+    /// How many block pointers the bin of this class holds when a heap starts.
+    pub(crate) const fn bin_initial(self) -> usize {
+        BIN_CAPACITIES.0[self.0 as usize] as usize
+    }
+
+    /// How many block pointers the bin of this class may grow to hold.
+    pub(crate) const fn bin_max(self) -> usize {
+        BIN_CAPACITIES.1[self.0 as usize] as usize
     }
 
     /// Where the bin of this class starts in a heap's slot array.

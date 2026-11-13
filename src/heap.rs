@@ -85,7 +85,7 @@ use crate::{
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::{Entry, Region},
-    size_class::{BIN_SLOTS, CLASSES, Class, Request, classify},
+    size_class::{CLASSES, Class, Request, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
@@ -111,8 +111,20 @@ const OUTBOXES: usize = 16;
 const OUTBOX_BYTES: usize = 64 << 10;
 
 /// How many refills pass between maintenance steps, which post the outboxes so that no block waits
-/// in one for long.
+/// in one for long, and shrink bins that have not missed since the last step.
 const MAINTENANCE_INTERVAL: u32 = 64;
+
+/// How many bytes of bin capacity a heap may add to the initial capacities of its bins.
+const GROWTH_BUDGET: usize = 2 << 20;
+
+/// The last miss of a bin was a refill of an empty bin.
+const UNDERFLOW: u8 = 0b01;
+
+/// The last miss of a bin was a free into a full bin.
+const OVERFLOW: u8 = 0b10;
+
+/// The bin has missed since the last maintenance step.
+const MISSED: u8 = 0b100;
 
 /// Blocks on their way to the heap that owns their slabs.
 ///
@@ -138,6 +150,10 @@ struct Bin {
     top: Cell<*mut *mut Block>,
     empty: Cell<u16>,
     full: Cell<u16>,
+    /// How many blocks the bin may hold now, between the class's initial and largest capacity.
+    capacity: Cell<u16>,
+    /// The kind of the last miss and whether the bin missed since the last maintenance step.
+    misses: Cell<u8>,
     /// Whether this bin may hold blocks of other heaps' slabs.
     anywhere: Cell<bool>,
 }
@@ -171,6 +187,8 @@ struct Private {
     _line: [CacheLine; 0],
     id: Cell<u32>,
     refills: Cell<u32>,
+    /// How many bytes of capacity the bins have grown by, against [`GROWTH_BUDGET`].
+    grown: Cell<usize>,
     /// The start of the managed memory, the slab descriptors and the chunk map of the region this
     /// slot was claimed from, so that the fast paths reach them without loading the region. They
     /// are set at every claim and valid while the claim lasts.
@@ -180,7 +198,8 @@ struct Private {
     region: Cell<*const Region<'static>>,
     cursor: Cell<usize>,
     bins: [Bin; CLASSES],
-    slots: [Cell<*mut Block>; BIN_SLOTS],
+    /// This heap's bin slots in the region, set at every claim.
+    slots: Cell<*mut *mut Block>,
     outboxes: [Outbox; OUTBOXES],
     classes: [Lists; CLASSES],
 }
@@ -222,6 +241,7 @@ impl HeapData {
                 _line: [],
                 id: Cell::new(0),
                 refills: Cell::new(0),
+                grown: Cell::new(0),
                 base: Cell::new(ptr::null_mut()),
                 map: Cell::new(ptr::null()),
                 slabs: Cell::new(ptr::null()),
@@ -232,10 +252,12 @@ impl HeapData {
                         top: Cell::new(ptr::null_mut()),
                         empty: Cell::new(0),
                         full: Cell::new(0),
+                        capacity: Cell::new(0),
+                        misses: Cell::new(0),
                         anywhere: Cell::new(false),
                     }
                 }; CLASSES],
-                slots: [const { Cell::new(ptr::null_mut()) }; BIN_SLOTS],
+                slots: Cell::new(ptr::null_mut()),
                 outboxes: [const {
                     Outbox {
                         dest: Cell::new(0),
@@ -268,33 +290,68 @@ impl HeapData {
             private.base.set(region.chunk_ptr(0));
             private.slabs.set(region.slabs_ptr());
             private.map.set(region.map_ptr());
+            private.slots.set(region.bin_slots(id));
             self.init_bins();
         }
         won
     }
 
-    /// Points every bin at its range of the slot array. A slot that was claimed before has empty
-    /// bins at the same place, so this only matters the first time.
+    /// Points every bin at its range of the slot array, empty and at its initial capacity. A slot
+    /// that was claimed before has empty bins at the same place.
     fn init_bins(&self) {
-        let slots = self.slots();
         for (index, bin) in self.private.bins.iter().enumerate() {
             let class = Class::from_index(index);
-            let start = slots.wrapping_add(class.bin_start());
-            let end = start.wrapping_add(class.bin_capacity());
+            let end = self.bin_end(class);
             if bin.top.get().is_null() {
                 bin.top.set(end);
             }
             debug_assert_eq!(bin.top.get(), end, "a released heap left blocks in a bin");
             bin.empty.set(end.addr() as u16);
-            bin.full.set(start.addr() as u16);
+            bin.misses.set(0);
             bin.anywhere.set(class.reusable_anywhere());
+            self.set_capacity(class, class.bin_initial());
         }
+        self.private.grown.set(0);
     }
 
-    /// The first slot of the slot array, with provenance over all of it. The slots are cells, so
-    /// writing through the pointer is allowed.
+    /// The end of the bin of `class` in the slot array, past its last slot.
+    const fn bin_end(&self, class: Class) -> *mut *mut Block {
+        self.slots().wrapping_add(class.bin_start() + class.bin_max())
+    }
+
+    /// Sets how many blocks the bin of `class` may hold. It must hold no more than that already.
+    fn set_capacity(&self, class: Class, capacity: usize) {
+        let bin = &self.private.bins[class.index()];
+        debug_assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
+        bin.capacity.set(capacity as u16);
+        bin.full.set(self.bin_end(class).wrapping_sub(capacity).addr() as u16);
+    }
+
+    /// Records that the bin of `class` missed in the way `kind` says, and grows it if the class
+    /// alternates between running dry and overflowing, which is how TCMalloc sizes its per-CPU
+    /// caches. Returns whether the bin grew.
+    fn note_miss(&self, class: Class, kind: u8) -> bool {
+        let bin = &self.private.bins[class.index()];
+        let last = bin.misses.get() & (UNDERFLOW | OVERFLOW);
+        bin.misses.set(kind | MISSED);
+        let capacity = usize::from(bin.capacity.get());
+        if last == 0 || last == kind || capacity == class.bin_max() {
+            return false;
+        }
+        let grown = (capacity * 2).min(class.bin_max());
+        let bytes = (grown - capacity) * class.block_size();
+        if self.private.grown.get() + bytes > GROWTH_BUDGET {
+            return false;
+        }
+        self.private.grown.set(self.private.grown.get() + bytes);
+        self.set_capacity(class, grown);
+        true
+    }
+
+    /// The first of this heap's bin slots, with provenance over all of them. They live in the
+    /// region and not in the heap slot, so that the heap slot stays small.
     const fn slots(&self) -> *mut *mut Block {
-        self.private.slots.as_ptr().cast::<*mut Block>().cast_mut()
+        self.private.slots.get()
     }
 
     /// Hands over everything this heap holds that belongs to others and gives the slot up for
@@ -414,7 +471,7 @@ impl HeapData {
 
     /// How many blocks the bin of `class` holds.
     fn bin_len(&self, class: Class) -> usize {
-        let end = self.slots().wrapping_add(class.bin_start() + class.bin_capacity());
+        let end = self.bin_end(class);
         (end.addr() - self.private.bins[class.index()].top.get().addr()) / size_of::<usize>()
     }
 
@@ -488,6 +545,11 @@ impl HeapData {
         }
         // SAFETY: as above.
         unsafe { self.maintain(region) };
+        // Maintenance may have allocated a message from this very class.
+        if let Some(block) = self.pop(class) {
+            return block;
+        }
+        self.note_miss(class, UNDERFLOW);
         if self.fill(region, class) == 0 {
             // The region looks full, but this heap may be sitting on empty slabs. Give them back
             // and retry.
@@ -515,6 +577,20 @@ impl HeapData {
                 // SAFETY: forwarded.
                 unsafe { self.post_outbox(region, outbox) };
             }
+            for (index, bin) in self.private.bins.iter().enumerate() {
+                let class = Class::from_index(index);
+                let capacity = usize::from(bin.capacity.get());
+                if bin.misses.get() & MISSED == 0 && capacity > class.bin_initial() {
+                    // A bin that has not missed for a while holds more than it needs.
+                    let shrunk = (capacity / 2).max(class.bin_initial());
+                    // SAFETY: forwarded.
+                    unsafe { self.flush_bin(class, shrunk) };
+                    self.set_capacity(class, shrunk);
+                    let bytes = (capacity - shrunk) * class.block_size();
+                    self.private.grown.set(self.private.grown.get() - bytes);
+                }
+                bin.misses.set(bin.misses.get() & !MISSED);
+            }
         }
     }
 
@@ -524,7 +600,7 @@ impl HeapData {
     /// the same order.
     fn fill(&self, region: &Region<'_>, class: Class) -> usize {
         let bin = &self.private.bins[class.index()];
-        let want = (class.bin_capacity() / 2).max(1);
+        let want = (usize::from(bin.capacity.get()) / 2).max(1);
         // The bin is empty, so its top is its end. Blocks are written upwards from `want` slots
         // below the end, lowest address first, so that the bin hands them out in address order.
         let end = bin.top.get();
@@ -664,9 +740,13 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn free_full(&self, block: *mut Block, class: Class) {
+        if self.note_miss(class, OVERFLOW) && self.push(class, block) {
+            return;
+        }
         loop {
+            let keep = usize::from(self.private.bins[class.index()].capacity.get()) / 2;
             // SAFETY: forwarded.
-            unsafe { self.flush_bin(class, class.bin_capacity() / 2) };
+            unsafe { self.flush_bin(class, keep) };
             if self.push(class, block) {
                 return;
             }
@@ -690,7 +770,7 @@ impl HeapData {
         let gone = len - keep;
         // The oldest blocks are at the end of the bin. Move them out first and the rest down, so
         // that the bin is consistent if giving the blocks back allocates or frees again.
-        let mut out = [ptr::null_mut::<Block>(); 128];
+        let mut out = [ptr::null_mut::<Block>(); 512];
         let top = bin.top.get();
         // SAFETY: the bin holds `len` blocks from `top`, and `out` holds a bin's capacity.
         unsafe {
@@ -952,7 +1032,10 @@ impl HeapData {
             // SAFETY: the bin held `len` blocks from `top`, which are in use and ours to give
             // back, and giving them back directly never touches a bin.
             unsafe { self.give_back(region, class, core::slice::from_raw_parts(top, len), true) };
+            self.set_capacity(class, class.bin_initial());
+            bin.misses.set(0);
         }
+        self.private.grown.set(0);
     }
 
     /// Handles a slab with no live blocks. Its chunks are returned unless it is the only active
@@ -1148,6 +1231,10 @@ impl HeapData {
                 }
             }
             let bin = &self.private.bins[index];
+            assert!(
+                self.bin_len(class) <= usize::from(bin.capacity.get()),
+                "a bin is over capacity"
+            );
             let mut slot = bin.top.get();
             for _ in 0..self.bin_len(class) {
                 // SAFETY: slots from the top to the end of a bin hold blocks.
@@ -1492,11 +1579,12 @@ mod test {
         let region = test.region();
         let heap = region.heap().unwrap();
         let class = Class::for_size(ANYWHERE);
-        let capacity = class.bin_capacity();
         let layout = layout(ANYWHERE, 8);
-        let blocks = alloc_many(&heap, layout, 2 * capacity);
+        let blocks = alloc_many(&heap, layout, 4 * class.bin_max());
         let newest = *blocks.last().unwrap();
         free_all(&heap, layout, blocks);
+        let capacity = usize::from(heap.data.private.bins[class.index()].capacity.get());
+        assert!(capacity > class.bin_initial(), "a bin that runs dry and overflows grows");
         let len = heap.data.bin_len(class);
         assert!(len > capacity / 2 && len <= capacity, "{len} blocks are left in the bin");
         assert_eq!(heap.alloc(layout), Some(newest), "the newest blocks stay");
@@ -1820,10 +1908,10 @@ mod test {
         let test = TestRegion::new(4, 1);
         let region = test.region();
         assert!(!data.is_claimed());
-        assert!(data.claim(3, &region));
-        assert!(!data.claim(4, &region), "a claimed slot cannot be claimed again");
+        assert!(data.claim(0, &region));
+        assert!(!data.claim(0, &region), "a claimed slot cannot be claimed again");
         data.release_claim();
-        assert!(data.claim(5, &region));
+        assert!(data.claim(0, &region));
     }
 
     #[test]

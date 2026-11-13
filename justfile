@@ -40,11 +40,11 @@ hack *args='':
 
 # Run the tests under Miri with strict provenance.
 miri *args='':
-    MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test --all-features --lib $@
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri nextest run --all-features --lib $@
 
 # Model check the lock-free code with loom.
 loom *args='':
-    RUSTFLAGS="--cfg loom" cargo test --release --lib loom_test $@
+    RUSTFLAGS="--cfg loom" cargo nextest run --release --lib loom_test $@
 
 # Fuzz one target for a number of seconds. The targets are heap_ops and chunk_ops.
 fuzz target='heap_ops' seconds='60':

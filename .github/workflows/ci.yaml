@@ -96,6 +96,7 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@nextest
       - name: Run the tests under Miri
         run: just miri
 
@@ -112,6 +113,7 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@nextest
       - name: Model check the lock-free code
         run: just loom
 

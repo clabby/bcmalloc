@@ -34,8 +34,8 @@ use crate::{
     chunks::{CHUNK_SHIFT, CHUNK_SIZE, Chunks},
     config::{Commit, Config},
     heap::{Heap, HeapData},
-    size_class::{Class, Request, classify},
-    slab::Slab,
+    size_class::{BIN_SLOTS, Class, Request, classify},
+    slab::{Block, Slab},
     sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     sys,
 };
@@ -98,6 +98,8 @@ pub struct Region<'a> {
     /// For every chunk of a slab, the owning heap and the class. See [`Entry`].
     map: &'a [AtomicU64],
     heaps: &'a [HeapData],
+    /// The bin slots of every heap, [`BIN_SLOTS`] for each, owned by whoever claims the heap.
+    bin_slots: *mut *mut Block,
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
@@ -118,35 +120,44 @@ unsafe impl Send for Region<'_> {}
 // SAFETY: as above.
 unsafe impl Sync for Region<'_> {}
 
+/// The storage a [`Region`] is assembled from.
+///
+/// * `base` must point to `chunk_count` chunks of writable memory aligned to 4 MiB, valid for as
+///   long as `'a`, and used by nothing else.
+/// * `words` must be zeroed bitmap storage for `chunk_count` chunks, `slabs` must hold
+///   `chunk_count` unused descriptors, `map` `chunk_count` entries, and `heaps` unclaimed heap
+///   slots.
+/// * `bin_slots` must point to [`BIN_SLOTS`] writable pointers for each heap slot, valid for as
+///   long as `'a` and used by nothing else.
+/// * `purge_granule` is how many chunks the purge clock gives back together, a power of two of at
+///   most 64 that `base` is aligned to in chunks.
+pub(crate) struct Parts<'a> {
+    pub(crate) base: *mut u8,
+    pub(crate) words: &'a [AtomicU64],
+    pub(crate) chunk_count: usize,
+    pub(crate) slabs: &'a [Slab],
+    pub(crate) map: &'a [AtomicU64],
+    pub(crate) heaps: &'a [HeapData],
+    pub(crate) bin_slots: *mut *mut Block,
+    pub(crate) purge_granule: usize,
+}
+
 impl<'a> Region<'a> {
     /// Assembles a region from its parts.
     ///
     /// # Safety
     ///
-    /// * `base` must point to `chunk_count` chunks of writable memory aligned to 4 MiB, valid for
-    ///   as long as `'a`, and used by nothing else.
-    /// * `words` must be zeroed bitmap storage for `chunk_count` chunks, `slabs` must hold
-    ///   `chunk_count` unused descriptors, `map` `chunk_count` entries, and `heaps` unclaimed heap
-    ///   slots.
-    /// * `purge_granule` is how many chunks the purge clock gives back together, a power of two of
-    ///   at most 64 that `base` is aligned to in chunks.
-    pub(crate) unsafe fn from_parts(
-        base: *mut u8,
-        words: &'a [AtomicU64],
-        chunk_count: usize,
-        slabs: &'a [Slab],
-        map: &'a [AtomicU64],
-        heaps: &'a [HeapData],
-        purge_granule: usize,
-    ) -> Self {
-        debug_assert_eq!(slabs.len(), chunk_count);
-        debug_assert_eq!(map.len(), chunk_count);
+    /// The parts must satisfy the contract documented on [`Parts`].
+    pub(crate) unsafe fn from_parts(parts: Parts<'a>) -> Self {
+        debug_assert_eq!(parts.slabs.len(), parts.chunk_count);
+        debug_assert_eq!(parts.map.len(), parts.chunk_count);
         Self {
-            base,
-            chunks: Chunks::with_granule(words, chunk_count, purge_granule),
-            slabs,
-            map,
-            heaps,
+            base: parts.base,
+            chunks: Chunks::with_granule(parts.words, parts.chunk_count, parts.purge_granule),
+            slabs: parts.slabs,
+            map: parts.map,
+            heaps: parts.heaps,
+            bin_slots: parts.bin_slots,
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
             aging: AtomicBool::new(false),
@@ -388,6 +399,11 @@ impl<'a> Region<'a> {
         unsafe { self.slab_of(ptr, class).owned() }.is_free(ptr.as_ptr())
     }
 
+    /// The bin slots of heap `id`, with provenance over all of them.
+    pub(crate) const fn bin_slots(&self, id: u32) -> *mut *mut Block {
+        self.bin_slots.wrapping_add(id as usize * BIN_SLOTS)
+    }
+
     /// The heap slot with id `id`.
     pub(crate) const fn heap_slot(&self, id: u32) -> &HeapData {
         &self.heaps[id as usize]
@@ -443,6 +459,7 @@ impl Entry {
 #[derive(Clone, Copy, Debug)]
 struct Geometry {
     heaps: usize,
+    bins: usize,
     slabs: usize,
     map: usize,
     words: usize,
@@ -455,14 +472,26 @@ impl Geometry {
     fn new(chunks: usize, heaps: usize) -> Option<Self> {
         let heaps_at =
             mem::size_of::<Region<'_>>().checked_next_multiple_of(mem::align_of::<HeapData>())?;
-        let slabs_at = heaps_at.checked_add(heaps.checked_mul(mem::size_of::<HeapData>())?)?;
+        let bins_at = heaps_at.checked_add(heaps.checked_mul(mem::size_of::<HeapData>())?)?;
+        let bin_bytes = BIN_SLOTS * mem::size_of::<*mut Block>();
+        let slabs_at = bins_at
+            .checked_add(heaps.checked_mul(bin_bytes)?)?
+            .checked_next_multiple_of(mem::align_of::<Slab>())?;
         let map_at = slabs_at.checked_add(chunks.checked_mul(mem::size_of::<Slab>())?)?;
         let words_at = map_at.checked_add(chunks.checked_mul(mem::size_of::<AtomicU64>())?)?;
         let words_end =
             words_at.checked_add(Chunks::storage_words(chunks) * mem::size_of::<AtomicU64>())?;
         let data = words_end.checked_next_multiple_of(SLAB_ALIGN)?;
         let total = data.checked_add(chunks.checked_mul(CHUNK_SIZE)?)?;
-        Some(Self { heaps: heaps_at, slabs: slabs_at, map: map_at, words: words_at, data, total })
+        Some(Self {
+            heaps: heaps_at,
+            bins: bins_at,
+            slabs: slabs_at,
+            map: map_at,
+            words: words_at,
+            data,
+            total,
+        })
     }
 }
 
@@ -530,15 +559,16 @@ impl Mapping {
             } else {
                 1
             };
-            let region = Region::from_parts(
-                at(geometry.data),
+            let region = Region::from_parts(Parts {
+                base: at(geometry.data),
                 words,
-                chunks,
+                chunk_count: chunks,
                 slabs,
                 map,
-                heap_slots,
-                granule,
-            );
+                heaps: heap_slots,
+                bin_slots: at(geometry.bins).cast::<*mut Block>(),
+                purge_granule: granule,
+            });
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
         }
 

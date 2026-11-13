@@ -3,9 +3,10 @@
 //! This module only exists in test builds and behind the `testing` feature, so none of it is part
 //! of the allocator.
 
-use core::{alloc::Layout, ptr::NonNull};
+use core::{alloc::Layout, cell::Cell, ptr, ptr::NonNull};
 use std::{
     alloc::{alloc, dealloc},
+    boxed::Box,
     collections::BTreeMap,
     vec::Vec,
 };
@@ -13,8 +14,9 @@ use std::{
 use crate::{
     chunks::{CHUNK_SHIFT, Chunks},
     heap::{Heap, HeapData},
-    region::Region,
-    slab::Slab,
+    region::{Parts, Region},
+    size_class::BIN_SLOTS,
+    slab::{Block, Slab},
     sync::AtomicU64,
 };
 
@@ -125,10 +127,11 @@ unsafe impl Sync for Buffer {}
 /// regions cheaply and loom can model the atomics inside them.
 #[derive(Debug)]
 pub struct TestRegion {
-    words: Vec<AtomicU64>,
-    slabs: Vec<Slab>,
-    map: Vec<AtomicU64>,
-    heaps: Vec<HeapData>,
+    words: Box<[AtomicU64]>,
+    slabs: Box<[Slab]>,
+    map: Box<[AtomicU64]>,
+    heaps: Box<[HeapData]>,
+    bins: Box<[Cell<*mut Block>]>,
     memory: Buffer,
     chunks: usize,
 }
@@ -141,13 +144,18 @@ impl TestRegion {
     /// Panics if `chunks` is zero.
     pub fn new(chunks: usize, heaps: usize) -> Self {
         assert!(chunks > 0, "a region needs at least one chunk");
-        Self {
-            words: (0..Chunks::storage_words(chunks)).map(|_| AtomicU64::new(0)).collect(),
-            slabs: (0..chunks).map(|_| Slab::new()).collect(),
-            map: (0..chunks).map(|_| AtomicU64::new(0)).collect(),
-            heaps: (0..heaps).map(|_| HeapData::new()).collect(),
-            memory: Buffer::new(chunks << CHUNK_SHIFT),
-            chunks,
+        // SAFETY: an all-zero value is a valid free word, unused descriptor, empty map entry and
+        // unclaimed heap, which is what the region relies on for its mapping as well.
+        unsafe {
+            Self {
+                words: zeroed(Chunks::storage_words(chunks), || AtomicU64::new(0)),
+                slabs: zeroed(chunks, Slab::new),
+                map: zeroed(chunks, || AtomicU64::new(0)),
+                heaps: zeroed(heaps, HeapData::new),
+                bins: zeroed(heaps * BIN_SLOTS, || Cell::new(ptr::null_mut())),
+                memory: Buffer::new(chunks << CHUNK_SHIFT),
+                chunks,
+            }
         }
     }
 
@@ -156,17 +164,33 @@ impl TestRegion {
         // SAFETY: the buffer is 4 MiB aligned and `chunks` chunks long, and everything else was
         // just created empty.
         unsafe {
-            Region::from_parts(
-                self.memory.as_ptr(),
-                &self.words,
-                self.chunks,
-                &self.slabs,
-                &self.map,
-                &self.heaps,
-                1,
-            )
+            Region::from_parts(Parts {
+                base: self.memory.as_ptr(),
+                words: &self.words,
+                chunk_count: self.chunks,
+                slabs: &self.slabs,
+                map: &self.map,
+                heaps: &self.heaps,
+                bin_slots: self.bins.as_ptr().cast::<*mut Block>().cast_mut(),
+                purge_granule: 1,
+            })
         }
     }
+}
+
+/// `len` values that are all zero. Zeroing the memory in one go keeps Miri from interpreting the
+/// construction of every field, which made building a region the slowest part of most tests. Loom
+/// atomics are not plain memory, so under loom every value is built with `make`.
+///
+/// # Safety
+///
+/// An all-zero bit pattern must be a valid `T` that equals what `make` returns.
+unsafe fn zeroed<T>(len: usize, make: impl Fn() -> T) -> Box<[T]> {
+    if cfg!(loom) {
+        return (0..len).map(|_| make()).collect();
+    }
+    // SAFETY: the caller vouches for the zero bit pattern.
+    unsafe { Box::new_zeroed_slice(len).assume_init() }
 }
 
 /// A block the harness is tracking, and the byte it was filled with.
