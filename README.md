@@ -1,4 +1,4 @@
-# cwmalloc
+# bcmalloc
 
 <img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
 
@@ -7,10 +7,10 @@ A global allocator for long-lived, highly concurrent Rust programs. It reserves 
 Usage is one line. The region is reserved the first time anything allocates.
 
 ```rust
-use cwmalloc::Cwmalloc;
+use bcmalloc::Bcmalloc;
 
 #[global_allocator]
-static GLOBAL: Cwmalloc = Cwmalloc::new();
+static GLOBAL: Bcmalloc = Bcmalloc::new();
 
 let numbers: Vec<u64> = (0..1000).collect();
 assert_eq!(numbers.iter().sum::<u64>(), 499_500);
@@ -19,10 +19,10 @@ assert_eq!(numbers.iter().sum::<u64>(), 499_500);
 To size the region for your program, pass a [`Config`]. Every method is `const`, so the configuration sits in the static.
 
 ```rust
-use cwmalloc::{Commit, Config, Cwmalloc};
+use bcmalloc::{Commit, Config, Bcmalloc};
 
 #[global_allocator]
-static GLOBAL: Cwmalloc = Cwmalloc::with_config(
+static GLOBAL: Bcmalloc = Bcmalloc::with_config(
     Config::new().capacity(8 << 30).max_heaps(256).commit(Commit::Lazy),
 );
 
@@ -35,7 +35,7 @@ The same allocator is available without the global hook. A [`Mapping`] owns a re
 
 ```rust
 use core::alloc::Layout;
-use cwmalloc::{Config, Mapping};
+use bcmalloc::{Config, Mapping};
 
 let mapping = Mapping::new(&Config::new().capacity(64 << 20).max_heaps(4))?;
 let heap = mapping.region().heap().expect("a free heap");
@@ -44,7 +44,7 @@ let layout = Layout::new::<[u64; 8]>();
 let block = heap.alloc(layout).expect("memory");
 // SAFETY: the block came from this region with this layout and is not used again.
 unsafe { heap.dealloc(block, layout) };
-# Ok::<(), cwmalloc::Error>(())
+# Ok::<(), bcmalloc::Error>(())
 ```
 
 ## Configuration
@@ -62,7 +62,7 @@ If the operating system refuses the default reservation, the global allocator re
 
 Millions of operations per second, and MiB for the last row. Each figure is the best of five runs on an Apple M4 Max with macOS 26.5 and Rust 1.100. The system allocator is macOS libmalloc. Run `just bench` to reproduce them.
 
-| Workload                      | system     | cwmalloc | mimalloc  | jemalloc   | snmalloc  |
+| Workload                      | system     | bcmalloc | mimalloc  | jemalloc   | snmalloc  |
 | ----------------------------- | ---------- | -------- | --------- | ---------- | --------- |
 | single-thread churn           | 36.6       | 63.5     | **122.4** | 112.3      | 119.1     |
 | 4-thread churn                | 39.7       | 230.9    | **462.3** | 435.9      | 341.2     |
@@ -75,7 +75,7 @@ Millions of operations per second, and MiB for the last row. Each figure is the 
 | large blocks                  | 0.2        | **0.2**  | 0.2       | 0.0        | 0.0       |
 | peak memory (lower is better) | 863.5      | 61.6     | 90.2      | **47.1**   | 66.5      |
 
-cwmalloc is ahead of the system allocator on every row except vec growth and uses less memory than mimalloc. It is within a factor of 2.3 of the fastest allocator on every throughput row. It is slowest relative to the others on blocks between 512 B and 2 KiB spread over many slabs. DESIGN.md explains where the time goes.
+bcmalloc is ahead of the system allocator on every row except vec growth and uses less memory than mimalloc. It is within a factor of 2.3 of the fastest allocator on every throughput row. It is slowest relative to the others on blocks between 512 B and 2 KiB spread over many slabs. DESIGN.md explains where the time goes.
 
 ## Limits
 

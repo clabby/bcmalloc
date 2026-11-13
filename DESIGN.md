@@ -1,6 +1,6 @@
-# How cwmalloc works
+# How bcmalloc works
 
-**Tldr.** cwmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions, and a free from another thread is one compare-and-swap. On an Apple M4 Max it allocates small blocks faster than mimalloc and jemalloc (144 against 121 and 131 million operations per second), and it uses less memory than mimalloc on our mixed benchmark (62 against 90 MiB). It is two to three times slower than the best allocator on blocks of 512 B to 2 KiB, and that is the first thing we would tune. This post walks through the design, the tests that keep it honest, and the numbers.
+**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A small allocation pops a block off a thread-local list with no atomic instructions, and a free from another thread is one compare-and-swap. On an Apple M4 Max it allocates small blocks faster than mimalloc and jemalloc (144 against 121 and 131 million operations per second), and it uses less memory than mimalloc on our mixed benchmark (62 against 90 MiB). It is two to three times slower than the best allocator on blocks of 512 B to 2 KiB, and that is the first thing we would tune. This post walks through the design, the tests that keep it honest, and the numbers.
 
 ## 1. Introduction
 
@@ -10,7 +10,7 @@ Most programs never think about their allocator, and that is the right default. 
 2. **No contention on the hot path.** Allocation should touch only memory that belongs to the calling thread. Freeing should be cheap even when the block was allocated somewhere else, because in a pipeline one thread allocates and another frees.
 3. **Memory that comes back.** A burst of one size should not strand memory that a later burst of another size needs.
 
-cwmalloc is built around those three. It is not a drop-in replacement for malloc in every program, it does not support Windows, and it has no idea about NUMA. It supports Linux and macOS.
+bcmalloc is built around those three. It is not a drop-in replacement for malloc in every program, it does not support Windows, and it has no idea about NUMA. It supports Linux and macOS.
 
 The design borrows from several places. The per-thread heaps and per-page free lists come from mimalloc[^mimalloc]. Batched, message-style returns of remote frees come from snmalloc[^snmalloc]. The idea that one atomic update on one cache line should be the whole transaction comes from LLFree[^llfree], and so does the habit of keeping allocator metadata dense and addressable by arithmetic. The uniform slab pool that lets any empty slab become any size class echoes jwmalloc[^jwmalloc].
 
@@ -141,7 +141,7 @@ Concurrency bugs hide from tests that pass, so there are four independent layers
 
 The heap claim bug shows why one layer is not enough. Loom did not find it, because nothing modelled two threads claiming at once until the benchmark crashed. The first version limited its search to the slots that had been claimed so far plus one, so that thread start-up would not touch every slot. Two threads starting together both wanted the same next slot, and the loser was told no slot was free. It aborted the benchmark with a failed 64 KiB allocation. The loom model for it is two threads and two slots, and it fails on the old code every time. The fix is to scan from slot zero and stop at the first free slot, which touches at most one unused slot anyway.
 
-Every test uses the same helpers. A shadow model records each live block, checks alignment, bounds and overlap, and fills every block with a stamp that is verified when it is freed or reallocated. The same model drives the unit tests, the random-traffic test, and the fuzz target, so a failing fuzz input replays as a unit test. Several heaps are driven from one thread, which makes cross-heap frees deterministic. The real global allocator is also exercised end to end. The integration test binary runs the whole standard test harness on top of cwmalloc, with producer and consumer threads and a few thousand short-lived threads.
+Every test uses the same helpers. A shadow model records each live block, checks alignment, bounds and overlap, and fills every block with a stamp that is verified when it is freed or reallocated. The same model drives the unit tests, the random-traffic test, and the fuzz target, so a failing fuzz input replays as a unit test. Several heaps are driven from one thread, which makes cross-heap frees deterministic. The real global allocator is also exercised end to end. The integration test binary runs the whole standard test harness on top of bcmalloc, with producer and consumer threads and a few thousand short-lived threads.
 
 Memory ordering is the other thing to state clearly. A chunk claim is an `Acquire` compare-and-swap, and a free is a `Release` `fetch_and`. A block is usually written by one thread, freed, and reused by another, and the release on the free and the acquire on the claim carry the first thread's writes to the second. The remote list uses the same pairing. A push is a `Release` compare-and-swap and the owner's take is an `Acquire`.
 
@@ -153,11 +153,11 @@ All numbers come from an Apple M4 Max with 12 performance and 4 efficiency cores
 
 **Figure 8.** The benchmark suite against the system allocator, mimalloc, jemalloc and snmalloc.
 
-The honest summary is that cwmalloc is competitive and not the fastest. It is ahead of macOS's system allocator everywhere except vec growth, it beats mimalloc on cross-thread frees and memory, and it is within a factor of 2.3 of the leader on every throughput row. It loses most on thread scaling of the mixed churn, where jemalloc pulls ahead at 8 and 16 threads, and on cross-thread frees, where jemalloc is about twice as fast.
+The honest summary is that bcmalloc is competitive and not the fastest. It is ahead of macOS's system allocator everywhere except vec growth, it beats mimalloc on cross-thread frees and memory, and it is within a factor of 2.3 of the leader on every throughput row. It loses most on thread scaling of the mixed churn, where jemalloc pulls ahead at 8 and 16 threads, and on cross-thread frees, where jemalloc is about twice as fast.
 
 The mixed churn number hides the more interesting result. We ran the same loop through every allocator with only one kind of block at a time.
 
-| Blocks         | cwmalloc | mimalloc | jemalloc  | snmalloc  |
+| Blocks         | bcmalloc | mimalloc | jemalloc  | snmalloc  |
 | -------------- | -------- | -------- | --------- | --------- |
 | 16 B to 128 B  | 143.7    | 121.3    | 130.9     | **211.2** |
 | 512 B to 2 KiB | 46.3     | 59.9     | **112.1** | 76.4      |
@@ -165,11 +165,11 @@ The mixed churn number hides the more interesting result. We ran the same loop t
 
 Millions of allocate-and-free pairs per second on one thread. Small blocks are where the design works as intended. The fast path is a few loads and a store, and it is faster than mimalloc and jemalloc. Mid-sized blocks are where it hurts. A slab of 2 KiB blocks holds 32 of them, and a loop that frees random blocks leaves every slab sparsely free. The front slab runs dry after a few allocations, so the slow path runs constantly. Each run of the slow path moves a slab between lists and does a compare-and-swap to mark it full, and each free into a full slab undoes that. jemalloc avoids this with bins and thread caches that decouple the allocation path from slab state. We have not done that yet, and it is the first thing we would tune.
 
-Two other rows deserve an explanation. Peak memory is low, which we attribute to freed slabs returning to a pool that any class can use, though we have not isolated the cause. The large-block row is about 0.2 million operations per second for cwmalloc, mimalloc and the system allocator, and about 25 times lower for jemalloc and snmalloc. Our guess, which we have not verified, is that those two give pages back to the OS on every free, so the benchmark takes a page fault on every page it touches. cwmalloc only returns pages when asked, with `Region::trim`, which is the behaviour a program that reserves up front wants.
+Two other rows deserve an explanation. Peak memory is low, which we attribute to freed slabs returning to a pool that any class can use, though we have not isolated the cause. The large-block row is about 0.2 million operations per second for bcmalloc, mimalloc and the system allocator, and about 25 times lower for jemalloc and snmalloc. Our guess, which we have not verified, is that those two give pages back to the OS on every free, so the benchmark takes a page fault on every page it touches. bcmalloc only returns pages when asked, with `Region::trim`, which is the behaviour a program that reserves up front wants.
 
 ## 10. Limits and what comes next
 
-cwmalloc is a working allocator and not a finished one. These are the limits we know about.
+bcmalloc is a working allocator and not a finished one. These are the limits we know about.
 
 - Alignments above 64 KiB are refused.
 - A thread that finds every heap taken fails its allocations, which aborts the program. `max_heaps` is a design-time bound, like TigerBeetle's connection limit.

@@ -20,7 +20,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-const ALLOCATORS: [&str; 5] = ["system", "cwmalloc", "mimalloc", "jemalloc", "snmalloc"];
+const ALLOCATORS: [&str; 5] = ["system", "bcmalloc", "mimalloc", "jemalloc", "snmalloc"];
 
 /// The best result seen so far for one allocator on one workload.
 #[derive(Clone, Copy)]

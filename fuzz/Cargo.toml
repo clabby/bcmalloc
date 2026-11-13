@@ -1,5 +1,5 @@
 [package]
-name = "cwmalloc-fuzz"
+name = "bcmalloc-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-cwmalloc = { path = "..", features = ["testing"] }
+bcmalloc = { path = "..", features = ["testing"] }
 
 [[bin]]
 name = "heap_ops"

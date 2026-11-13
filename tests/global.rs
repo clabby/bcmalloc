@@ -1,4 +1,4 @@
-//! Runs real programs on top of `Cwmalloc`. This needs its own test binary because a program has
+//! Runs real programs on top of `Bcmalloc`. This needs its own test binary because a program has
 //! one global allocator, and everything the test harness allocates goes through it too.
 
 #![cfg(not(miri))]
@@ -9,11 +9,11 @@ use std::{
     thread,
 };
 
-use cwmalloc::{Commit, Config, Cwmalloc};
+use bcmalloc::{Bcmalloc, Commit, Config};
 
 #[global_allocator]
-static GLOBAL: Cwmalloc =
-    Cwmalloc::with_config(Config::new().capacity(16 << 30).max_heaps(256).commit(Commit::Lazy));
+static GLOBAL: Bcmalloc =
+    Bcmalloc::with_config(Config::new().capacity(16 << 30).max_heaps(256).commit(Commit::Lazy));
 
 /// A deterministic filler so that corrupted or mixed-up blocks are noticed.
 fn pattern(seed: usize, len: usize) -> Vec<u8> {

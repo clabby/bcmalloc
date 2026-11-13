@@ -19,7 +19,7 @@ pub enum Commit {
 /// Region settings. Every method is `const`, so a configuration can sit in a `static`.
 ///
 /// ```
-/// use cwmalloc::{Commit, Config};
+/// use bcmalloc::{Commit, Config};
 ///
 /// // A fixed 256 MiB heap that is fully resident and pinned, so allocation never page faults.
 /// const CONFIG: Config = Config::new().capacity(256 << 20).max_heaps(64).commit(Commit::Lock);

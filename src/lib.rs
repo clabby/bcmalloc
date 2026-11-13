@@ -23,7 +23,7 @@ mod tls;
 
 pub use config::{Commit, Config};
 #[cfg(all(feature = "std", not(loom)))]
-pub use global::Cwmalloc;
+pub use global::Bcmalloc;
 pub use heap::Heap;
 pub use region::{Error, Mapping, Region, Stats};
 pub use size_class::{MAX_ALIGN, MAX_SMALL};

@@ -868,8 +868,8 @@ impl HeapData {
 /// Blocks are not tied to the heap that allocated them. Any heap, or the region itself through
 /// [`Region::dealloc`], can free them.
 /// ```
+/// use bcmalloc::{Config, Mapping};
 /// use core::alloc::Layout;
-/// use cwmalloc::{Config, Mapping};
 ///
 /// let mapping = Mapping::new(&Config::new().capacity(64 << 20).max_heaps(4))?;
 /// let region = mapping.region();
@@ -879,7 +879,7 @@ impl HeapData {
 /// let block = heap.alloc(layout).expect("memory");
 /// // SAFETY: the block came from this region with this layout and is not used again.
 /// unsafe { heap.dealloc(block, layout) };
-/// # Ok::<(), cwmalloc::Error>(())
+/// # Ok::<(), bcmalloc::Error>(())
 /// ```
 #[derive(Debug)]
 pub struct Heap<'r> {

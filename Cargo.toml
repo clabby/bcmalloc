@@ -1,8 +1,9 @@
 [package]
-name = "cwmalloc"
+name = "bcmalloc"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+repository = "https://github.com/clabby/bcmalloc"
 description = "A scalable global allocator that reserves its memory up front, for long-lived, highly concurrent programs."
 license = "Apache-2.0"
 readme = "README.md"
@@ -14,7 +15,7 @@ exclude = ["/assets", "/fuzz", "/.github"]
 default = [ "std" ]
 # Enables the `#[global_allocator]` front end, which needs thread-local storage from `std`.
 std = [ "libc/std" ]
-# Exposes the model-checking helpers in `cwmalloc::testing` (used by the fuzz targets).
+# Exposes the model-checking helpers in `bcmalloc::testing` (used by the fuzz targets).
 testing = [ "std" ]
 
 [dependencies]
@@ -33,7 +34,7 @@ name = "system"
 harness = false
 
 [[bench]]
-name = "cwmalloc"
+name = "bcmalloc"
 harness = false
 
 [[bench]]
@@ -59,7 +60,7 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unnameable_types = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(cwmalloc_portable_tls)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(bcmalloc_portable_tls)"] }
 
 [lints.rustdoc]
 all = "warn"

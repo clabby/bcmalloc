@@ -400,12 +400,12 @@ impl Geometry {
 /// The OS mapping behind a [`Region`]. Dropping it unmaps everything.
 ///
 /// ```
-/// use cwmalloc::{Config, Mapping};
+/// use bcmalloc::{Config, Mapping};
 ///
 /// let mapping = Mapping::new(&Config::new().capacity(64 << 20).max_heaps(8))?;
 /// let region = mapping.region();
 /// assert_eq!(region.stats().capacity, 64 << 20);
-/// # Ok::<(), cwmalloc::Error>(())
+/// # Ok::<(), bcmalloc::Error>(())
 /// ```
 #[derive(Debug)]
 pub struct Mapping {

@@ -102,7 +102,7 @@ unsafe extern "C" fn release_heap(value: *mut c_void) {
     target_vendor = "apple",
     target_arch = "aarch64",
     not(miri),
-    not(cwmalloc_portable_tls)
+    not(bcmalloc_portable_tls)
 ))]
 mod slot {
     use core::{arch::asm, ptr};
@@ -154,7 +154,7 @@ mod slot {
     target_vendor = "apple",
     target_arch = "aarch64",
     not(miri),
-    not(cwmalloc_portable_tls)
+    not(bcmalloc_portable_tls)
 )))]
 mod slot {
     use core::{cell::Cell, ptr};

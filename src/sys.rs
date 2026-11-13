@@ -19,7 +19,7 @@
 use core::ptr::NonNull;
 
 #[cfg(not(unix))]
-compile_error!("cwmalloc supports Linux and macOS only");
+compile_error!("bcmalloc supports Linux and macOS only");
 
 /// Reserves `len` bytes of zeroed, lazily committed, read-write memory.
 ///

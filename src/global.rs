@@ -1,6 +1,6 @@
 //! The `#[global_allocator]` front end.
 //!
-//! [`Cwmalloc`] is a `static` that creates its [`Region`] the first time anything allocates, and
+//! [`Bcmalloc`] is a `static` that creates its [`Region`] the first time anything allocates, and
 //! gives every thread a [`Heap`] of its own. After that a call looks like this.
 //!
 //! ```text
@@ -44,7 +44,7 @@ use crate::{
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
 const MIN_CAPACITY: usize = 256 << 20;
 
-/// The value of [`Cwmalloc`] key field before the key exists.
+/// The value of [`Bcmalloc`] key field before the key exists.
 const NO_KEY: usize = usize::MAX;
 
 /// A global allocator that reserves its memory up front.
@@ -52,39 +52,39 @@ const NO_KEY: usize = usize::MAX;
 /// Declare one as the program's allocator and everything else follows.
 ///
 /// ```
-/// use cwmalloc::Cwmalloc;
+/// use bcmalloc::Bcmalloc;
 ///
 /// #[global_allocator]
-/// static GLOBAL: Cwmalloc = Cwmalloc::new();
+/// static GLOBAL: Bcmalloc = Bcmalloc::new();
 ///
 /// let numbers: Vec<u64> = (0..1000).collect();
 /// assert_eq!(numbers.iter().sum::<u64>(), 499_500);
 /// ```
 ///
-/// The region is reserved on first use with the default [`Config`]. Use [`Cwmalloc::with_config`]
+/// The region is reserved on first use with the default [`Config`]. Use [`Bcmalloc::with_config`]
 /// to size it for the program. If the operating system refuses the reservation, the allocator
 /// retries with half the capacity, down to 256 MiB.
 ///
 /// ```
-/// use cwmalloc::{Commit, Config, Cwmalloc};
+/// use bcmalloc::{Bcmalloc, Commit, Config};
 ///
 /// #[global_allocator]
-/// static GLOBAL: Cwmalloc =
-///     Cwmalloc::with_config(Config::new().capacity(8 << 30).max_heaps(256).commit(Commit::Lazy));
+/// static GLOBAL: Bcmalloc =
+///     Bcmalloc::with_config(Config::new().capacity(8 << 30).max_heaps(256).commit(Commit::Lazy));
 ///
 /// let text = String::from("allocated from an 8 GiB region");
 /// assert_eq!(GLOBAL.stats().unwrap().heaps_in_use, 1);
 /// # drop(text);
 /// ```
 #[derive(Debug)]
-pub struct Cwmalloc {
+pub struct Bcmalloc {
     config: Config,
     region: AtomicPtr<Region<'static>>,
     /// The thread-specific key under which threads keep their heap, or `NO_KEY`.
     key: AtomicUsize,
 }
 
-impl Cwmalloc {
+impl Bcmalloc {
     /// An allocator with the default [`Config`].
     pub const fn new() -> Self {
         Self::with_config(Config::new())
@@ -155,13 +155,13 @@ impl Cwmalloc {
     }
 }
 
-impl Default for Cwmalloc {
+impl Default for Bcmalloc {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Cwmalloc {
+impl Bcmalloc {
     /// This thread's heap, or null if it has not bound one.
     #[inline(always)]
     fn thread_heap(&self) -> *const HeapData {
@@ -253,7 +253,7 @@ impl Cwmalloc {
 
 // SAFETY: every method forwards to a heap or region of the allocator, which return blocks that
 // are valid, aligned, disjoint and live until freed, and never unwind.
-unsafe impl GlobalAlloc for Cwmalloc {
+unsafe impl GlobalAlloc for Bcmalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: a thread's bound heap is claimed by that thread alone.
@@ -302,9 +302,9 @@ mod test {
     use crate::config::Commit;
 
     /// An allocator over a small region, leaked so that it can be used as a static would be.
-    fn instance() -> &'static Cwmalloc {
+    fn instance() -> &'static Bcmalloc {
         let config = Config::new().capacity(1 << 28).max_heaps(4).commit(Commit::Lazy);
-        Box::leak(Box::new(Cwmalloc::with_config(config)))
+        Box::leak(Box::new(Bcmalloc::with_config(config)))
     }
 
     #[test]
