@@ -275,6 +275,25 @@ impl<'a> Region<'a> {
         Some(first)
     }
 
+    /// Extends the run of `had` chunks at `first` to `wants` chunks if the chunks after it are
+    /// free, and returns whether it did.
+    pub(crate) fn grow_in_place(&self, first: usize, had: usize, wants: usize) -> bool {
+        let (start, more) = (first + had, wants - had);
+        if start + more > self.chunks.len() || !self.chunks.claim_at(start, more) {
+            return false;
+        }
+        self.chunks.take_purged(start, more, |run| {
+            // SAFETY: the run is inside the region and belongs to us since the claim above.
+            unsafe {
+                sys::reuse(
+                    NonNull::new_unchecked(self.chunk_ptr(run.start)),
+                    run.len() << CHUNK_SHIFT,
+                );
+            }
+        });
+        true
+    }
+
     /// Looks again for chunks after a failed claim, in case a purge pass was holding the free
     /// ones. The region is only reported full when no pass overlapped a failed attempt.
     #[cold]

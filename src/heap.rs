@@ -85,7 +85,7 @@ use crate::{
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::{Entry, Region},
-    size_class::{CLASSES, Class, Request, classify},
+    size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
@@ -666,8 +666,32 @@ impl HeapData {
     pub(crate) unsafe fn realloc(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: the caller guarantees the size is valid for the alignment.
         let new = unsafe { Layout::from_size_align_unchecked(new_size, old.align()) };
-        if classify(old) == classify(new) {
-            return ptr.as_ptr();
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        match (classify(old), classify(new)) {
+            (Some(Request::Small(_)), Some(Request::Small(_))) => {
+                // The block keeps its place while the new size fits and wastes at most half of
+                // it, as mimalloc decides. Frees read the class from the chunk map and not from
+                // the layout, so the block is still freed as what it is.
+                let size = self.entry_of(ptr.as_ptr()).class().block_size();
+                if new_size <= size && new_size >= size / 2 {
+                    return ptr.as_ptr();
+                }
+            }
+            (Some(Request::Huge { chunks: had }), Some(Request::Huge { chunks: wants })) => {
+                let first = region.chunk_index(ptr.as_ptr());
+                if wants <= had {
+                    if wants < had {
+                        region.free_chunks(first + wants, had - wants);
+                        region.purge_if_due();
+                    }
+                    return ptr.as_ptr();
+                }
+                if region.grow_in_place(first, had, wants) {
+                    return ptr.as_ptr();
+                }
+            }
+            _ => {}
         }
         // SAFETY: forwarded.
         let block = unsafe { self.alloc(new) };
@@ -690,44 +714,38 @@ impl HeapData {
     /// this region with exactly the layout and not be used again.
     #[inline(always)]
     pub(crate) unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
-        if Class::is_table_request(layout) {
-            let class = Class::from_table(layout.size());
+        if layout.size() <= MAX_SMALL {
             // SAFETY: forwarded.
-            unsafe { self.free_small(ptr.as_ptr().cast(), class) };
+            unsafe { self.free_small(ptr.as_ptr().cast()) };
         } else {
-            // SAFETY: forwarded.
-            unsafe { self.dealloc_general(ptr, layout) };
+            // SAFETY: the claim keeps the region alive, and the caller vouches for the block.
+            unsafe { self.region().dealloc(ptr, layout) };
         }
     }
 
-    /// Frees a block of a slab of `class`.
+    /// Frees a block of a slab. Its class and its owner both come from one load of the chunk map,
+    /// so the layout does not matter beyond telling slab blocks from huge ones, and a block that a
+    /// realloc kept in place is freed as what it is.
     ///
     /// # Safety
     ///
     /// As for [`dealloc`](Self::dealloc).
     #[inline(always)]
-    unsafe fn free_small(&self, block: *mut Block, class: Class) {
+    unsafe fn free_small(&self, block: *mut Block) {
+        let entry = self.entry_of(block.cast());
+        let class = entry.class();
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
         // the program's requests.
-        let owner = self.entry_of(block.cast()).owner();
-        if owner != self.private.id.get() && !self.private.bins[class.index()].anywhere.get() {
+        if entry.owner() != self.private.id.get() &&
+            !self.private.bins[class.index()].anywhere.get()
+        {
             // SAFETY: forwarded.
-            return unsafe { self.send(block, class, owner) };
+            return unsafe { self.send(block, class, entry.owner()) };
         }
         if !self.push(class, block) {
             // SAFETY: forwarded.
             unsafe { self.free_full(block, class) };
-        }
-    }
-
-    #[inline(never)]
-    unsafe fn dealloc_general(&self, ptr: NonNull<u8>, layout: Layout) {
-        match classify(layout) {
-            // SAFETY: forwarded.
-            Some(Request::Small(class)) => unsafe { self.free_small(ptr.as_ptr().cast(), class) },
-            // SAFETY: the claim keeps the region alive, and the caller vouches for the block.
-            _ => unsafe { self.region().dealloc(ptr, layout) },
         }
     }
 
@@ -979,7 +997,7 @@ impl HeapData {
                     for index in 0..(*message).count {
                         self.file(region, (*message).blocks[index]);
                     }
-                    self.free_small(message.cast(), MESSAGE_CLASS);
+                    self.free_small(message.cast());
                 }
             }
             node = next;
@@ -1764,6 +1782,43 @@ mod test {
         assert!(copied.iter().all(|&byte| byte == 0xAB));
         // SAFETY: allocated by the call above.
         unsafe { heap.dealloc(grown, layout(5000, 8)) };
+    }
+
+    #[test]
+    fn a_block_that_shrinks_by_at_most_half_keeps_its_place_and_its_class() {
+        let test = TestRegion::new(16, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let block = heap.alloc(layout(1000, 8)).unwrap();
+        // SAFETY: the block is live with this layout.
+        let same = unsafe { heap.realloc(block, layout(1000, 8), 600) }.unwrap();
+        assert_eq!(same, block, "600 bytes waste less than half of a 1 KiB block");
+        // SAFETY: as above, now with 600 bytes.
+        let moved = unsafe { heap.realloc(same, layout(600, 8), 300) }.unwrap();
+        assert_ne!(moved, block, "300 bytes would waste more than half");
+        // The kept block was freed with a 600-byte layout and still went back as a 1 KiB block.
+        assert_eq!(heap.alloc(layout(1024, 8)), Some(block));
+        heap.validate();
+    }
+
+    #[test]
+    fn huge_blocks_shrink_in_place_and_grow_into_free_chunks() {
+        let test = TestRegion::new(64, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let big = layout(20 * CHUNK_SIZE, 8);
+        let block = heap.alloc(big).unwrap();
+        assert_eq!(used(&region), 20 * CHUNK_SIZE);
+        // SAFETY: the block is live with this layout.
+        let shrunk = unsafe { heap.realloc(block, big, 12 * CHUNK_SIZE) }.unwrap();
+        assert_eq!((shrunk, used(&region)), (block, 12 * CHUNK_SIZE), "the tail goes back");
+        // SAFETY: as above, now with twelve chunks.
+        let grown = unsafe { heap.realloc(shrunk, layout(12 * CHUNK_SIZE, 8), 18 * CHUNK_SIZE) };
+        assert_eq!(grown, Some(block), "the chunks after the block were free");
+        assert_eq!(used(&region), 18 * CHUNK_SIZE);
+        // SAFETY: as above, now with eighteen chunks.
+        unsafe { heap.dealloc(block, layout(18 * CHUNK_SIZE, 8)) };
+        assert_eq!(used(&region), 0);
     }
 
     #[test]

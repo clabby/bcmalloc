@@ -163,6 +163,55 @@ impl<'a> Chunks<'a> {
         }
     }
 
+    /// Claims exactly the `n` chunks from `first` if every one of them is free, and returns whether
+    /// it did. A run that spans words is claimed one word at a time and given back if a later word
+    /// is taken, so this is obstruction-free like the claim of a long run.
+    pub(crate) fn claim_at(&self, first: usize, n: usize) -> bool {
+        debug_assert!(n > 0 && first + n <= self.len);
+        let end = first + n;
+        let mut chunk = first;
+        while chunk < end {
+            let (word, offset) = (chunk / WORD, chunk % WORD);
+            let take = (WORD - offset).min(end - chunk);
+            let mask = run_mask(take, offset);
+            let used = &self.used[word];
+            let mut seen = used.load(Ordering::Relaxed);
+            loop {
+                if seen & mask != 0 {
+                    // Give back what this call already claimed.
+                    if chunk > first {
+                        self.release(first, chunk - first);
+                    }
+                    return false;
+                }
+                match used.compare_exchange_weak(
+                    seen,
+                    seen | mask,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => seen = actual,
+                }
+            }
+            chunk += take;
+        }
+        true
+    }
+
+    /// Clears the bits of chunks that a failed claim took, without marking them dirty or touching
+    /// their clock, since nothing was ever stored in them.
+    fn release(&self, first: usize, n: usize) {
+        let end = first + n;
+        let mut chunk = first;
+        while chunk < end {
+            let (word, offset) = (chunk / WORD, chunk % WORD);
+            let take = (WORD - offset).min(end - chunk);
+            self.used[word].fetch_and(!run_mask(take, offset), Ordering::Release);
+            chunk += take;
+        }
+    }
+
     /// Returns `n` chunks starting at `first`, which were freed at time `now` in milliseconds.
     ///
     /// The run must be exactly one previously returned by [`alloc`](Self::alloc), or a part of
@@ -601,6 +650,19 @@ mod test {
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0], 5..8);
         chunks.take_purged(5, 3, |_| panic!("already reported"));
+    }
+
+    #[test]
+    fn a_claim_at_a_place_takes_exactly_free_runs_and_rolls_back() {
+        let bitmap = Bitmap::new(200);
+        let chunks = bitmap.chunks();
+        assert!(chunks.claim_at(60, 70), "a free run across three words");
+        assert_eq!(chunks.free_chunks(), 130);
+        assert!(!chunks.claim_at(10, 51), "chunk 60 is taken");
+        assert!(!chunks.claim_at(129, 40), "chunk 129 is taken");
+        assert_eq!(chunks.free_chunks(), 130, "a failed claim leaves nothing behind");
+        assert!(chunks.claim_at(130, 70));
+        assert_eq!(chunks.free_chunks(), 60);
     }
 
     #[test]
