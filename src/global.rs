@@ -132,6 +132,17 @@ impl Bcmalloc {
         }
     }
 
+    /// The layout of the whole block that `ptr` points to: its full usable size, and an alignment
+    /// of
+    /// 16. It is None if `ptr` is not in this allocator's region.
+    ///
+    /// The answer is only meaningful when `ptr` is the start of a live block from this allocator.
+    /// It is what a C interface needs to implement `free` and `malloc_usable_size`, which get no
+    /// size, and the layout it returns is a valid one to free or reallocate the block with.
+    pub fn block_layout(&self, ptr: NonNull<u8>) -> Option<Layout> {
+        self.existing()?.block_layout(ptr.as_ptr())
+    }
+
     /// Hands back the blocks that the calling thread's heap keeps for reuse: its bins, its
     /// outboxes and what other threads sent it, and then its empty slabs.
     ///
@@ -248,9 +259,17 @@ impl Bcmalloc {
     /// heap is free or the system has no key to give.
     #[cold]
     fn bind(&self, region: &'static Region<'static>) -> Option<&'static HeapData> {
-        if tls::exiting() {
+        if tls::exiting() || tls::binding() {
             return None;
         }
+        tls::set_binding(true);
+        let bound = self.bind_now(region);
+        tls::set_binding(false);
+        bound
+    }
+
+    /// The body of [`bind`](Self::bind), which runs with the binding flag set.
+    fn bind_now(&self, region: &'static Region<'static>) -> Option<&'static HeapData> {
         let key = self.key()?;
         let heap = region.heap()?;
         // The heap releases its claim if the system refuses to remember it.
@@ -410,6 +429,27 @@ mod test {
         // SAFETY: the block came from this allocator with this layout.
         unsafe { allocator.deallocate(empty.cast(), Layout::from_size_align(0, 32).unwrap()) };
         assert!(allocator.stats().is_none());
+    }
+
+    #[test]
+    fn a_block_can_be_freed_and_resized_with_the_layout_the_allocator_reports() {
+        let allocator = instance();
+        for (size, align) in [(1, 1), (100, 8), (5000, 64), (300_000, 4096), (3 << 20, 16)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            // SAFETY: the layout has a non-zero size.
+            let block = NonNull::new(unsafe { allocator.alloc(layout) }).unwrap();
+            let held = allocator.block_layout(block).unwrap();
+            assert!(held.size() >= size, "{size} fits in what the allocator holds");
+            // SAFETY: the block is live, and the reported layout is valid for resizing it.
+            let grown = unsafe { allocator.realloc(block.as_ptr(), held, held.size() * 2) };
+            let grown = NonNull::new(grown).unwrap();
+            let held = allocator.block_layout(grown).unwrap();
+            assert!(held.size() >= size * 2);
+            // SAFETY: the block is live, and the reported layout is valid for freeing it.
+            unsafe { allocator.dealloc(grown.as_ptr(), held) };
+        }
+        let outside = NonNull::from(&0_u64).cast::<u8>();
+        assert_eq!(allocator.block_layout(outside), None, "a pointer outside the region");
     }
 
     #[test]

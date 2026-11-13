@@ -705,12 +705,14 @@ impl HeapData {
                 let first = region.chunk_index(ptr.as_ptr());
                 if wants <= had {
                     if wants < had {
+                        region.set_huge(first, wants);
                         region.free_chunks(first + wants, had - wants);
                         region.purge_if_due();
                     }
                     return ptr.as_ptr();
                 }
                 if region.grow_in_place(first, had, wants) {
+                    region.set_huge(first, wants);
                     return ptr.as_ptr();
                 }
             }
@@ -1128,9 +1130,11 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
-        region
-            .alloc_chunks(chunks, 1, 0, self.private.node.get())
-            .map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
+        let Some(first) = region.alloc_chunks(chunks, 1, 0, self.private.node.get()) else {
+            return ptr::null_mut();
+        };
+        region.set_huge(first, chunks);
+        region.chunk_ptr(first)
     }
 
     /// Moves a slab to the full list, or to the back of the active list.

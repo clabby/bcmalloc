@@ -43,6 +43,19 @@ pub(crate) const NO_KEY: Key = usize::MAX;
 thread_local! {
     /// Set once this thread's heap has been released at exit.
     static EXITED: Cell<bool> = const { Cell::new(false) };
+    /// Set while this thread is binding a heap. When the allocator replaces malloc, creating a key
+    /// or storing a value may itself allocate, and that allocation must not try to bind again.
+    static BINDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is in the middle of binding a heap.
+pub(crate) fn binding() -> bool {
+    BINDING.with(Cell::get)
+}
+
+/// Marks this thread as binding a heap, or as done.
+pub(crate) fn set_binding(on: bool) {
+    BINDING.with(|binding| binding.set(on));
 }
 
 /// Whether this thread has already given its heap back, so that it must not bind a new one.

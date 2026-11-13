@@ -491,6 +491,25 @@ impl<'a> Region<'a> {
         self.map.as_ptr()
     }
 
+    /// Records that the chunks from `first` hold a huge block of `chunks` chunks.
+    pub(crate) fn set_huge(&self, first: usize, chunks: usize) {
+        self.map[first].store(Entry::huge(chunks).0, Ordering::Relaxed);
+    }
+
+    /// The layout of the whole block that `ptr` points to, as the allocator holds it, or None if
+    /// `ptr` is outside the region. It is only meaningful for the start of a live block.
+    #[cfg(all(feature = "std", not(loom)))]
+    pub(crate) fn block_layout(&self, ptr: *const u8) -> Option<Layout> {
+        if !self.contains(ptr) {
+            return None;
+        }
+        let entry = self.entry(self.chunk_index(ptr));
+        let size = entry
+            .huge_chunks()
+            .map_or_else(|| entry.class().block_size(), |chunks| chunks << CHUNK_SHIFT);
+        Layout::from_size_align(size, 16).ok()
+    }
+
     /// Records that the `n` chunks from `first` hold a slab of `class` owned by heap `owner`.
     ///
     /// The entries are read by threads that free blocks of the slab. Those threads got the blocks
@@ -504,9 +523,12 @@ impl<'a> Region<'a> {
     }
 }
 
-/// What the chunk map records for a chunk: the heap that owns the slab and the slab's size class.
+/// What the chunk map records for a chunk: the heap that owns the slab and the slab's size class,
+/// or for the first chunk of a huge block, how many chunks the block spans.
 ///
 /// The owner sits in the low 32 bits, so the free path reads it with one load and a truncation.
+/// The top bit marks a huge block. Frees through the Rust interfaces know a huge block by its
+/// layout. The entry is what lets a C [`free`] without a size tell the two apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Entry(pub(crate) u64);
 
@@ -514,6 +536,20 @@ impl Entry {
     /// The entry for a slab of `class` owned by heap `owner`.
     pub(crate) const fn new(owner: u32, class: Class) -> Self {
         Self(owner as u64 | (class.index() as u64) << 32)
+    }
+
+    /// The bit that marks the entry of the first chunk of a huge block.
+    const HUGE: u64 = 1 << 63;
+
+    /// The entry for the first chunk of a huge block of `chunks` chunks.
+    pub(crate) const fn huge(chunks: usize) -> Self {
+        Self(Self::HUGE | chunks as u64)
+    }
+
+    /// The number of chunks of a huge block, or None if the entry is a slab's.
+    #[cfg(all(feature = "std", not(loom)))]
+    pub(crate) const fn huge_chunks(self) -> Option<usize> {
+        if self.0 & Self::HUGE != 0 { Some((self.0 & !Self::HUGE) as usize) } else { None }
     }
 
     /// The id of the heap that owns the slab.

@@ -1,0 +1,24 @@
+[package]
+name = "bcmalloc-cabi"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The C allocation interface of bcmalloc, as a library to preload."
+
+[lib]
+name = "bcmalloc"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bcmalloc = { path = ".." }
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+debug = "line-tables-only"
+
+# Keep the library out of the parent crate's build.
+[workspace]
