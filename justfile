@@ -54,8 +54,15 @@ fuzz target='heap_ops' seconds='60':
 bench-build:
     cargo bench --no-run
 
-# Run every workload under every allocator and print the comparison. Options are --quick,
-# --rounds N, --filter TEXT, --only A,B, --baseline ALLOCATOR and --perf, which counts hardware
-# events with perf stat on Linux. The raw rows go to target/bench.tsv.
+# Run every workload under every allocator and print the comparison with medians and bootstrap
+# intervals. Options are --quick, --runs N (default 10), --filter TEXT, --only A,B, --baseline
+# ALLOCATOR, --cpus LIST (taskset, Linux), --manifest PATH (the benches of another crate), --save
+# PATH and --perf, which counts hardware events with perf stat on Linux. Every sample goes to
+# target/bench.tsv.
 bench *args='':
     cargo bench --bench report -- $@
+
+# Compare two saved sample files from bench --save and print the change of each median with a 95%
+# interval. Only bcmalloc is shown unless --only A,B says otherwise.
+bench-compare old new *args='':
+    old="$1"; new="$2"; shift 2; cargo bench --bench report -- --compare "$old" "$new" "$@"
