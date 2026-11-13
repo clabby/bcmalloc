@@ -384,7 +384,8 @@ impl HeapData {
     /// Sets how many blocks the bin of `class` may hold. It must hold no more than that already.
     fn set_capacity(&self, class: Class, capacity: usize) {
         let bin = self.bin(class);
-        debug_assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
+        // A bin that held more than its capacity would let pushes run past its start.
+        assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
         bin.capacity.set(capacity as u16);
         bin.full.set(self.bin_end(class).wrapping_sub(capacity).addr() as u16);
     }
@@ -679,8 +680,12 @@ impl HeapData {
                 if bin.misses.get() & MISSED == 0 && capacity > class.bin_initial() {
                     // A bin that has not missed for a while holds more than it needs.
                     let shrunk = (capacity / 2).max(class.bin_initial());
-                    // SAFETY: forwarded.
-                    unsafe { self.flush_bin(class, shrunk) };
+                    // Giving blocks back may read the inbox, which files blocks into this very
+                    // bin, so the bin only shrinks once it holds no more than the new capacity.
+                    while self.bin_len(class) > shrunk {
+                        // SAFETY: forwarded.
+                        unsafe { self.flush_bin(class, shrunk) };
+                    }
                     self.set_capacity(class, shrunk);
                     let bytes = (capacity - shrunk) * class.block_size();
                     self.private.grown.set(self.private.grown.get() - bytes);
@@ -2171,6 +2176,42 @@ mod test {
         heap.validate();
         other.validate();
         assert_eq!(used(&region), 0, "every block went back to its slab or the chunk allocator");
+    }
+    #[test]
+    fn shrinking_a_bin_that_takes_in_mail_while_it_shrinks_keeps_it_within_capacity() {
+        // Found by mimalloc-bench's mstress. Shrinking an idle bin gives its oldest blocks back.
+        // Sending another heap's block may read the inbox, and blocks filed from it land in the bin
+        // being shrunk. Setting the smaller capacity after that let pushes run past the bin.
+        let test = TestRegion::new(256, 2);
+        let region = test.region();
+        let (heap, other) = (region.heap().unwrap(), region.heap().unwrap());
+        let class = Class::for_size(4096);
+        assert!(class.reusable_anywhere(), "the bin keeps the other heap's blocks");
+        let layout = layout(class.block_size(), 8);
+        let max = class.bin_max();
+        heap.data.set_capacity(class, max);
+        heap.data.private.grown.set((max - class.bin_initial()) * class.block_size());
+        // Blocks of this heap come back through its inbox once the other heap flushes them.
+        let mine = alloc_many(&heap, layout, max);
+        free_all(&other, layout, mine);
+        other.flush();
+        assert!(has_mail(&heap));
+        // The bin fills with the other heap's blocks, which shrinking sends home.
+        let theirs = alloc_many(&other, layout, max);
+        free_all(&heap, layout, theirs);
+        heap.data.bin(class).misses.set(0);
+        heap.data.private.refills.set(MAINTENANCE_INTERVAL - 1);
+        // SAFETY: the handle holds the claim.
+        unsafe { heap.data.maintain(&region) };
+        let capacity = usize::from(heap.data.bin(class).capacity.get());
+        assert!(capacity < max, "the idle bin shrank");
+        assert!(heap.data.bin_len(class) <= capacity);
+        heap.validate();
+        other.validate();
+        heap.flush();
+        other.flush();
+        heap.flush();
+        assert_eq!(used(&region), 0);
     }
 
     #[test]
