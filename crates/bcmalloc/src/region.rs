@@ -275,7 +275,12 @@ impl<'a> Region<'a> {
     /// Whether `ptr` points into this region's managed memory.
     pub fn contains(&self, ptr: *const u8) -> bool {
         let offset = ptr.addr().wrapping_sub(self.base.addr());
-        offset < self.chunks.len() << CHUNK_SHIFT
+        offset < self.span()
+    }
+
+    /// The length of the managed memory in bytes.
+    pub(crate) const fn span(&self) -> usize {
+        self.chunks.len() << CHUNK_SHIFT
     }
 
     /// Claims `n` chunks as `Chunks`::alloc does, preferring part `part` (see [`Region::part`]),
@@ -575,9 +580,13 @@ impl Entry {
     }
 
     /// The number of chunks of a huge block, or None if the entry is a slab's.
-    #[cfg(all(feature = "std", not(loom)))]
     pub(crate) const fn huge_chunks(self) -> Option<usize> {
-        if self.0 & Self::HUGE != 0 { Some((self.0 & !Self::HUGE) as usize) } else { None }
+        if self.is_huge() { Some((self.0 & !Self::HUGE) as usize) } else { None }
+    }
+
+    /// Whether the entry is that of the first chunk of a huge block.
+    pub(crate) const fn is_huge(self) -> bool {
+        self.0 & Self::HUGE != 0
     }
 
     /// The id of the heap that owns the slab.

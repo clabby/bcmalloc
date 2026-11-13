@@ -8,7 +8,8 @@
 //! ```
 //!
 //! Every function forwards to one [`Bcmalloc`] with its default configuration. C frees carry no
-//! size, so `free` and `realloc` ask the allocator for the layout of the block from its chunk map.
+//! size, so `free` reads what the block is from the chunk map, and `realloc` asks the allocator
+//! for the layout of the block.
 //! Pointers that the allocator does not own are ignored by `free`, which can happen with memory a
 //! program got before the library was loaded.
 //!
@@ -85,7 +86,11 @@ fn allocate(size: usize, align: usize) -> *mut c_void {
 /// Callable from C with the usual contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
-    allocate(size, MIN_ALIGN)
+    let block = ALLOCATOR.malloc(size);
+    if block.is_null() {
+        set_errno(libc::ENOMEM);
+    }
+    block.cast()
 }
 
 /// C `free`.
@@ -96,10 +101,8 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     let Some(block) = NonNull::new(ptr.cast::<u8>()) else { return };
-    if let Some(layout) = ALLOCATOR.block_layout(block) {
-        // SAFETY: the caller frees a live block, and the layout is the one the allocator holds.
-        unsafe { ALLOCATOR.dealloc(block.as_ptr(), layout) };
-    }
+    // SAFETY: the caller frees a live block, and pointers from elsewhere are ignored.
+    unsafe { ALLOCATOR.free_unsized(block) };
 }
 
 /// C `calloc`.
@@ -113,12 +116,14 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
         set_errno(libc::ENOMEM);
         return ptr::null_mut();
     };
-    let block = allocate(bytes, MIN_ALIGN);
-    if !block.is_null() {
+    let block = ALLOCATOR.malloc(bytes);
+    if block.is_null() {
+        set_errno(libc::ENOMEM);
+    } else {
         // SAFETY: the block holds at least `bytes` bytes.
         unsafe { block.cast::<u8>().write_bytes(0, bytes) };
     }
-    block
+    block.cast()
 }
 
 /// C `realloc`. A size of zero frees the block and returns null, as glibc does.

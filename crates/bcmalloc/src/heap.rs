@@ -221,6 +221,9 @@ struct Private {
     /// slot was claimed from, so that the fast paths reach them without loading the region. They
     /// are set at every claim and valid while the claim lasts.
     base: Cell<*mut u8>,
+    /// The length of the managed memory in bytes, so that a free without a layout can tell a block
+    /// of the region from any other pointer.
+    span: Cell<usize>,
     map: Cell<*const AtomicU64>,
     slabs: Cell<*const Slab>,
     region: Cell<*const Region<'static>>,
@@ -280,6 +283,7 @@ impl HeapData {
                 draining: Cell::new(false),
                 grown: Cell::new(0),
                 base: Cell::new(ptr::null_mut()),
+                span: Cell::new(0),
                 map: Cell::new(ptr::null()),
                 slabs: Cell::new(ptr::null()),
                 region: Cell::new(ptr::null()),
@@ -328,6 +332,7 @@ impl HeapData {
             private.id.set(id);
             private.region.set(ptr::from_ref(region).cast());
             private.base.set(region.chunk_ptr(0));
+            private.span.set(region.span());
             private.slabs.set(region.slabs_ptr());
             private.map.set(region.map_ptr());
             private.slots.set(region.bin_slots(id));
@@ -558,6 +563,23 @@ impl HeapData {
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_general(layout) }
+    }
+    /// Allocates `size` bytes aligned to 16 for a size the class table covers, zero included.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, and `size` must be at most
+    /// [`TABLE_MAX`](crate::size_class::TABLE_MAX).
+    #[cfg(all(feature = "std", not(loom)))]
+    #[inline(always)]
+    pub(crate) unsafe fn alloc_table(&self, size: usize) -> *mut u8 {
+        debug_assert!(size <= crate::size_class::TABLE_MAX);
+        let class = Class::from_table(size);
+        if let Some(block) = self.pop(class) {
+            return block.cast();
+        }
+        // SAFETY: forwarded.
+        unsafe { self.refill(class) }.cast()
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
@@ -850,7 +872,42 @@ impl HeapData {
     /// As for [`dealloc`](Self::dealloc).
     #[inline(always)]
     unsafe fn free_small(&self, block: *mut Block) {
-        let entry = self.entry_of(block.cast());
+        // SAFETY: forwarded.
+        unsafe { self.free_entry(block, self.entry_of(block.cast())) };
+    }
+
+    /// Frees a block without its layout, as C's `free` does, and ignores a pointer outside the
+    /// region. The chunk map tells a slab's block from a huge one, so this takes one load of the
+    /// map where looking the layout up first and then freeing would take two.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, and a pointer inside the region must be the
+    /// start of a live block that is not used again.
+    #[inline(always)]
+    pub(crate) unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
+        let offset = ptr.as_ptr().addr().wrapping_sub(self.private.base.get().addr());
+        if offset >= self.private.span.get() {
+            return;
+        }
+        let entry = self.entry_of(ptr.as_ptr());
+        if let Some(chunks) = entry.huge_chunks() {
+            // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
+            return unsafe {
+                self.free_huge(ptr, Layout::from_size_align_unchecked(chunks << CHUNK_SHIFT, 16))
+            };
+        }
+        // SAFETY: the caller gives up a block of a slab.
+        unsafe { self.free_entry(ptr.as_ptr().cast(), entry) };
+    }
+
+    /// Frees a block of a slab whose chunk map entry is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`dealloc`](Self::dealloc), and `entry` must be the entry of the block's chunk.
+    #[inline(always)]
+    unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
         let class = entry.class();
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
@@ -1571,6 +1628,17 @@ impl<'r> Heap<'r> {
         unsafe { self.data.dealloc(ptr, layout) };
     }
 
+    /// Frees a block without its layout, and ignores a pointer outside the region.
+    ///
+    /// # Safety
+    ///
+    /// A pointer inside the region must be a live block of it, and must not be used or freed
+    /// again.
+    pub unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
+        // SAFETY: this handle holds the claim, and the caller vouches for the block.
+        unsafe { self.data.free_unsized(ptr) };
+    }
+
     /// Resizes a block, returning `None` (and leaving the block untouched) if there is no room.
     ///
     /// A block whose new size falls in the same size class, or the same number of chunks for huge
@@ -2078,6 +2146,31 @@ mod test {
         assert!(chunk(huge) >= 128, "huge blocks come from the node's part too");
         near.validate();
         far.validate();
+    }
+    #[test]
+    fn frees_without_a_layout_find_small_and_huge_blocks_and_skip_others() {
+        let test = TestRegion::new(256, 2);
+        let region = test.region();
+        let (heap, other) = (region.heap().unwrap(), region.heap().unwrap());
+        let small = alloc_many(&heap, layout(48, 8), 100);
+        let theirs = alloc_many(&other, layout(4000, 8), 10);
+        let huge = heap.alloc(layout(9 * CHUNK_SIZE + 1, 8)).unwrap();
+        let mut outside = 0_u64;
+        // SAFETY: each block is live and freed once, and the last pointer is not in the region.
+        unsafe {
+            for &block in small.iter().chain(&theirs) {
+                heap.free_unsized(block);
+            }
+            heap.free_unsized(huge);
+            heap.free_unsized(NonNull::from(&mut outside).cast());
+        }
+        heap.flush();
+        other.flush();
+        // The other heap frees the messages it was sent, which are this heap's blocks.
+        heap.flush();
+        heap.validate();
+        other.validate();
+        assert_eq!(used(&region), 0, "every block went back to its slab or the chunk allocator");
     }
 
     #[test]
