@@ -134,6 +134,7 @@ pub struct TestRegion {
     bins: Box<[Cell<*mut Block>]>,
     memory: Buffer,
     chunks: usize,
+    nodes: usize,
 }
 
 impl TestRegion {
@@ -155,8 +156,15 @@ impl TestRegion {
                 bins: zeroed(heaps * BIN_SLOTS, || Cell::new(ptr::null_mut())),
                 memory: Buffer::new(chunks << CHUNK_SHIFT),
                 chunks,
+                nodes: 1,
             }
         }
+    }
+
+    /// As [`TestRegion::new`], with the chunks split between `nodes` NUMA nodes as a machine with
+    /// that many would split them.
+    pub fn with_nodes(chunks: usize, heaps: usize, nodes: usize) -> Self {
+        Self { nodes, ..Self::new(chunks, heaps) }
     }
 
     /// The region over this storage.
@@ -173,6 +181,7 @@ impl TestRegion {
                 heaps: &self.heaps,
                 bin_slots: self.bins.as_ptr().cast::<*mut Block>().cast_mut(),
                 purge_granule: 1,
+                nodes: self.nodes,
             })
         }
     }

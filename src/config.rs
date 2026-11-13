@@ -30,6 +30,7 @@ pub struct Config {
     capacity: usize,
     max_heaps: usize,
     huge_pages: bool,
+    numa: bool,
     commit: Commit,
 }
 
@@ -41,6 +42,7 @@ impl Config {
             capacity: 64 << 30,
             max_heaps: 4096,
             huge_pages: cfg!(target_os = "linux"),
+            numa: true,
             commit: Commit::Lazy,
         }
     }
@@ -79,6 +81,16 @@ impl Config {
         self
     }
 
+    /// Splits the region into one part per NUMA node on Linux machines with more than one, which is
+    /// the default. Each part prefers the memory of its node, and a heap takes its slabs from the
+    /// part of the node its thread started on, so that a thread's memory is local to it. Other
+    /// platforms and single-node machines ignore it.
+    #[must_use]
+    pub const fn numa(mut self, enabled: bool) -> Self {
+        self.numa = enabled;
+        self
+    }
+
     /// Sets how eagerly the region is backed by physical memory.
     #[must_use]
     pub const fn commit(mut self, commit: Commit) -> Self {
@@ -98,6 +110,10 @@ impl Config {
 
     pub(crate) const fn wants_huge_pages(&self) -> bool {
         self.huge_pages
+    }
+
+    pub(crate) const fn wants_numa(&self) -> bool {
+        self.numa
     }
 
     pub(crate) const fn commit_mode(&self) -> Commit {

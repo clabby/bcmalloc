@@ -151,15 +151,46 @@ impl<'a> Chunks<'a> {
     /// `hint` is the bitmap word at which single-chunk searches begin. Returns `None` if no run
     /// is free.
     pub(crate) fn alloc(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
+        self.alloc_near(n, align, hint, 0..Self::words_for(self.len))
+    }
+
+    /// As [`alloc`](Self::alloc), but looks in the bitmap words of `home` first and only then in
+    /// the whole bitmap. This is how a heap keeps to the memory of its own NUMA node.
+    pub(crate) fn alloc_near(
+        &self,
+        n: usize,
+        align: usize,
+        hint: usize,
+        home: Range<usize>,
+    ) -> Option<usize> {
         debug_assert!(n > 0 && align.is_power_of_two() && align <= WORD);
+        if n > self.len {
+            return None;
+        }
         let words = Self::words_for(self.len);
+        let home = home.start.min(words)..home.end.min(words);
+        if !home.is_empty() &&
+            home.len() < words &&
+            let Some(first) = self.alloc_in(n, align, hint, home)
+        {
+            return Some(first);
+        }
+        self.alloc_in(n, align, hint, 0..words)
+    }
+
+    /// Claims a run whose words all lie in `words`, as [`alloc`](Self::alloc) places them.
+    fn alloc_in(&self, n: usize, align: usize, hint: usize, words: Range<usize>) -> Option<usize> {
+        let count = words.len();
         match n {
-            _ if n > self.len => None,
             1 => {
-                (0..words).map(|i| (hint + i) % words).find_map(|w| self.claim(w, 1, align, false))
+                let start = hint.wrapping_sub(words.start) % count;
+                let start = if words.contains(&hint) || words.start == 0 { start } else { 0 };
+                (0..count)
+                    .map(|i| words.start + (start + i) % count)
+                    .find_map(|w| self.claim(w, 1, align, false))
             }
-            2..=WORD => (0..words).rev().find_map(|w| self.claim(w, n, align, true)),
-            _ => self.claim_span(n),
+            2..=WORD => words.rev().find_map(|w| self.claim(w, n, align, true)),
+            _ => self.claim_span(n, words),
         }
     }
 
@@ -400,9 +431,13 @@ impl<'a> Chunks<'a> {
     }
 
     /// Claims `n > 64` chunks that start on a word boundary, preferring the highest address.
-    fn claim_span(&self, n: usize) -> Option<usize> {
+    fn claim_span(&self, n: usize, words: Range<usize>) -> Option<usize> {
         let (full, rest) = (n / WORD, n % WORD);
-        (0..=(self.len - n) / WORD)
+        let end = (words.end * WORD).min(self.len);
+        if end < words.start * WORD + n {
+            return None;
+        }
+        (words.start..=(end - n) / WORD)
             .rev()
             .find(|&first| {
                 self.looks_free(first, full, rest) && self.try_claim_span(first, full, rest)

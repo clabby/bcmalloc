@@ -196,6 +196,9 @@ struct Private {
     map: Cell<*const AtomicU64>,
     slabs: Cell<*const Slab>,
     region: Cell<*const Region<'static>>,
+    /// The NUMA node whose part of the region this heap takes its chunks from, and the bitmap word
+    /// where single-chunk searches start.
+    node: Cell<usize>,
     cursor: Cell<usize>,
     bins: [Bin; CLASSES],
     /// This heap's bin slots in the region, set at every claim.
@@ -246,6 +249,7 @@ impl HeapData {
                 map: Cell::new(ptr::null()),
                 slabs: Cell::new(ptr::null()),
                 region: Cell::new(ptr::null()),
+                node: Cell::new(0),
                 cursor: Cell::new(0),
                 bins: [const {
                     Bin {
@@ -291,9 +295,19 @@ impl HeapData {
             private.slabs.set(region.slabs_ptr());
             private.map.set(region.map_ptr());
             private.slots.set(region.bin_slots(id));
+            self.settle_on(region, region.current_node());
             self.init_bins();
         }
         won
+    }
+
+    /// Makes the heap take its chunks from the part of the region of NUMA node `node`.
+    fn settle_on(&self, region: &Region<'_>, node: usize) {
+        let home = region.home(node);
+        self.private.node.set(node);
+        if !home.contains(&self.private.cursor.get()) {
+            self.private.cursor.set(home.start);
+        }
     }
 
     /// Points every bin at its range of the slot array, empty and at its initial capacity. A slot
@@ -648,7 +662,8 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let Some(first) = region.alloc_chunks(chunks, chunks, self.private.cursor.get()) else {
+        let (cursor, node) = (self.private.cursor.get(), self.private.node.get());
+        let Some(first) = region.alloc_chunks(chunks, chunks, cursor, node) else {
             return false;
         };
         region.set_owner(first, chunks, self.private.id.get(), class);
@@ -658,7 +673,7 @@ impl HeapData {
         // SAFETY: the chunks are a slab-sized, slab-aligned run that is ours alone.
         unsafe { owned.init(class, region.chunk_ptr(first)) };
         self.push_front(owned, List::Active);
-        if chunks == 1 {
+        if chunks == 1 && region.home(node).contains(&(first / 64)) {
             self.private.cursor.set(first / 64);
         }
         true
@@ -1079,8 +1094,11 @@ impl HeapData {
         let first = region.chunk_index(slab.start());
         region.free_chunks(first, slab.class().slab_chunks());
         region.purge_if_due();
-        // Prefer the lowest free word next time, so slabs stay packed towards the bottom.
-        self.private.cursor.set(self.private.cursor.get().min(first / 64));
+        // Prefer the lowest free word of the home part next time, so slabs stay packed towards the
+        // bottom of it.
+        if region.home(self.private.node.get()).contains(&(first / 64)) {
+            self.private.cursor.set(self.private.cursor.get().min(first / 64));
+        }
     }
 
     /// Hands back everything this heap holds outside its slabs, then every empty slab.
@@ -1110,7 +1128,9 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
-        region.alloc_chunks(chunks, 1, 0).map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
+        region
+            .alloc_chunks(chunks, 1, 0, self.private.node.get())
+            .map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
     }
 
     /// Moves a slab to the full list, or to the back of the active list.
@@ -1411,6 +1431,13 @@ impl<'r> Heap<'r> {
     ) -> Option<NonNull<u8>> {
         // SAFETY: this handle holds the claim, and the caller vouches for the block and size.
         NonNull::new(unsafe { self.data.realloc(ptr, old, new_size) })
+    }
+
+    /// Makes this heap take its chunks from the part of the region of NUMA node `node`, as if its
+    /// thread had started there.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn settle_on(&self, node: usize) {
+        self.data.settle_on(self.region, node);
     }
 
     /// Checks the heap's structural invariants. See `HeapData::validate`.
@@ -1825,6 +1852,29 @@ mod test {
         // SAFETY: as above, now with eighteen chunks.
         unsafe { heap.dealloc(block, layout(18 * CHUNK_SIZE, 8)) };
         assert_eq!(used(&region), 0);
+    }
+
+    #[test]
+    fn heaps_take_chunks_from_their_own_node_first() {
+        // Four bitmap words, two for each node.
+        let test = TestRegion::with_nodes(256, 2, 2);
+        let region = test.region();
+        let (near, far) = (region.heap().unwrap(), region.heap().unwrap());
+        near.settle_on(0);
+        far.settle_on(1);
+        let small = layout(8192, 8);
+        let chunk = |block: NonNull<u8>| region.chunk_index(block.as_ptr());
+        let mine = alloc_many(&near, small, 8 * 100);
+        assert!(mine.iter().all(|&block| chunk(block) < 128), "node 0 owns chunks 0 to 127");
+        let theirs = alloc_many(&far, small, 8 * 100);
+        assert!(theirs.iter().all(|&block| chunk(block) >= 128), "node 1 owns chunks 128 up");
+        // Node 0's part has 28 chunks left, so a request for 40 more falls back to node 1's part.
+        let more = alloc_many(&near, small, 8 * 40);
+        assert!(more.iter().any(|&block| chunk(block) >= 128), "a full part borrows from others");
+        let huge = far.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(huge) >= 128, "huge blocks come from the node's part too");
+        near.validate();
+        far.validate();
     }
 
     #[test]

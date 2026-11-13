@@ -199,9 +199,126 @@ pub(crate) fn monotonic_ms() -> u64 {
     }
 }
 
+/// How many NUMA nodes the machine has, counting from node 0. It is 1 where the system does not
+/// say, the list of nodes has gaps, or the platform has no NUMA support to speak of.
+#[cfg_attr(
+    not(all(target_os = "linux", not(miri))),
+    allow(clippy::missing_const_for_fn, reason = "only Linux reads the system here")
+)]
+pub(crate) fn numa_nodes() -> usize {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        // The kernel lists online nodes as ranges such as "0-3". Reading the file needs no
+        // allocation, which matters because this runs inside the first allocation.
+        let mut buffer = [0_u8; 64];
+        let path = c"/sys/devices/system/node/online";
+        // SAFETY: the path is a valid C string and the buffer is ours.
+        let read = unsafe {
+            let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return 1;
+            }
+            let read = libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len());
+            libc::close(fd);
+            read
+        };
+        let Ok(read) = usize::try_from(read) else { return 1 };
+        parse_node_list(&buffer[..read])
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        1
+    }
+}
+
+/// The node count in a list like "0" or "0-3". Anything else, such as a list with gaps, counts as
+/// one node, so that the allocator never binds memory to a node that may not exist.
+#[cfg(any(test, all(target_os = "linux", not(miri))))]
+fn parse_node_list(list: &[u8]) -> usize {
+    let list = list.strip_suffix(b"\n").unwrap_or(list);
+    match list {
+        b"0" => 1,
+        [b'0', b'-', last @ ..] if !last.is_empty() && last.iter().all(u8::is_ascii_digit) => last
+            .iter()
+            .fold(0_usize, |n, digit| n * 10 + usize::from(digit - b'0'))
+            .saturating_add(1),
+        _ => 1,
+    }
+}
+
+/// The NUMA node of the CPU the calling thread runs on, or 0 where the system does not say.
+#[cfg_attr(
+    not(all(target_os = "linux", not(miri))),
+    allow(clippy::missing_const_for_fn, reason = "only Linux asks the system here")
+)]
+pub(crate) fn current_node() -> usize {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        let (mut cpu, mut node) = (0_u32, 0_u32);
+        // SAFETY: both pointers are valid for the call, and the third argument is unused.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_getcpu,
+                &raw mut cpu,
+                &raw mut node,
+                core::ptr::null_mut::<u8>(),
+            )
+        };
+        if result == 0 { node as usize } else { 0 }
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        0
+    }
+}
+
+/// Asks the kernel to back the range with memory of `node` where it can, and elsewhere when that
+/// node is out of memory.
+///
+/// # Safety
+///
+/// The range must lie within a live reservation.
+#[cfg_attr(
+    not(all(target_os = "linux", not(miri))),
+    allow(clippy::missing_const_for_fn, reason = "only Linux makes a system call here")
+)]
+pub(crate) unsafe fn prefer_node(ptr: NonNull<u8>, len: usize, node: usize) {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        /// The memory policy that prefers one node and falls back to the others.
+        const MPOL_PREFERRED: libc::c_long = 1;
+        let mask: u64 = 1 << (node % 64);
+        // SAFETY: the range is inside a reservation, and the mask outlives the call.
+        unsafe {
+            libc::syscall(
+                libc::SYS_mbind,
+                ptr.as_ptr(),
+                len,
+                MPOL_PREFERRED,
+                &raw const mask,
+                64 as libc::c_ulong,
+                0 as libc::c_uint,
+            );
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    let _ = (ptr, len, node);
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn node_lists_are_parsed_conservatively() {
+        assert_eq!(parse_node_list(b"0\n"), 1);
+        assert_eq!(parse_node_list(b"0-3\n"), 4);
+        assert_eq!(parse_node_list(b"0-15"), 16);
+        assert_eq!(parse_node_list(b"0,2-3\n"), 1, "a list with gaps binds nothing");
+        assert_eq!(parse_node_list(b""), 1);
+        assert!(numa_nodes() >= 1);
+        assert!(current_node() < 1024);
+    }
 
     const LEN: usize = 1 << 20;
 

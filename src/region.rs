@@ -26,6 +26,7 @@
 use core::{
     alloc::Layout,
     fmt, mem,
+    ops::Range,
     ptr::{self, NonNull},
     slice,
 };
@@ -100,6 +101,9 @@ pub struct Region<'a> {
     heaps: &'a [HeapData],
     /// The bin slots of every heap, [`BIN_SLOTS`] for each, owned by whoever claims the heap.
     bin_slots: *mut *mut Block,
+    /// How many NUMA nodes the region is split between, and how many bitmap words each part has.
+    nodes: usize,
+    node_words: usize,
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
@@ -140,6 +144,8 @@ pub(crate) struct Parts<'a> {
     pub(crate) heaps: &'a [HeapData],
     pub(crate) bin_slots: *mut *mut Block,
     pub(crate) purge_granule: usize,
+    /// How many NUMA nodes to split the chunks between, at least 1.
+    pub(crate) nodes: usize,
 }
 
 impl<'a> Region<'a> {
@@ -151,6 +157,8 @@ impl<'a> Region<'a> {
     pub(crate) unsafe fn from_parts(parts: Parts<'a>) -> Self {
         debug_assert_eq!(parts.slabs.len(), parts.chunk_count);
         debug_assert_eq!(parts.map.len(), parts.chunk_count);
+        let words = Chunks::words_for(parts.chunk_count);
+        let nodes = parts.nodes.clamp(1, words);
         Self {
             base: parts.base,
             chunks: Chunks::with_granule(parts.words, parts.chunk_count, parts.purge_granule),
@@ -158,6 +166,8 @@ impl<'a> Region<'a> {
             map: parts.map,
             heaps: parts.heaps,
             bin_slots: parts.bin_slots,
+            nodes,
+            node_words: words.div_ceil(nodes),
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
             aging: AtomicBool::new(false),
@@ -258,10 +268,17 @@ impl<'a> Region<'a> {
 
     /// Claims `n` chunks as `Chunks`::alloc does, and makes the pages of any that were given back
     /// to the OS ready for use.
-    pub(crate) fn alloc_chunks(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
-        let first = match self.chunks.alloc(n, align, hint) {
+    pub(crate) fn alloc_chunks(
+        &self,
+        n: usize,
+        align: usize,
+        hint: usize,
+        node: usize,
+    ) -> Option<usize> {
+        let home = self.home(node);
+        let first = match self.chunks.alloc_near(n, align, hint, home.clone()) {
             Some(first) => first,
-            None => self.alloc_chunks_after_purge(n, align, hint)?,
+            None => self.alloc_chunks_after_purge(n, align, hint, home)?,
         };
         self.chunks.take_purged(first, n, |run| {
             // SAFETY: the run is inside the region and belongs to us since the claim above.
@@ -273,6 +290,17 @@ impl<'a> Region<'a> {
             }
         });
         Some(first)
+    }
+
+    /// The bitmap words of the part of the region that belongs to NUMA node `node`.
+    pub(crate) const fn home(&self, node: usize) -> Range<usize> {
+        let start = (node % self.nodes) * self.node_words;
+        start..start + self.node_words
+    }
+
+    /// The NUMA node of the CPU the calling thread runs on, as the region numbers its parts.
+    pub(crate) fn current_node(&self) -> usize {
+        if self.nodes == 1 { 0 } else { sys::current_node() % self.nodes }
     }
 
     /// Extends the run of `had` chunks at `first` to `wants` chunks if the chunks after it are
@@ -297,13 +325,19 @@ impl<'a> Region<'a> {
     /// Looks again for chunks after a failed claim, in case a purge pass was holding the free
     /// ones. The region is only reported full when no pass overlapped a failed attempt.
     #[cold]
-    fn alloc_chunks_after_purge(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
+    fn alloc_chunks_after_purge(
+        &self,
+        n: usize,
+        align: usize,
+        hint: usize,
+        home: Range<usize>,
+    ) -> Option<usize> {
         loop {
             let active = self.purges_active.load(Ordering::Acquire);
             let done = self.purges_done.load(Ordering::Acquire);
             // Every round looks at the bitmap, so chunks that are free for some other reason can
             // be used even while a pass that was descheduled is still holding its own.
-            if let Some(first) = self.chunks.alloc(n, align, hint) {
+            if let Some(first) = self.chunks.alloc_near(n, align, hint, home.clone()) {
                 return Some(first);
             }
             // The attempt may have failed because of chunks that a pass claimed. Seeing such a
@@ -574,6 +608,7 @@ impl Mapping {
                 Chunks::storage_words(chunks),
             );
             // With huge pages, giving back less than a whole one would split it.
+            let nodes = if config.wants_numa() { sys::numa_nodes() } else { 1 };
             let granule = if config.wants_huge_pages() && cfg!(target_os = "linux") {
                 HUGE_PAGE_CHUNKS
             } else {
@@ -588,6 +623,7 @@ impl Mapping {
                 heaps: heap_slots,
                 bin_slots: at(geometry.bins).cast::<*mut Block>(),
                 purge_granule: granule,
+                nodes,
             });
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
         }
@@ -619,6 +655,22 @@ impl Mapping {
         if config.wants_huge_pages() {
             // SAFETY: as above.
             unsafe { sys::advise_huge(data, data_len) };
+        }
+        let region = self.region();
+        for node in 0..region.nodes {
+            let words = region.home(node);
+            let start = (words.start * 64).min(region.chunks.len());
+            let end = (words.end * 64).min(region.chunks.len());
+            if region.nodes > 1 && start < end {
+                // SAFETY: the range is inside the data range.
+                unsafe {
+                    sys::prefer_node(
+                        NonNull::new_unchecked(region.chunk_ptr(start)),
+                        (end - start) << CHUNK_SHIFT,
+                        node,
+                    );
+                }
+            }
         }
         match config.commit_mode() {
             Commit::Lazy => {}
@@ -689,14 +741,14 @@ mod test {
 
         let test = TestRegion::new(2, 1);
         let region = test.region();
-        let a = region.alloc_chunks(1, 1, 0).unwrap();
-        region.alloc_chunks(1, 1, 0).unwrap();
+        let a = region.alloc_chunks(1, 1, 0, 0).unwrap();
+        region.alloc_chunks(1, 1, 0, 0).unwrap();
         // A pass that was descheduled while holding some other chunks.
         region.purges_active.fetch_add(1, Ordering::Release);
         region.free_chunks(a, 1);
         let (sender, receiver) = mpsc::channel();
         std::thread::scope(|scope| {
-            scope.spawn(|| sender.send(region.alloc_chunks_after_purge(1, 1, 0)).unwrap());
+            scope.spawn(|| sender.send(region.alloc_chunks_after_purge(1, 1, 0, 0..1)).unwrap());
             let found = receiver.recv_timeout(Duration::from_secs(5));
             // Let the retry finish whatever happened, so that the scope can end.
             region.purges_active.fetch_sub(1, Ordering::Release);
@@ -717,7 +769,7 @@ mod test {
             for _ in 0..2 {
                 scope.spawn(|| {
                     for _ in 0..rounds {
-                        let chunk = region.alloc_chunks(1, 1, 0).expect("a chunk is free");
+                        let chunk = region.alloc_chunks(1, 1, 0, 0).expect("a chunk is free");
                         region.free_chunks(chunk, 1);
                     }
                 });
@@ -804,7 +856,7 @@ mod loom_test {
                 std::boxed::Box::leak(std::boxed::Box::new(TestRegion::new(1, 1)));
             let region: &'static Region<'static> =
                 std::boxed::Box::leak(std::boxed::Box::new(test.region()));
-            let chunk = region.alloc_chunks(1, 1, 0).unwrap();
+            let chunk = region.alloc_chunks(1, 1, 0, 0).unwrap();
             let freer = thread::spawn(move || region.free_chunks(chunk, 1));
             let purger = thread::spawn(move || region.purge_pass(u64::MAX));
             freer.join().unwrap();
