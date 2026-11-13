@@ -88,10 +88,11 @@ pub(crate) enum Event {
     HugeCacheHits,
     BinsGrown,
     BinsShrunk,
+    ZeroedFresh,
 }
 
 /// How many kinds of [`Event`] there are.
-const EVENTS: usize = Event::BinsShrunk as usize + 1;
+const EVENTS: usize = Event::ZeroedFresh as usize + 1;
 
 /// The slow-path counters of one heap slot.
 #[derive(Debug)]
@@ -196,6 +197,8 @@ pub struct Events {
     pub bins_grown: u64,
     /// Bins that shrank because they stopped missing.
     pub bins_shrunk: u64,
+    /// Zeroed requests served from fresh memory, which needed no clearing.
+    pub zeroed_fresh: u64,
     /// Passes of the purge clock.
     pub purge_passes: u64,
     /// Chunks the purge clock gave back to the operating system.
@@ -374,6 +377,25 @@ mod test {
         let counted = region.metrics().classes[Class::for_size(48).index()];
         assert_eq!((counted.allocs, counted.frees), (1, 1));
     }
+
+    #[test]
+    fn zeroed_requests_from_fresh_memory_are_not_cleared() {
+        let test = TestRegion::new(256, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let fresh = heap.alloc_zeroed(Layout::from_size_align(4096, 8).unwrap()).unwrap();
+        let huge = heap.alloc_zeroed(Layout::from_size_align(20 * CHUNK_SIZE, 8).unwrap()).unwrap();
+        assert_eq!(region.metrics().events.zeroed_fresh, 2);
+        // SAFETY: both blocks are live and freed once.
+        unsafe {
+            heap.dealloc(fresh, Layout::from_size_align(4096, 8).unwrap());
+            heap.dealloc(huge, Layout::from_size_align(20 * CHUNK_SIZE, 8).unwrap());
+        }
+        // The huge block comes back from the heap's cache, which is not fresh.
+        let again = heap.alloc_zeroed(Layout::from_size_align(20 * CHUNK_SIZE, 8).unwrap());
+        assert!(again.is_some());
+        assert_eq!(region.metrics().events.zeroed_fresh, 2);
+    }
 }
 
 impl fmt::Display for Metrics {
@@ -410,12 +432,13 @@ impl fmt::Display for Metrics {
         )?;
         writeln!(
             f,
-            "  huge +{} -{} ({} cached), bins grown {} shrunk {}, purges {} gave back {} reused {}",
+            "  huge +{} -{} ({} cached), bins grown {} shrunk {}, fresh zeroed {}, purges {} gave back {} reused {}",
             events.huge_allocs,
             events.huge_frees,
             events.huge_cache_hits,
             events.bins_grown,
             events.bins_shrunk,
+            events.zeroed_fresh,
             events.purge_passes,
             Bytes(events.chunks_purged << CHUNK_SHIFT),
             Bytes(events.chunks_reused << CHUNK_SHIFT)

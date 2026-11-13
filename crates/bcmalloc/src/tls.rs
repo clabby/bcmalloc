@@ -191,16 +191,28 @@ mod slot {
     use super::Key;
     use crate::heap::HeapData;
 
+    /// The key of an empty slot, which no allocator has. Pthread keys are small, and an allocator
+    /// without one has [`NO_KEY`](super::NO_KEY).
+    const EMPTY: Key = super::NO_KEY - 1;
+
     thread_local! {
         /// The key and heap this thread used last. A thread that serves several allocators keeps
-        /// only the latest here, and pthread remembers the others.
-        static CURRENT: Cell<(Key, *const HeapData)> = const { Cell::new((0, ptr::null())) };
+        /// only the latest here, and pthread remembers the others. A slot whose key matches always
+        /// holds a heap.
+        static CURRENT: Cell<(Key, *const HeapData)> = const { Cell::new((EMPTY, ptr::null())) };
     }
 
     #[inline(always)]
     pub(super) fn get(key: Key) -> *const HeapData {
         let (bound, data) = CURRENT.with(Cell::get);
-        if bound == key { data } else { ptr::null() }
+        if bound == key {
+            // SAFETY: only `set` stores a key that an allocator has, and it stores a heap with it.
+            // Knowing that lets the caller's null check fold into the key check.
+            unsafe { core::hint::assert_unchecked(!data.is_null()) };
+            data
+        } else {
+            ptr::null()
+        }
     }
 
     /// Looks the heap up through pthread and makes it the latest.
@@ -221,7 +233,7 @@ mod slot {
     }
 
     pub(super) fn clear() {
-        CURRENT.with(|current| current.set((0, ptr::null())));
+        CURRENT.with(|current| current.set((EMPTY, ptr::null())));
     }
 
     pub(super) const fn probe(_key: Key) -> bool {

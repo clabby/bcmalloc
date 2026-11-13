@@ -116,12 +116,14 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
         set_errno(libc::ENOMEM);
         return ptr::null_mut();
     };
-    let block = ALLOCATOR.malloc(bytes);
+    let Some(layout) = layout(bytes, MIN_ALIGN) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    // SAFETY: the layout has a non-zero size.
+    let block = unsafe { ALLOCATOR.alloc_zeroed(layout) };
     if block.is_null() {
         set_errno(libc::ENOMEM);
-    } else {
-        // SAFETY: the block holds at least `bytes` bytes.
-        unsafe { block.cast::<u8>().write_bytes(0, bytes) };
     }
     block.cast()
 }

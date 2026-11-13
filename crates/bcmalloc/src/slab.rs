@@ -75,6 +75,10 @@ pub(crate) struct Slab {
     capacity: Cell<u32>,
     /// No word of the bitmap below this one has a bit set.
     cursor: Cell<u16>,
+    /// Blocks from this index on have never been handed out since the slab was set up on memory
+    /// that read as zeros, so they still hold zeros. It is the capacity if the memory was not
+    /// zero.
+    zero_from: Cell<u16>,
     class: Cell<u8>,
     list: Cell<List>,
     /// Whether every block has been handed out once since the slab was set up.
@@ -105,6 +109,7 @@ impl Slab {
             free_len: Cell::new(0),
             capacity: Cell::new(0),
             cursor: Cell::new(0),
+            zero_from: Cell::new(0),
             class: Cell::new(0),
             list: Cell::new(List::None),
             filled: Cell::new(false),
@@ -134,12 +139,13 @@ impl<'a> Owned<'a> {
     }
 
     /// Prepares an unused descriptor for a fresh slab of `class` whose first block is at `start`,
-    /// with every block free.
+    /// with every block free. `zeroed` says that the slab's memory reads as zeros.
     ///
     /// # Safety
     ///
-    /// `start` must point to a slab-sized, suitably aligned region that nothing else uses.
-    pub(crate) unsafe fn init(self, class: Class, start: *mut u8) {
+    /// `start` must point to a slab-sized, suitably aligned region that nothing else uses, and
+    /// that is all zeros if `zeroed`.
+    pub(crate) unsafe fn init(self, class: Class, start: *mut u8, zeroed: bool) {
         let slab = self.0;
         let capacity = class.blocks_per_slab();
         debug_assert!(capacity <= MAX_BLOCKS);
@@ -149,6 +155,7 @@ impl<'a> Owned<'a> {
         slab.free_len.set(capacity as u32);
         slab.capacity.set(capacity as u32);
         slab.cursor.set(0);
+        slab.zero_from.set(if zeroed { 0 } else { capacity as u16 });
         slab.class.set(class.index() as u8);
         slab.list.set(List::None);
         slab.filled.set(false);
@@ -239,6 +246,7 @@ impl<'a> Owned<'a> {
         let (start, size) = (slab.start.get(), self.class().block_size());
         let mut word = usize::from(slab.cursor.get());
         let mut taken = 0;
+        let mut last = 0;
         while taken < want {
             let mut bits = slab.bits[word].get();
             if bits == u64::MAX && want - taken >= 64 {
@@ -251,6 +259,7 @@ impl<'a> Owned<'a> {
                 }
                 slab.bits[word].set(0);
                 taken += 64;
+                last = word * 64 + 63;
                 word += 1;
                 continue;
             }
@@ -260,6 +269,7 @@ impl<'a> Owned<'a> {
                 out(unsafe { start.add(index * size) });
                 bits &= bits - 1;
                 taken += 1;
+                last = index;
             }
             slab.bits[word].set(bits);
             if bits == 0 {
@@ -268,7 +278,21 @@ impl<'a> Owned<'a> {
         }
         slab.cursor.set(word.min(BITMAP_WORDS - 1) as u16);
         slab.free_len.set(slab.free_len.get() - taken as u32);
+        if taken != 0 {
+            // Blocks come out lowest first, so everything handed out lies below the last one.
+            slab.zero_from.set(slab.zero_from.get().max(last as u16 + 1));
+        }
         taken
+    }
+
+    /// Hands out the lowest free block, and whether it still holds the zeros of fresh memory.
+    pub(crate) fn take_one(self) -> Option<(*mut u8, bool)> {
+        let zero_from = usize::from(self.0.zero_from.get());
+        let mut block = None;
+        self.take(1, |taken| block = Some(taken));
+        let block = block?;
+        let index = (block.addr() - self.start().addr()) / self.class().block_size();
+        Some((block, index >= zero_from))
     }
 
     /// Checks that the bitmap agrees with the counters and has no bit set below the cursor or
@@ -412,7 +436,7 @@ mod test {
             let memory = Buffer::new(class.slab_chunks() << crate::chunks::CHUNK_SHIFT);
             let slab = Slab::new();
             // SAFETY: the buffer is slab sized and aligned, and ours alone.
-            unsafe { slab.owned().init(class, memory.as_ptr()) };
+            unsafe { slab.owned().init(class, memory.as_ptr(), true) };
             Self { slab, _memory: memory }
         }
 

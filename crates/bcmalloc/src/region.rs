@@ -48,6 +48,12 @@ const PURGE_INTERVAL_MS: u64 = 10;
 /// The alignment of the managed memory, which is the size of the largest slab.
 const SLAB_ALIGN: usize = 64 * CHUNK_SIZE;
 
+/// How many times longer free chunks of the zone of transparent huge pages wait before they are
+/// given back. A huge page that is given back and then used again costs a fault that clears 2 MiB,
+/// and big blocks that a program frees and allocates in turn would pay it every time, so idle huge
+/// pages wait 100 ms, as jemalloc lets dirty pages decay instead of returning them at once.
+const HUGE_PURGE_WAIT: u64 = 10;
+
 /// The chunks in one transparent huge page of 2 MiB.
 pub(crate) const HUGE_PAGE_CHUNKS: usize = (2 << 20) / CHUNK_SIZE;
 
@@ -168,7 +174,7 @@ impl<'a> Region<'a> {
         // Huge pages go back whole, and small pages one chunk at a time.
         let chunks = if zones > 1 {
             Chunks::with_granule(parts.words, parts.chunk_count, HUGE_PAGE_CHUNKS)
-                .coarse_in_odd_parts(nodes * zones)
+                .coarse_in_odd_parts(nodes * zones, HUGE_PURGE_WAIT)
         } else {
             Chunks::with_granule(parts.words, parts.chunk_count, 1)
         };
@@ -326,6 +332,7 @@ impl<'a> Region<'a> {
                 huge_cache_hits: sum(Event::HugeCacheHits),
                 bins_grown: sum(Event::BinsGrown),
                 bins_shrunk: sum(Event::BinsShrunk),
+                zeroed_fresh: sum(Event::ZeroedFresh),
                 purge_passes: counters.purge_passes.get(),
                 chunks_purged: counters.chunks_purged.get(),
                 chunks_reused: counters.chunks_reused.get(),
@@ -346,6 +353,7 @@ impl<'a> Region<'a> {
 
     /// Claims `n` chunks as `Chunks`::alloc does, preferring part `part` (see [`Region::part`]),
     /// and makes the pages of any that were given back to the OS ready for use.
+    #[cfg(test)]
     pub(crate) fn alloc_chunks(
         &self,
         n: usize,
@@ -353,11 +361,23 @@ impl<'a> Region<'a> {
         hint: usize,
         part: usize,
     ) -> Option<usize> {
+        self.alloc_chunks_zeroed(n, align, hint, part).map(|(first, _)| first)
+    }
+
+    /// As [`alloc_chunks`](Self::alloc_chunks), and also tells whether the chunks read as zeros.
+    pub(crate) fn alloc_chunks_zeroed(
+        &self,
+        n: usize,
+        align: usize,
+        hint: usize,
+        part: usize,
+    ) -> Option<(usize, bool)> {
         let home = self.home(part);
         let first = match self.chunks.alloc_near(n, align, hint, home.clone()) {
             Some(first) => first,
             None => self.alloc_chunks_after_purge(n, align, hint, home)?,
         };
+        let zeroed = self.chunks.is_clean(first, n, sys::DISCARD_ZEROES);
         self.chunks.take_purged(first, n, |run| {
             #[cfg(feature = "metrics")]
             self.counters.chunks_reused.add(run.len() as u64);
@@ -369,7 +389,7 @@ impl<'a> Region<'a> {
                 );
             }
         });
-        Some(first)
+        Some((first, zeroed))
     }
 
     /// The part of the region that the chunks of NUMA node `node` come from, in its zone for

@@ -265,6 +265,11 @@ impl Backend for Bcmalloc {
         unsafe { GlobalAlloc::alloc(self, layout) }
     }
 
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::alloc_zeroed(self, layout) }
+    }
+
     unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: forwarded.
         unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) };
@@ -414,6 +419,22 @@ unsafe impl GlobalAlloc for Bcmalloc {
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_unbound(layout) }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
+            // SAFETY: as above.
+            return unsafe { data.alloc_zeroed(layout) };
+        }
+        // SAFETY: forwarded.
+        let block = unsafe { self.alloc_unbound(layout) };
+        if !block.is_null() {
+            // SAFETY: the block holds the layout's size in bytes.
+            unsafe { block.write_bytes(0, layout.size()) };
+        }
+        block
     }
 
     #[inline]

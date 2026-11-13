@@ -84,7 +84,7 @@ use crate::{
     allocator::{Backend, allocator},
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
-    region::{Entry, HUGE_PAGE_CHUNKS, Region},
+    region::{Entry, Region},
     size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -131,6 +131,10 @@ macro_rules! count {
         $heap.private.events.add(crate::metrics::Event::$event, $n as u64);
     };
 }
+
+/// The smallest block for which a zeroed request asks whether the memory is fresh. Clearing a
+/// smaller block costs less than the slab lookup that would find out.
+const ZERO_CHECK_MIN: usize = 1024;
 
 /// How many chunks of filled slabs a heap holds before its chunks come from the zone of
 /// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
@@ -210,6 +214,8 @@ struct Lists {
     active: Cell<*const Slab>,
     active_last: Cell<*const Slab>,
     full: Cell<*const Slab>,
+    /// How many of the class's slabs that the heap holds have been filled once.
+    filled: Cell<u32>,
     /// How many slabs of the class the heap holds.
     #[cfg(feature = "metrics")]
     slabs: crate::metrics::Counter,
@@ -336,6 +342,7 @@ impl HeapData {
                         active: Cell::new(ptr::null()),
                         active_last: Cell::new(ptr::null()),
                         full: Cell::new(ptr::null()),
+                        filled: Cell::new(0),
                         #[cfg(feature = "metrics")]
                         slabs: crate::metrics::Counter::new(),
                     }
@@ -392,12 +399,13 @@ impl HeapData {
 
     /// The part of the region the next slab of `class` comes from. See [`Region::part`].
     ///
-    /// Only single-chunk slabs of a big heap go to the zone of transparent huge pages. They fill
-    /// quickly and pack next to each other, so the huge pages they touch are dense. A slab of
-    /// several chunks holds few blocks and is often mostly untouched, and a huge page fault
-    /// would back all of it.
+    /// Slabs of a big heap go to the zone of transparent huge pages when they will be dense. A
+    /// single-chunk slab fills quickly and packs next to others. A slab of several chunks holds
+    /// few blocks and may stay mostly untouched, where a huge page fault would back all of it, so
+    /// it goes there only once the heap holds a slab of its class that it has filled.
     const fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
-        let huge = class.slab_chunks() == 1 && self.private.held.get() >= HUGE_ZONE_CHUNKS;
+        let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
+        let huge = dense && self.private.held.get() >= HUGE_ZONE_CHUNKS;
         region.part(self.private.node.get(), huge)
     }
 
@@ -772,12 +780,7 @@ impl HeapData {
                 unsafe { *slot = block.cast() };
                 slot = slot.wrapping_add(1);
             });
-            if slab.is_exhausted() {
-                self.move_to(slab, List::Full);
-                if slab.mark_filled() {
-                    self.private.held.set(self.private.held.get() + class.slab_chunks());
-                }
-            }
+            self.after_take(slab, class);
         }
         let top = end.wrapping_sub(got);
         if got < want {
@@ -796,7 +799,7 @@ impl HeapData {
         let home = region.home(part);
         let cursor = self.private.cursor.get();
         let cursor = if home.contains(&cursor) { cursor } else { home.start };
-        let Some(first) = region.alloc_chunks(chunks, chunks, cursor, part) else {
+        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, chunks, cursor, part) else {
             return false;
         };
         count!(self, SlabsAdded, 1);
@@ -807,12 +810,125 @@ impl HeapData {
         // SAFETY: the chunks were just allocated to us, so nobody else uses this descriptor.
         let owned = unsafe { slab.owned() };
         // SAFETY: the chunks are a slab-sized, slab-aligned run that is ours alone.
-        unsafe { owned.init(class, region.chunk_ptr(first)) };
+        unsafe { owned.init(class, region.chunk_ptr(first), zeroed) };
         self.push_front(owned, List::Active);
         if chunks == 1 && home.contains(&(first / 64)) {
             self.private.cursor.set(first / 64);
         }
         true
+    }
+
+    /// Moves a slab that blocks were just taken from to the full list if it has none left.
+    fn after_take(&self, slab: Owned<'_>, class: Class) {
+        if slab.is_exhausted() {
+            self.move_to(slab, List::Full);
+            if slab.mark_filled() {
+                self.private.held.set(self.private.held.get() + class.slab_chunks());
+                let filled = &self.lists(class).filled;
+                filled.set(filled.get() + 1);
+            }
+        }
+    }
+
+    /// Allocates zeroed memory for the layout, returning null if the region is out of room or the
+    /// layout is not supported.
+    ///
+    /// Fresh memory already reads as zeros, so it is not written again, as mimalloc and jemalloc
+    /// skip zeroing pages they know are fresh. A huge block knows from the chunk bitmap. A block
+    /// of a slab is fresh if the slab was set up on zeroed memory and the block lies beyond every
+    /// block the slab has handed out. Blocks in a bin may have been used, so a request that a bin
+    /// can serve takes the block from the bin and clears it, while it is likely still in the cache.
+    /// When the bin is empty the block comes straight from a slab instead, where it may be fresh.
+    /// Small blocks are cleared without asking, which costs less than finding out.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    pub(crate) unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size();
+        match classify(layout) {
+            Some(Request::Small(class)) if class.block_size() >= ZERO_CHECK_MIN => {
+                let (block, zeroed) = self.pop(class).map_or_else(
+                    // SAFETY: forwarded.
+                    || unsafe { self.take_zeroed(class) },
+                    |block| (block.cast::<u8>(), false),
+                );
+                if !block.is_null() && !zeroed {
+                    // SAFETY: the block holds at least `size` bytes and is ours.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+            Some(Request::Huge { chunks }) => {
+                // SAFETY: the claim keeps the region alive.
+                let region = unsafe { self.region() };
+                let (mut block, mut zeroed) = self.alloc_huge_zeroed(region, chunks);
+                if block.is_null() {
+                    // SAFETY: the caller holds the claim.
+                    unsafe { self.flush(region) };
+                    (block, zeroed) = self.alloc_huge_zeroed(region, chunks);
+                }
+                if !block.is_null() && !zeroed {
+                    // SAFETY: as above.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+            _ => {
+                // SAFETY: forwarded.
+                let block = unsafe { self.alloc(layout) };
+                if !block.is_null() {
+                    // SAFETY: as above.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+        }
+    }
+
+    /// Takes one block of `class` straight from a slab for a zeroed request whose bin is empty,
+    /// and tells whether it still holds the zeros of fresh memory. Falls back to an ordinary
+    /// refill when the inbox has blocks to take in first.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    #[cold]
+    unsafe fn take_zeroed(&self, class: Class) -> (*mut u8, bool) {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        if self.has_mail() {
+            // SAFETY: the caller holds the claim.
+            return (unsafe { self.refill(class) }.cast(), false);
+        }
+        // SAFETY: as above.
+        unsafe { self.maintain(region) };
+        if let Some(block) = self.pop(class) {
+            return (block.cast(), false);
+        }
+        loop {
+            // SAFETY: slabs on our lists are ours.
+            if let Some(slab) = unsafe { self.lists(class).active.get().as_ref() } {
+                // SAFETY: as above.
+                let slab = unsafe { slab.owned() };
+                if let Some((block, zeroed)) = slab.take_one() {
+                    self.after_take(slab, class);
+                    #[cfg(feature = "metrics")]
+                    {
+                        self.bin(class).allocs.add(1);
+                        if zeroed {
+                            count!(self, ZeroedFresh, 1);
+                        }
+                    }
+                    return (block, zeroed);
+                }
+            }
+            // SAFETY: as above.
+            if !unsafe { self.add_slab(region, class) } {
+                // SAFETY: as above.
+                return (unsafe { self.refill(class) }.cast(), false);
+            }
+        }
     }
 
     /// Resizes a block, returning null and leaving the block untouched if there is no room.
@@ -919,8 +1035,8 @@ impl HeapData {
                 return;
             }
         }
-        // SAFETY: forwarded.
-        unsafe { region.dealloc(ptr, layout) };
+        region.free_chunks(region.chunk_index(ptr.as_ptr()), chunks);
+        region.purge_if_due();
     }
 
     /// Frees a block of a slab. Its class and its owner both come from one load of the chunk map,
@@ -1352,6 +1468,8 @@ impl HeapData {
         let chunks = slab.class().slab_chunks();
         if slab.was_filled() {
             self.private.held.set(self.private.held.get().saturating_sub(chunks));
+            let filled = &self.lists(slab.class()).filled;
+            filled.set(filled.get().saturating_sub(1));
         }
         region.free_chunks(first, chunks);
         region.purge_if_due();
@@ -1389,6 +1507,11 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
+        self.alloc_huge_zeroed(region, chunks).0
+    }
+
+    /// As [`alloc_huge`](Self::alloc_huge), and also tells whether the block reads as zeros.
+    fn alloc_huge_zeroed(&self, region: &Region<'_>, chunks: usize) -> (*mut u8, bool) {
         for kept in &self.private.kept {
             let block = kept.get();
             if block.chunks == chunks {
@@ -1397,18 +1520,22 @@ impl HeapData {
                 self.mark_kept_reused(chunks);
                 count!(self, HugeCacheHits, 1);
                 self.count_huge_alloc(chunks);
-                return region.chunk_ptr(block.first);
+                return (region.chunk_ptr(block.first), false);
             }
         }
-        // A block of a huge page or more is all touched by most programs, so it gains from huge
-        // pages whatever the size of the heap. Smaller ones may be touched only in part.
-        let part = region.part(self.private.node.get(), chunks >= HUGE_PAGE_CHUNKS);
-        let Some(first) = region.alloc_chunks(chunks, 1, 0, part) else {
-            return ptr::null_mut();
+        // A block of whole chunks is a buffer or an arena that most programs touch all of, and
+        // blocks of whole chunks pack next to each other, so they use huge pages.
+        let part = region.part(self.private.node.get(), true);
+        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, 1, 0, part) else {
+            return (ptr::null_mut(), false);
         };
         self.count_huge_alloc(chunks);
         region.set_huge(first, chunks);
-        region.chunk_ptr(first)
+        #[cfg(feature = "metrics")]
+        if zeroed {
+            count!(self, ZeroedFresh, 1);
+        }
+        (region.chunk_ptr(first), zeroed)
     }
 
     /// Counts a huge block of `chunks` chunks handed out.
@@ -1694,10 +1821,8 @@ impl<'r> Heap<'r> {
 
     /// As [`alloc`](Self::alloc), but the memory is zeroed.
     pub fn alloc_zeroed(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let block = self.alloc(layout)?;
-        // SAFETY: the block holds at least `layout.size()` bytes and is ours.
-        unsafe { block.as_ptr().write_bytes(0, layout.size()) };
-        Some(block)
+        // SAFETY: this handle holds the claim.
+        NonNull::new(unsafe { self.data.alloc_zeroed(layout) })
     }
 
     /// Frees a block.
@@ -1787,6 +1912,10 @@ impl Backend for Heap<'_> {
         self.alloc(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
     }
 
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        self.alloc_zeroed(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
     unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: forwarded.
         unsafe { self.dealloc(ptr, layout) };
@@ -1819,6 +1948,7 @@ mod test {
     use super::*;
     use crate::{
         chunks::CHUNK_SIZE,
+        region::HUGE_PAGE_CHUNKS,
         testing::{Harness, Rng, TestRegion, iterations, random_traffic},
     };
 
@@ -2293,6 +2423,45 @@ mod test {
         heap.flush();
         assert_eq!(used(&region), 0);
     }
+    #[test]
+    fn zeroed_requests_read_as_zeros_whether_memory_is_fresh_reused_or_cached() {
+        let test = TestRegion::new(256, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let check = |block: NonNull<u8>, size: usize| {
+            // SAFETY: the block holds `size` bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(block.as_ptr(), size) };
+            assert!(bytes.iter().all(|&byte| byte == 0), "a zeroed block of {size} has data");
+        };
+        // Miri checks every byte it writes, so it takes the small sizes only.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[24, 4096]
+        } else {
+            &[24, 2000, 4096, 20 << 10, 9 * CHUNK_SIZE + 5, 3 << 20]
+        };
+        for &size in sizes {
+            let layout = layout(size, 8);
+            for _ in 0..3 {
+                let count = if size > CHUNK_SIZE { 3 } else { 40 };
+                let blocks: Vec<_> =
+                    (0..count).map(|_| heap.alloc_zeroed(layout).unwrap()).collect();
+                for &block in &blocks {
+                    check(block, size);
+                    // SAFETY: the block holds `size` bytes.
+                    unsafe { block.as_ptr().write_bytes(0xa5, size) };
+                }
+                free_all(&heap, layout, blocks);
+                // The next round takes the same memory back, from the bin, the slab or the cache
+                // of huge blocks, or after a flush from the chunk bitmap.
+                if size > 4096 {
+                    heap.flush();
+                }
+            }
+        }
+        heap.flush();
+        heap.validate();
+        assert_eq!(used(&region), 0);
+    }
 
     #[test]
     fn big_heaps_and_big_blocks_take_chunks_from_the_huge_page_zone() {
@@ -2309,7 +2478,9 @@ mod test {
         let sparse = big.alloc(layout(20 << 10, 8)).unwrap();
         assert!(chunk(sparse) < 128, "a slab of several chunks of a big heap uses small pages");
         let run = big.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
-        assert!(chunk(run) < 128, "so does a block smaller than a huge page");
+        assert!(chunk(run) >= 128, "a block of whole chunks uses huge pages");
+        let medium = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(medium) >= 128, "whatever the size of its heap");
         let large = small.alloc(layout(HUGE_PAGE_CHUNKS * CHUNK_SIZE, 8)).unwrap();
         assert!(chunk(large) >= 128, "a block of a huge page or more uses huge pages");
         for block in first.into_iter().chain(later) {

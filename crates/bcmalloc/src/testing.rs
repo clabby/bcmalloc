@@ -5,7 +5,7 @@
 
 use core::{alloc::Layout, cell::Cell, ptr, ptr::NonNull};
 use std::{
-    alloc::{alloc, dealloc},
+    alloc::{alloc_zeroed, dealloc},
     boxed::Box,
     collections::BTreeMap,
     vec::Vec,
@@ -101,7 +101,7 @@ impl Buffer {
     pub(crate) fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, SLAB_ALIGN).expect("valid test layout");
         // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc(layout) }).expect("test allocation failed");
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation failed");
         Self { ptr, layout }
     }
 

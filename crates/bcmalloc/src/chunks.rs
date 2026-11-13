@@ -107,6 +107,8 @@ pub(crate) struct Chunks<'a> {
     ///
     /// [`Region::home`]: crate::region::Region::home
     coarse_parts: usize,
+    /// How many times the purge delay the words of the odd parts wait.
+    coarse_wait: u64,
 }
 
 impl<'a> Chunks<'a> {
@@ -134,25 +136,44 @@ impl<'a> Chunks<'a> {
         let (used, rest) = words.split_at(each);
         let (dirty, rest) = rest.split_at(each);
         let (purged, rest) = rest.split_at(each);
-        Self { used, dirty, purged, stamps: &rest[..each], len, granule, coarse_parts: 0 }
+        Self {
+            used,
+            dirty,
+            purged,
+            stamps: &rest[..each],
+            len,
+            granule,
+            coarse_parts: 0,
+            coarse_wait: 1,
+        }
     }
 
-    /// These chunks with only the odd ones of `parts` parts purged in granules. See
-    /// [`Chunks::coarse_parts`](Self#structfield.coarse_parts).
-    pub(crate) const fn coarse_in_odd_parts(self, parts: usize) -> Self {
-        Self { coarse_parts: parts, ..self }
+    /// These chunks with only the odd ones of `parts` parts purged in granules, and only after
+    /// `wait` times the purge delay. See [`Chunks::coarse_parts`](Self#structfield.coarse_parts).
+    pub(crate) const fn coarse_in_odd_parts(self, parts: usize, wait: u64) -> Self {
+        Self { coarse_parts: parts, coarse_wait: wait, ..self }
     }
 
-    /// How many chunks of word `w` are purged together.
-    const fn granule_of(&self, w: usize) -> usize {
+    /// Whether word `w` lies in an odd part, or there are no parts.
+    const fn is_coarse(&self, w: usize) -> bool {
         let parts = self.coarse_parts;
         if parts == 0 {
-            return self.granule;
+            return true;
         }
         // The part whose words `p * words / parts..(p + 1) * words / parts` hold `w`.
         let words = Self::words_for(self.len);
         let part = ((w + 1) * parts).div_ceil(words) - 1;
-        if part % 2 == 1 { self.granule } else { 1 }
+        part % 2 == 1
+    }
+
+    /// How many chunks of word `w` are purged together.
+    const fn granule_of(&self, w: usize) -> usize {
+        if self.is_coarse(w) { self.granule } else { 1 }
+    }
+
+    /// How long the chunks of word `w` wait before a purge, for a purge delay of `delay`.
+    const fn delay_of(&self, w: usize, delay: u64) -> u64 {
+        if self.coarse_parts != 0 && self.is_coarse(w) { delay * self.coarse_wait } else { delay }
     }
 
     /// The number of chunks tracked.
@@ -346,7 +367,8 @@ impl<'a> Chunks<'a> {
             if self.dirty[w].load(Ordering::Relaxed) & valid == 0 {
                 continue;
             }
-            if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < delay {
+            if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < self.delay_of(w, delay)
+            {
                 let free = !self.used[w].load(Ordering::Relaxed) & valid;
                 let dirty = self.dirty[w].load(Ordering::Relaxed);
                 pending |= self.purgeable(w, free, dirty, valid) != 0;
@@ -404,6 +426,29 @@ impl<'a> Chunks<'a> {
             offset += granule;
         }
         want
+    }
+
+    /// Whether the `n` chunks from `first`, which the caller has just claimed, read as zeros: none
+    /// was used since its pages were last given back, and, unless `purged_reads_zero`, none was
+    /// given back either. Chunks that were never used hold fresh pages, which are zero. Call this
+    /// before [`take_purged`](Self::take_purged), which forgets which chunks were purged.
+    pub(crate) fn is_clean(&self, first: usize, n: usize, purged_reads_zero: bool) -> bool {
+        let end = first + n;
+        let mut chunk = first;
+        while chunk < end {
+            let (word, offset) = (chunk / WORD, chunk % WORD);
+            let take = (WORD - offset).min(end - chunk);
+            let mask = run_mask(take, offset);
+            let mut used = self.dirty[word].load(Ordering::Relaxed);
+            if !purged_reads_zero {
+                used |= self.purged[word].load(Ordering::Relaxed);
+            }
+            if used & mask != 0 {
+                return false;
+            }
+            chunk += take;
+        }
+        true
     }
 
     /// Hands the purged runs among the `n` chunks from `first`, which the caller has just claimed,
@@ -822,12 +867,29 @@ mod test {
         chunks.purge_pass(200, 10, |run| purged.push(run));
         assert_eq!(purged.first(), Some(&(0..32)));
     }
+    #[test]
+    fn only_chunks_unused_since_their_last_purge_are_clean() {
+        let bitmap = Bitmap::new(128);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(4, 4, 0).unwrap();
+        assert!(chunks.is_clean(first, 4, false), "never used");
+        chunks.free_at(first, 4, 0);
+        let again = chunks.alloc(4, 4, 0).unwrap();
+        assert_eq!(again, first);
+        assert!(!chunks.is_clean(first, 4, true), "used since it was fresh");
+        chunks.free_at(first, 4, 0);
+        chunks.purge_pass(100, 10, |_| ());
+        assert!(chunks.claim_at(first, 4));
+        assert!(chunks.is_clean(first, 4, true), "purged pages that read as zeros");
+        assert!(!chunks.is_clean(first, 4, false), "purged pages that may keep their contents");
+        chunks.take_purged(first, 4, |_| ());
+    }
 
     #[test]
     fn only_the_odd_parts_are_purged_in_huge_pages() {
         // Four words in two parts, so the huge page granule applies from chunk 128 on.
         let bitmap = Bitmap::with_granule(256, 32);
-        let chunks = bitmap.chunks().coarse_in_odd_parts(2);
+        let chunks = bitmap.chunks().coarse_in_odd_parts(2, 1);
         for first in [0, 128] {
             assert!(chunks.claim_at(first, 2));
             chunks.free_at(first + 1, 1, 0);
@@ -836,13 +898,28 @@ mod test {
         chunks.purge_pass(100, 10, |run| purged.push(run));
         assert_eq!(purged, vec![(1..2)], "small pages go one chunk at a time, huge pages whole");
     }
+    #[test]
+    fn huge_pages_wait_longer_before_they_are_purged() {
+        let bitmap = Bitmap::with_granule(256, 32);
+        let chunks = bitmap.chunks().coarse_in_odd_parts(2, 10);
+        for first in [0, 128] {
+            assert!(chunks.claim_at(first, 32));
+            chunks.free_at(first, 32, 0);
+        }
+        let mut purged = Vec::new();
+        assert!(chunks.purge_pass(20, 10, |run| purged.push(run)), "the huge page still waits");
+        assert_eq!(purged, vec![(0..32)]);
+        purged.clear();
+        assert!(!chunks.purge_pass(100, 10, |run| purged.push(run)));
+        assert_eq!(purged, vec![(128..160)]);
+    }
 
     #[test]
     fn the_granule_of_a_word_follows_the_parts_of_the_region() {
         for words in 1..40 {
             for parts in (2..=8).step_by(2).filter(|&parts| parts <= words) {
                 let bitmap = Bitmap::with_granule(words * WORD, 32);
-                let chunks = bitmap.chunks().coarse_in_odd_parts(parts);
+                let chunks = bitmap.chunks().coarse_in_odd_parts(parts, 1);
                 for part in 0..parts {
                     for w in part * words / parts..(part + 1) * words / parts {
                         let want = if part % 2 == 1 { 32 } else { 1 };

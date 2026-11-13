@@ -12,8 +12,8 @@
 //! * A block is as long as it was asked to be. The allocator may have rounded the size up
 //!   internally, but the slice it returns is exactly the requested length, so the zeroing and
 //!   copying rules stay simple.
-//! * Zeroed requests clear the whole block. Memory that was freed or given back to the OS is not
-//!   known to be zero, so there is no shortcut.
+//! * Zeroed requests read as zeros in the whole block. Fresh memory is not cleared again, and
+//!   everything else is.
 //! * Growing and shrinking keep the block in place when the new size falls in the same size class.
 //!   Otherwise they move it, and they always move it when the alignment changes, which the
 //!   allocator's own resize does not support.
@@ -32,6 +32,13 @@ pub(crate) trait Backend {
     ///
     /// The layout must not be zero sized.
     unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8;
+
+    /// Allocates a zeroed block, or returns null.
+    ///
+    /// # Safety
+    ///
+    /// The layout must not be zero sized.
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8;
 
     /// Frees a block.
     ///
@@ -69,11 +76,9 @@ pub(crate) fn allocate<A: Backend + ?Sized>(
         return Ok(empty(layout));
     }
     // SAFETY: the layout is not zero sized.
-    let ptr = unsafe { backend.allocate_raw(layout) };
-    if zeroed && !ptr.is_null() {
-        // SAFETY: the block holds the layout's size in bytes.
-        unsafe { ptr.write_bytes(0, layout.size()) };
-    }
+    let ptr = unsafe {
+        if zeroed { backend.allocate_zeroed_raw(layout) } else { backend.allocate_raw(layout) }
+    };
     block(ptr, layout.size())
 }
 
