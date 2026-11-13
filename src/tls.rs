@@ -37,6 +37,9 @@ use crate::heap::HeapData;
 /// A POSIX thread-specific key.
 pub(crate) type Key = usize;
 
+/// A key value that no key has, standing for an allocator that has not created its key yet.
+pub(crate) const NO_KEY: Key = usize::MAX;
+
 thread_local! {
     /// Set once this thread's heap has been released at exit.
     static EXITED: Cell<bool> = const { Cell::new(false) };
@@ -128,6 +131,9 @@ mod slot {
 
     #[inline(always)]
     pub(super) fn get(key: Key) -> *const HeapData {
+        if key == super::NO_KEY {
+            return ptr::null();
+        }
         // SAFETY: the key was created by create_key and was checked by probe, so its slot is in
         // the table.
         unsafe { *table().add(key) }
@@ -174,9 +180,14 @@ mod slot {
         if bound == key { data } else { switch(key) }
     }
 
-    /// Looks the heap up through pthread and makes it the latest.
+    /// Looks the heap up through pthread and makes it the latest. It is never inlined, so that the
+    /// fast paths that call it need no stack frame of their own.
     #[cold]
+    #[inline(never)]
     fn switch(key: Key) -> *const HeapData {
+        if key == super::NO_KEY {
+            return ptr::null();
+        }
         // SAFETY: the key was created by create_key.
         let data = unsafe { libc::pthread_getspecific(key as _) }.cast::<HeapData>().cast_const();
         if !data.is_null() {

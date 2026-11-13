@@ -1,8 +1,9 @@
 //! A slab, which is a run of chunks carved into equal blocks of one size class.
 //!
-//! Every slab has a descriptor, kept outside the slab so that user memory is never metadata. The
-//! descriptor has two halves, each on cache lines of its own. One half is state that only the
-//! owning heap touches. The other is state that any thread may touch to free a block.
+//! Every slab has a descriptor, kept outside the slab so that user memory is never metadata. Only
+//! the heap that owns the slab reads or writes it. Other threads that free a block of the slab send
+//! the block to the owning heap instead, as the [heap module](crate::heap) explains, so the
+//! descriptor needs no atomic operations at all.
 //!
 //! ```text
 //!   slab memory, one size class (64-byte blocks here)
@@ -11,92 +12,29 @@
 //!   +-------+-------+-------+-------+-------+-------+-------+-------+--------------+
 //!   0                                             bumped --^                capacity
 //!
-//!   descriptor, owner only                     descriptor, shared
-//!   +-------------------------------------+    +---------------------------------+
-//!   | free       -> block -> block -> nil |    | remote -> block -> block -> nil |
-//!   | local_free -> block -> nil          |    |           + FULL and QUEUED     |
-//!   | free_len, local_count, bumped       |    | owner, notified                 |
-//!   | capacity, class, next, prev, list   |    +---------------------------------+
-//!   +-------------------------------------+
+//!   descriptor, owner only
+//!   +----------------------------------------+
+//!   | free -> block -> block -> block -> nil |
+//!   | free_len, bumped, capacity, class      |
+//!   | start, next, prev, list                |
+//!   +----------------------------------------+
 //! ```
 //!
-//! # Free lists
+//! # Free blocks
 //!
-//! `free` holds the blocks for the next refill of the heap's hot list, which takes the whole list
-//! at once. The slab keeps the length of each list, so it never walks one to count it. `local_free`
-//! collects blocks freed by the owning thread. It is spliced into `free` when `free` runs dry, so
-//! the fast path never has to look at it. `remote` collects blocks freed by other threads. It is a
-//! push-only atomic stack that the owner empties in one swap, so it cannot suffer the ABA problem
-//! that a stack with pop-by-anyone would.
+//! `free` is a list of blocks that came back to the slab, threaded through their first words, and
+//! the slab keeps its length so it never walks it to count. Blocks that have never been handed out
+//! are on no list. The `bumped` frontier marks how many blocks have been handed out so far,
+//! and refills take fresh blocks by arithmetic, so a new slab touches none of its memory until the
+//! program does.
 //!
-//! Blocks that have never been handed out are on no list. The `bumped` frontier marks how many
-//! blocks have been threaded onto `free` so far, so the slab touches fresh memory a few blocks at a
-//! time instead of all at once.
-//!
-//! # The remote word
-//!
-//! A full slab leaves the owner's allocation path, so the owner has no reason to look at it again.
-//! If another thread frees a block into it, the owner needs to hear about that exactly once. The
-//! `remote` word carries the whole protocol. The list head sits in the high bits and two flags sit
-//! in the low bits, which are free because blocks are 16-byte aligned.
-//!
-//! ```text
-//!         owner calls try_mark_full         any thread calls push_remote
-//!         (only works on an empty word)     (returns true when it turns FULL into QUEUED)
-//!   +--------+ -----------------------> +------+ ---------------------------> +--------+
-//!   | NORMAL |                          | FULL |                              | QUEUED |
-//!   +--------+ <----------------------- +------+                              +--------+
-//!       ^        owner calls clear_full                                           |
-//!       |                                                                         |
-//!       +-------------------- owner calls collect with clear ---------------------+
-//! ```
-//!
-//! The list and the flags change in the same compare-and-swap. A pusher therefore learns atomically
-//! whether it must notify the owner, and the owner can only mark the slab full when no block is
-//! pending. No fences and no second look at the descriptor are needed. That matters because the
-//! last block of a slab may be freed remotely, after which the owner is free to recycle the slab.
-//!
-//! A queued slab cannot be recycled until the owner has processed the notification, because the
-//! notification still points at it. The sticky `QUEUED` flag records that.
+//! A slab counts every block that is not on its free list and below the frontier as in use. That
+//! includes blocks sitting in a heap's bins or in a message on the way back, so a slab is only
+//! released when every block has really come home.
 
-use core::{cell::Cell, fmt, ptr};
+use core::{cell::Cell, ptr};
 
-use crate::{
-    cache::CacheLine,
-    size_class::Class,
-    sync::{AtomicPtr, AtomicU32, Ordering},
-};
-
-/// The slab is on its owner's full list, and the next remote free must notify the owner.
-const FULL: usize = 0b01;
-
-/// A remote free has notified the owner, who has not processed the notification yet.
-const QUEUED: usize = 0b10;
-
-/// The bits of the remote word that are flags rather than list head.
-const FLAGS: usize = 0b11;
-
-/// The flag bits of a remote word.
-fn flags(word: *mut Block) -> usize {
-    word.addr() & FLAGS
-}
-
-/// The list head of a remote word, with the flag bits cleared.
-fn list(word: *mut Block) -> *mut Block {
-    word.map_addr(|addr| addr & !FLAGS)
-}
-
-/// A remote word made of a list head and flag bits. Tagging the pointer keeps its provenance, which
-/// storing it in an integer would lose.
-fn tagged(list: *mut Block, flags: usize) -> *mut Block {
-    list.map_addr(|addr| addr | flags)
-}
-
-/// At most this many blocks are threaded onto the free list at a time.
-const EXTEND_BLOCKS: usize = 64;
-
-/// A target for how much fresh memory one extension touches.
-const EXTEND_BYTES: usize = 4096;
+use crate::{cache::CacheLine, size_class::Class};
 
 /// A free block, seen as a link in an intrusive list. Blocks are at least 16 bytes.
 #[derive(Debug)]
@@ -111,35 +49,10 @@ pub(crate) struct Block {
 pub(crate) enum List {
     /// On neither list. This is an unused descriptor or a slab in the middle of a move.
     None = 0,
-    /// Has free blocks or may have, and allocation draws from here.
+    /// Has free blocks or may have, and refills draw from here.
     Active = 1,
-    /// Every block is allocated, or a notification is pending.
+    /// Every block is in use.
     Full = 2,
-}
-
-/// Descriptor state that only the owning heap reads or writes.
-struct Local {
-    _line: [CacheLine; 0],
-    free: Cell<*mut Block>,
-    local_free: Cell<*mut Block>,
-    next: Cell<*const Slab>,
-    prev: Cell<*const Slab>,
-    start: Cell<*mut u8>,
-    free_len: Cell<u32>,
-    local_count: Cell<u32>,
-    bumped: Cell<u32>,
-    capacity: Cell<u32>,
-    class: Cell<u8>,
-    list: Cell<List>,
-}
-
-/// Descriptor state any thread may touch.
-#[derive(Debug)]
-struct Shared {
-    _line: [CacheLine; 0],
-    remote: AtomicPtr<Block>,
-    owner: AtomicU32,
-    notified: AtomicPtr<Slab>,
 }
 
 /// The descriptor of one slab. See the [module documentation](self).
@@ -147,192 +60,74 @@ struct Shared {
 /// An all-zero descriptor is a valid, unused one, which is what lets the region hand out
 /// descriptors straight from zeroed memory.
 pub(crate) struct Slab {
-    local: Local,
-    shared: Shared,
+    _line: [CacheLine; 0],
+    free: Cell<*mut Block>,
+    next: Cell<*const Self>,
+    prev: Cell<*const Self>,
+    start: Cell<*mut u8>,
+    free_len: Cell<u32>,
+    bumped: Cell<u32>,
+    capacity: Cell<u32>,
+    class: Cell<u8>,
+    list: Cell<List>,
 }
 
-impl fmt::Debug for Slab {
-    /// Formats only the shared half. The owner-only half may be changing on another thread.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Slab").field("shared", &self.shared).finish_non_exhaustive()
+impl core::fmt::Debug for Slab {
+    /// Formats nothing of the state, which belongs to the owning heap and may be changing.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Slab").finish_non_exhaustive()
     }
 }
 
-// SAFETY: the owner-only half is reachable only through [`Owned`], whose constructor is unsafe and
-// requires exclusive ownership. The other half is atomic.
+// SAFETY: a descriptor is reachable for reading or writing only through [`Owned`], whose
+// constructor is unsafe and requires that the caller owns the slab.
 unsafe impl Sync for Slab {}
 
 impl Slab {
     /// An unused descriptor.
     #[cfg(any(test, feature = "testing"))]
-    #[allow(clippy::missing_const_for_fn, reason = "loom atomics have no const constructors")]
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            local: Local {
-                _line: [],
-                free: Cell::new(ptr::null_mut()),
-                local_free: Cell::new(ptr::null_mut()),
-                next: Cell::new(ptr::null()),
-                prev: Cell::new(ptr::null()),
-                start: Cell::new(ptr::null_mut()),
-                free_len: Cell::new(0),
-                local_count: Cell::new(0),
-                bumped: Cell::new(0),
-                capacity: Cell::new(0),
-                class: Cell::new(0),
-                list: Cell::new(List::None),
-            },
-            shared: Shared {
-                _line: [],
-                remote: AtomicPtr::new(ptr::null_mut()),
-                owner: AtomicU32::new(0),
-                notified: AtomicPtr::new(ptr::null_mut()),
-            },
+            _line: [],
+            free: Cell::new(ptr::null_mut()),
+            next: Cell::new(ptr::null()),
+            prev: Cell::new(ptr::null()),
+            start: Cell::new(ptr::null_mut()),
+            free_len: Cell::new(0),
+            bumped: Cell::new(0),
+            capacity: Cell::new(0),
+            class: Cell::new(0),
+            list: Cell::new(List::None),
         }
     }
 
-    /// Gives access to the owner-only half.
+    /// Gives access to the descriptor.
     ///
     /// # Safety
     ///
-    /// The caller must be the only thread using the owner-only half. That means it holds the heap
-    /// that owns this slab, or it is initialising an unowned descriptor.
+    /// The caller must be the only thread using the descriptor. That means it holds the heap that
+    /// owns this slab, or it is initialising a descriptor whose chunks it has just claimed.
     pub(crate) const unsafe fn owned(&self) -> Owned<'_> {
         Owned(self)
     }
-
-    /// The id of the heap that owns this slab.
-    pub(crate) fn owner(&self) -> u32 {
-        self.shared.owner.load(Ordering::Relaxed)
-    }
-
-    /// Frees `block` onto the remote list from any thread.
-    ///
-    /// Returns whether the caller must now call [`enqueue`](Self::enqueue). That is true exactly
-    /// when this push found the slab marked full, which makes it the push that turns the mark into
-    /// a notification.
-    ///
-    /// # Safety
-    ///
-    /// `block` must be an allocated block of this slab that the caller has just stopped using.
-    #[cfg(test)]
-    #[cfg(test)]
-    pub(crate) unsafe fn push_remote(&self, block: *mut Block) -> bool {
-        // SAFETY: a single block is a chain whose head and tail are the same.
-        unsafe { self.push_remote_chain(block, block) }
-    }
-
-    /// Pushes a chain of blocks, linked from `head` to `tail`, with one compare-and-swap. Returns
-    /// whether the push turned the full mark into a notification, as `push_remote` does.
-    ///
-    /// # Safety
-    ///
-    /// Every block in the chain must be an allocated block of this slab that the caller has stopped
-    /// using, linked by their first words from `head` down to `tail`. The link of `tail` is
-    /// overwritten.
-    pub(crate) unsafe fn push_remote_chain(&self, head: *mut Block, tail: *mut Block) -> bool {
-        let mut seen = self.shared.remote.load(Ordering::Relaxed);
-        loop {
-            // SAFETY: the caller owns the chain until the compare-and-swap below publishes it.
-            unsafe { (*tail).next = list(seen) };
-            let notify = flags(seen) & FULL != 0;
-            let kept = if notify { QUEUED } else { flags(seen) & QUEUED };
-            match self.shared.remote.compare_exchange_weak(
-                seen,
-                tagged(head, kept),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return notify,
-                Err(actual) => seen = actual,
-            }
-        }
-    }
-
-    /// Pushes this slab onto its owner's stack of slabs to revisit.
-    ///
-    /// Call this once after [`push_remote_chain`](Self::push_remote_chain) returned true. The slab
-    /// cannot be recycled before the owner pops it, so the pointer stays valid.
-    pub(crate) fn enqueue(&self, stack: &AtomicPtr<Self>) {
-        let this = ptr::from_ref(self).cast_mut();
-        let mut head = stack.load(Ordering::Relaxed);
-        loop {
-            self.shared.notified.store(head, Ordering::Relaxed);
-            match stack.compare_exchange_weak(head, this, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return,
-                Err(actual) => head = actual,
-            }
-        }
-    }
-
-    /// Takes every slab pushed by [`enqueue`](Self::enqueue). Slabs come out most recent first.
-    pub(crate) fn take_enqueued(stack: &AtomicPtr<Self>) -> *const Self {
-        stack.swap(ptr::null_mut(), Ordering::Acquire)
-    }
-
-    /// The slab after this one in a list taken by [`take_enqueued`](Self::take_enqueued).
-    pub(crate) fn next_enqueued(&self) -> *const Self {
-        self.shared.notified.load(Ordering::Relaxed)
-    }
-
-    /// Atomically empties the remote list and returns its head, keeping the flags unless `clear`.
-    fn take_remote(&self, clear: bool) -> *mut Block {
-        let mut seen = self.shared.remote.load(Ordering::Relaxed);
-        loop {
-            if list(seen).is_null() && !(clear && !seen.is_null()) {
-                return ptr::null_mut();
-            }
-            let kept = if clear { ptr::null_mut() } else { tagged(ptr::null_mut(), flags(seen)) };
-            match self.shared.remote.compare_exchange_weak(
-                seen,
-                kept,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return list(seen),
-                Err(actual) => seen = actual,
-            }
-        }
-    }
 }
 
-/// What [`Owned`] reports from inspect.
+/// What [`Owned::inspect`] reports.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Inspection {
     pub(crate) free: *mut Block,
-    pub(crate) local_free: *mut Block,
-    pub(crate) remote: *mut Block,
-    pub(crate) flags: usize,
     pub(crate) free_len: u32,
-    pub(crate) local_count: u32,
     pub(crate) bumped: u32,
     pub(crate) capacity: u32,
     pub(crate) start: *mut u8,
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Inspection {
-    /// Whether the remote word carries the full mark.
-    pub(crate) const fn is_marked_full(&self) -> bool {
-        self.flags & FULL != 0
-    }
-
-    /// Whether the remote word records a pending notification.
-    pub(crate) const fn is_queued(&self) -> bool {
-        self.flags & QUEUED != 0
-    }
-}
-
-/// The owner-only half of a [`Slab`], obtained from [`Slab::owned`].
+/// A descriptor in the hands of its owner, obtained from [`Slab::owned`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Owned<'a>(&'a Slab);
 
 impl<'a> Owned<'a> {
-    const fn local(self) -> &'a Local {
-        &self.0.local
-    }
-
     /// The descriptor itself.
     pub(crate) const fn slab(self) -> &'a Slab {
         self.0
@@ -343,192 +138,135 @@ impl<'a> Owned<'a> {
     /// # Safety
     ///
     /// `start` must point to a slab-sized, suitably aligned region that nothing else uses.
-    pub(crate) unsafe fn init(self, owner: u32, class: Class, start: *mut u8) {
-        let local = self.local();
-        local.free.set(ptr::null_mut());
-        local.local_free.set(ptr::null_mut());
-        local.next.set(ptr::null());
-        local.prev.set(ptr::null());
-        local.start.set(start);
-        local.free_len.set(0);
-        local.local_count.set(0);
-        local.bumped.set(0);
-        local.capacity.set(class.blocks_per_slab() as u32);
-        local.class.set(class.index() as u8);
-        local.list.set(List::None);
-        self.0.shared.remote.store(ptr::null_mut(), Ordering::Relaxed);
-        self.0.shared.owner.store(owner, Ordering::Relaxed);
+    pub(crate) unsafe fn init(self, class: Class, start: *mut u8) {
+        let slab = self.0;
+        slab.free.set(ptr::null_mut());
+        slab.next.set(ptr::null());
+        slab.prev.set(ptr::null());
+        slab.start.set(start);
+        slab.free_len.set(0);
+        slab.bumped.set(0);
+        slab.capacity.set(class.blocks_per_slab() as u32);
+        slab.class.set(class.index() as u8);
+        slab.list.set(List::None);
     }
 
     /// The size class of this slab's blocks.
     pub(crate) fn class(self) -> Class {
-        Class::from_index(usize::from(self.local().class.get()))
+        Class::from_index(usize::from(self.0.class.get()))
     }
 
     /// The first block of the slab, which is also the slab's start address.
     pub(crate) const fn start(self) -> *mut u8 {
-        self.local().start.get()
+        self.0.start.get()
     }
 
-    /// How many blocks are handed out, held on a heap's hot list or waiting on the remote list.
+    /// How many blocks are handed out, held in bins or on their way back in messages.
     pub(crate) const fn used(self) -> u32 {
-        let local = self.local();
-        local.bumped.get() - local.free_len.get() - local.local_count.get()
+        self.0.bumped.get() - self.0.free_len.get()
+    }
+
+    /// Whether every block is in use, so a refill can take nothing from this slab.
+    pub(crate) const fn is_exhausted(self) -> bool {
+        self.0.free_len.get() == 0 && self.0.bumped.get() == self.0.capacity.get()
     }
 
     /// The list this slab is on.
     pub(crate) const fn list(self) -> List {
-        self.local().list.get()
+        self.0.list.get()
     }
 
     /// Records which list this slab is on.
     pub(crate) fn set_list(self, list: List) {
-        self.local().list.set(list);
+        self.0.list.set(list);
     }
 
     /// The next slab on this slab's list.
     pub(crate) const fn next(self) -> *const Slab {
-        self.local().next.get()
+        self.0.next.get()
     }
 
     /// Sets the next slab on this slab's list.
     pub(crate) fn set_next(self, next: *const Slab) {
-        self.local().next.set(next);
+        self.0.next.set(next);
     }
 
     /// The previous slab on this slab's list.
     pub(crate) const fn prev(self) -> *const Slab {
-        self.local().prev.get()
+        self.0.prev.get()
     }
 
     /// Sets the previous slab on this slab's list.
     pub(crate) fn set_prev(self, prev: *const Slab) {
-        self.local().prev.set(prev);
+        self.0.prev.set(prev);
     }
 
-    /// Takes the whole free list, which is null if the slab has no free block. The blocks count as
-    /// used from now on, and the caller hands them out one at a time.
-    pub(crate) fn take_free(self) -> *mut Block {
-        let local = self.local();
-        local.free_len.set(0);
-        local.free.replace(ptr::null_mut())
-    }
-
-    /// Frees a block from the owning thread.
+    /// Takes a block back.
+    #[cfg(all(test, not(loom)))]
     ///
     /// # Safety
     ///
-    /// `block` must be an allocated block of this slab that the caller has stopped using.
-    pub(crate) unsafe fn push_local(self, block: *mut Block) {
-        let local = self.local();
+    /// `block` must be a block of this slab that is in use and that nobody will use again.
+    pub(crate) unsafe fn push(self, block: *mut Block) {
+        let slab = self.0;
         // SAFETY: the caller has given us the block.
-        unsafe { (*block).next = local.local_free.get() };
-        local.local_free.set(block);
-        local.local_count.set(local.local_count.get() + 1);
+        unsafe { (*block).next = slab.free.get() };
+        slab.free.set(block);
+        slab.free_len.set(slab.free_len.get() + 1);
     }
 
-    /// Folds the local and remote free lists into the free list, and returns whether it has
-    /// blocks. With `clear`, also resets the remote flags, acknowledging a notification.
-    pub(crate) fn collect(self, clear: bool) -> bool {
-        let local = self.local();
-        if local.free.get().is_null() {
-            local.free.set(local.local_free.replace(ptr::null_mut()));
-            local.free_len.set(local.local_count.replace(0));
-        }
-        let head = self.0.take_remote(clear);
-        if !head.is_null() {
-            let (mut tail, mut count) = (head, 1);
-            // SAFETY: the remote list holds blocks of this slab, linked by their freeing threads
-            // before the release that made them visible to our acquire.
-            unsafe {
-                while !(*tail).next.is_null() {
-                    tail = (*tail).next;
-                    count += 1;
-                }
-                (*tail).next = local.free.get();
-            }
-            local.free.set(head);
-            local.free_len.set(local.free_len.get() + count);
-        }
-        !local.free.get().is_null()
+    /// Takes back `count` blocks that the caller has linked from `head` to `tail`.
+    ///
+    /// # Safety
+    ///
+    /// The blocks must be blocks of this slab that are in use and that nobody will use again,
+    /// linked through their first words. The link of `tail` is overwritten.
+    pub(crate) unsafe fn push_chain(self, head: *mut Block, tail: *mut Block, count: u32) {
+        let slab = self.0;
+        // SAFETY: the caller has given us the blocks.
+        unsafe { (*tail).next = slab.free.get() };
+        slab.free.set(head);
+        slab.free_len.set(slab.free_len.get() + count);
     }
 
-    /// Threads the next few never-used blocks onto the empty free list. Returns false when every
-    /// block has been used at least once.
-    pub(crate) fn extend(self) -> bool {
-        let local = self.local();
-        let (bumped, capacity) = (local.bumped.get() as usize, local.capacity.get() as usize);
-        if bumped == capacity {
-            return false;
+    /// Hands up to `max` free blocks to `out` and returns how many it handed out. Blocks that
+    /// came back come first, then never-used blocks from the frontier, which are handed out from
+    /// the highest address down so that a stack that pops the last one first walks memory upwards.
+    pub(crate) fn take(self, max: usize, mut out: impl FnMut(*mut Block)) -> usize {
+        let slab = self.0;
+        let mut taken = 0;
+        let mut block = slab.free.get();
+        while taken < max && !block.is_null() {
+            out(block);
+            // SAFETY: blocks on the free list are unused memory whose first word is a link.
+            block = unsafe { (*block).next };
+            taken += 1;
         }
+        slab.free.set(block);
+        slab.free_len.set(slab.free_len.get() - taken as u32);
+        let (bumped, capacity) = (slab.bumped.get() as usize, slab.capacity.get() as usize);
+        let fresh = (max - taken).min(capacity - bumped);
         let size = self.class().block_size();
-        let count = (EXTEND_BYTES / size).clamp(1, EXTEND_BLOCKS).min(capacity - bumped);
-        let mut head = local.free.get();
-        // Link from the last block backwards so that allocation walks addresses upwards.
-        for index in (bumped..bumped + count).rev() {
+        for index in (bumped..bumped + fresh).rev() {
             // SAFETY: the block lies within the slab, because `capacity` blocks of `size` bytes
             // fit.
-            let block = unsafe { local.start.get().add(index * size) }.cast::<Block>();
-            // SAFETY: it is unused memory that we own.
-            unsafe { (*block).next = head };
-            head = block;
+            out(unsafe { slab.start.get().add(index * size) }.cast());
         }
-        local.free.set(head);
-        local.bumped.set((bumped + count) as u32);
-        local.free_len.set(local.free_len.get() + count as u32);
-        true
+        slab.bumped.set((bumped + fresh) as u32);
+        taken + fresh
     }
 
-    /// Marks the slab full so that the next remote free notifies the owner. Fails if a block is
-    /// pending or a notification has not been processed, in which case the owner should collect.
-    pub(crate) fn try_mark_full(self) -> bool {
-        let full = tagged(ptr::null_mut(), FULL);
-        self.0
-            .shared
-            .remote
-            .compare_exchange(ptr::null_mut(), full, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    /// Withdraws the full mark because the slab has free blocks again. A notification that has
-    /// already been sent stays pending.
-    pub(crate) fn clear_full(self) {
-        let mut seen = self.0.shared.remote.load(Ordering::Relaxed);
-        while flags(seen) & FULL != 0 {
-            let cleared = seen.map_addr(|word| word & !FULL);
-            match self.0.shared.remote.compare_exchange_weak(
-                seen,
-                cleared,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => seen = actual,
-            }
-        }
-    }
-
-    /// A snapshot of everything the owner knows, for the consistency checks.
+    /// A snapshot of the counters and the free list, for the consistency checks.
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn inspect(self) -> Inspection {
-        let local = self.local();
-        let word = self.0.shared.remote.load(Ordering::Acquire);
+    pub(crate) const fn inspect(self) -> Inspection {
+        let slab = self.0;
         Inspection {
-            free: local.free.get(),
-            local_free: local.local_free.get(),
-            remote: list(word),
-            flags: flags(word),
-            free_len: local.free_len.get(),
-            local_count: local.local_count.get(),
-            bumped: local.bumped.get(),
-            capacity: local.capacity.get(),
-            start: local.start.get(),
+            free: slab.free.get(),
+            free_len: slab.free_len.get(),
+            bumped: slab.bumped.get(),
+            capacity: slab.capacity.get(),
+            start: slab.start.get(),
         }
-    }
-
-    /// Whether a notification about this slab is waiting to be processed.
-    pub(crate) fn is_queued(self) -> bool {
-        flags(self.0.shared.remote.load(Ordering::Acquire)) & QUEUED != 0
     }
 }
 
@@ -536,366 +274,82 @@ impl<'a> Owned<'a> {
 mod test {
     use std::vec::Vec;
 
-    use core::mem::{align_of, offset_of, size_of};
+    use core::mem::{align_of, size_of};
 
     use super::*;
     use crate::testing::Buffer;
 
     #[test]
-    fn a_descriptor_keeps_what_other_threads_write_on_its_own_line() {
+    fn a_descriptor_fills_whole_cache_lines() {
         let line = align_of::<CacheLine>();
         assert_eq!(align_of::<Slab>(), line);
-        assert_eq!(size_of::<Slab>(), 2 * line);
-        assert_eq!(offset_of!(Slab, local) % line, 0);
-        assert_eq!(offset_of!(Slab, shared) % line, 0);
-        assert_ne!(offset_of!(Slab, local), offset_of!(Slab, shared));
+        assert_eq!(size_of::<Slab>() % line, 0);
     }
 
     /// A slab of `class` over its own memory, with the descriptor initialised.
     struct Fixture {
         slab: Slab,
-        /// Stands in for the heap's hot list, which hands out the blocks of a refill.
-        hot: Cell<*mut Block>,
         _memory: Buffer,
     }
 
     impl Fixture {
-        fn new(block_size: usize) -> Self {
-            let class = Class::for_size(block_size);
+        fn new(size: usize) -> Self {
+            let class = Class::for_size(size);
             let memory = Buffer::new(class.slab_chunks() << crate::chunks::CHUNK_SHIFT);
             let slab = Slab::new();
-            // SAFETY: the buffer is slab sized and aligned, and we are the only user of the slab.
-            unsafe { slab.owned().init(7, class, memory.as_ptr()) };
-            Self { slab, hot: Cell::new(ptr::null_mut()), _memory: memory }
+            // SAFETY: the buffer is slab sized and aligned, and ours alone.
+            unsafe { slab.owned().init(class, memory.as_ptr()) };
+            Self { slab, _memory: memory }
         }
 
         const fn owned(&self) -> Owned<'_> {
-            // SAFETY: tests drive each fixture from one thread.
+            // SAFETY: the fixture is used from one thread.
             unsafe { self.slab.owned() }
         }
 
-        /// Hands out the next block the way a heap does, refilling from the slab when its hot list
-        /// is empty. Returns null when the slab has nothing left.
-        fn pop(&self) -> *mut Block {
-            let owned = self.owned();
-            if self.hot.get().is_null() {
-                if !(owned.collect(false) || owned.extend()) {
-                    return ptr::null_mut();
-                }
-                self.hot.set(owned.take_free());
-            }
-            let block = self.hot.get();
-            // SAFETY: blocks on the hot list are unused slab memory whose first word is a link.
-            self.hot.set(unsafe { (*block).next });
-            block
-        }
-
-        /// Pops blocks until the slab is exhausted.
-        fn exhaust(&self) -> Vec<*mut Block> {
+        fn take(&self, max: usize) -> Vec<*mut Block> {
             let mut blocks = Vec::new();
-            loop {
-                let block = self.pop();
-                if block.is_null() {
-                    return blocks;
-                }
-                blocks.push(block);
-            }
+            assert_eq!(self.owned().take(max, |block| blocks.push(block)), blocks.len());
+            blocks
         }
     }
 
     #[test]
-    fn a_fresh_slab_yields_every_block_once_in_address_order() {
-        let fixture = Fixture::new(128);
-        let blocks = fixture.exhaust();
-        let size = fixture.owned().class().block_size();
-        assert_eq!(blocks.len(), fixture.owned().class().blocks_per_slab());
-        let start = fixture.owned().start();
-        for (i, block) in blocks.iter().enumerate() {
-            assert_eq!(*block, start.wrapping_add(i * size).cast());
-        }
-        assert_eq!(fixture.owned().used() as usize, blocks.len());
-        assert!(fixture.pop().is_null());
+    fn a_fresh_slab_yields_every_block_once_and_pops_upwards() {
+        let fixture = Fixture::new(1024);
+        let blocks = fixture.take(1000);
+        assert_eq!(blocks.len(), 64);
+        let mut sorted = blocks.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 64);
+        // The last block handed out is the lowest, so a stack pops them in address order.
+        assert!(blocks.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(fixture.owned().is_exhausted());
+        assert_eq!(fixture.owned().used(), 64);
+        assert!(fixture.take(1).is_empty());
     }
 
     #[test]
-    fn local_frees_come_back_after_a_collect() {
-        let fixture = Fixture::new(64);
-        let owned = fixture.owned();
-        let blocks = fixture.exhaust();
-        // SAFETY: the blocks were popped from this slab and are no longer used.
-        unsafe {
-            owned.push_local(blocks[3]);
-            owned.push_local(blocks[9]);
-        }
-        assert!(owned.collect(false));
-        assert_eq!((fixture.pop(), fixture.pop()), (blocks[9], blocks[3]));
-        assert!(fixture.pop().is_null());
-    }
-
-    #[test]
-    fn remote_frees_are_counted_when_collected() {
-        let fixture = Fixture::new(64);
-        let owned = fixture.owned();
-        let blocks = fixture.exhaust();
-        let used = owned.used();
-        // SAFETY: as above.
-        unsafe {
-            assert!(!fixture.slab.push_remote(blocks[0]));
-            assert!(!fixture.slab.push_remote(blocks[1]));
-        }
-        assert_eq!(owned.used(), used, "pending remote frees still count as used");
-        assert!(owned.collect(false));
-        assert_eq!(owned.used(), used - 2);
-        assert_eq!((fixture.pop(), fixture.pop()), (blocks[1], blocks[0]));
-    }
-
-    #[test]
-    fn the_first_remote_free_into_a_full_slab_notifies_exactly_once() {
-        let fixture = Fixture::new(64);
-        let owned = fixture.owned();
-        let blocks = fixture.exhaust();
-        assert!(owned.try_mark_full());
-        // SAFETY: as above.
-        unsafe {
-            assert!(fixture.slab.push_remote(blocks[0]), "the first free must notify");
-            assert!(!fixture.slab.push_remote(blocks[1]), "later frees must not");
-        }
-        assert!(owned.is_queued());
-        // Collecting keeps the notification pending until it is acknowledged.
-        assert!(owned.collect(false));
-        assert!(owned.is_queued());
-        assert!(!owned.try_mark_full(), "a pending notification blocks re-marking");
-    }
-
-    #[test]
-    fn acknowledging_a_notification_allows_marking_full_again() {
-        let fixture = Fixture::new(64);
-        let owned = fixture.owned();
-        let blocks = fixture.exhaust();
-        assert!(owned.try_mark_full());
-        // SAFETY: as above.
-        unsafe { assert!(fixture.slab.push_remote(blocks[0])) };
-        assert!(owned.collect(true));
-        assert!(!owned.is_queued());
-        assert!(fixture.pop() == blocks[0]);
-        assert!(owned.try_mark_full());
-    }
-
-    #[test]
-    fn marking_full_fails_while_remote_blocks_are_pending() {
-        let fixture = Fixture::new(64);
-        let blocks = fixture.exhaust();
-        // SAFETY: as above.
-        unsafe { assert!(!fixture.slab.push_remote(blocks[0])) };
-        assert!(!fixture.owned().try_mark_full());
-    }
-
-    #[test]
-    fn clearing_the_full_mark_stops_notifications_but_not_a_sent_one() {
-        let fixture = Fixture::new(64);
-        let owned = fixture.owned();
-        let blocks = fixture.exhaust();
-        assert!(owned.try_mark_full());
-        owned.clear_full();
-        // SAFETY: as above.
-        unsafe { assert!(!fixture.slab.push_remote(blocks[0])) };
-        assert!(!owned.is_queued());
-
-        assert!(owned.collect(false));
-        assert!(owned.try_mark_full());
-        // SAFETY: as above.
-        unsafe { assert!(fixture.slab.push_remote(blocks[1])) };
-        owned.clear_full();
-        assert!(owned.is_queued(), "clearing the mark must not lose a sent notification");
-    }
-
-    #[test]
-    fn enqueued_slabs_come_out_most_recent_first() {
-        let (a, b) = (Slab::new(), Slab::new());
-        let stack = AtomicPtr::new(ptr::null_mut());
-        a.enqueue(&stack);
-        b.enqueue(&stack);
-        let first = Slab::take_enqueued(&stack);
-        assert!(ptr::eq(first, &b));
-        // SAFETY: the slabs outlive the test.
-        let second = unsafe { &*first }.next_enqueued();
-        assert!(ptr::eq(second, &a));
-        // SAFETY: as above.
-        assert!(unsafe { &*second }.next_enqueued().is_null());
-        assert!(Slab::take_enqueued(&stack).is_null());
+    fn returned_blocks_come_back_before_fresh_ones() {
+        let fixture = Fixture::new(256);
+        let first = fixture.take(4);
+        // SAFETY: the blocks are in use and given back once.
+        unsafe { fixture.owned().push(first[1]) };
+        assert_eq!(fixture.owned().used(), 3);
+        let again = fixture.take(2);
+        assert_eq!(again[0], first[1], "a returned block is reused first");
+        assert!(!first.contains(&again[1]), "then the frontier moves on");
+        assert_eq!(fixture.owned().used(), 5);
     }
 
     #[test]
     fn an_all_zero_descriptor_is_an_unused_one() {
-        // SAFETY: this is the claim under test, and Miri checks that nothing here reads invalid
-        // state.
-        let slab: Slab = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
-        let fresh = Slab::new();
-        // SAFETY: single-threaded test.
-        let (zeroed, fresh) = unsafe { (slab.owned(), fresh.owned()) };
-        assert_eq!(zeroed.used(), fresh.used());
-        assert_eq!(zeroed.list(), List::None);
-        assert!(zeroed.take_free().is_null());
-        assert!(slab.shared.remote.load(Ordering::Relaxed).is_null());
-    }
-}
-
-#[cfg(all(test, loom))]
-mod loom_test {
-    use loom::{sync::Arc, thread};
-
-    use super::*;
-    use crate::testing::Buffer;
-
-    /// A slab with every block handed out, plus the blocks.
-    struct Exhausted {
-        slab: Slab,
-        blocks: std::vec::Vec<*mut Block>,
-        _memory: Buffer,
-    }
-
-    // SAFETY: the blocks are only ever passed to slab operations, never dereferenced here, and
-    // each test gives the owner role to exactly one thread.
-    unsafe impl Send for Exhausted {}
-    // SAFETY: as above.
-    unsafe impl Sync for Exhausted {}
-
-    impl Exhausted {
-        fn new() -> Arc<Self> {
-            let class = Class::for_size(8192);
-            let memory = Buffer::new(class.slab_chunks() << crate::chunks::CHUNK_SHIFT);
-            let slab = Slab::new();
-            // SAFETY: nothing else uses the fresh descriptor yet.
-            let owned = unsafe { slab.owned() };
-            // SAFETY: the buffer is slab sized and aligned, and private to this slab.
-            unsafe { owned.init(1, class, memory.as_ptr()) };
-            let mut blocks = std::vec::Vec::new();
-            loop {
-                let mut block = owned.take_free();
-                if block.is_null() {
-                    if !owned.extend() {
-                        break;
-                    }
-                    continue;
-                }
-                while !block.is_null() {
-                    blocks.push(block);
-                    // SAFETY: the block is unused slab memory whose first word is a link.
-                    block = unsafe { (*block).next };
-                }
-            }
-            Arc::new(Self { slab, blocks, _memory: memory })
-        }
-
-        /// The owner-only half. Each test calls this from the one thread that plays the owner.
-        const fn owner(&self) -> Owned<'_> {
-            // SAFETY: see the contract above.
-            unsafe { self.slab.owned() }
-        }
-
-        /// Frees block `index` from another thread and returns whether that push must notify.
-        fn push(&self, index: usize) -> bool {
-            // SAFETY: the block was handed out by `new` and each test frees it once.
-            unsafe { self.slab.push_remote(self.blocks[index]) }
-        }
-
-        /// Frees blocks `first` and `first + 1` together as one chain.
-        fn push_pair(&self, first: usize) -> bool {
-            let (head, tail) = (self.blocks[first], self.blocks[first + 1]);
-            // SAFETY: the blocks were handed out by `new`, each test frees them once, and the
-            // caller owns them until the push publishes the chain.
-            unsafe {
-                (*head).next = tail;
-                self.slab.push_remote_chain(head, tail)
-            }
-        }
-    }
-
-    #[test]
-    fn marking_full_and_a_racing_remote_free_never_lose_the_notification() {
-        loom::model(|| {
-            let state = Exhausted::new();
-            let pusher = {
-                let state = state.clone();
-                thread::spawn(move || state.push(0))
-            };
-            let marked = state.owner().try_mark_full();
-            let notified = pusher.join().unwrap();
-            // Either the owner saw the pending block and refused to mark the slab full, or the
-            // pusher saw the mark and promised to notify. Both losing is the lost wakeup.
-            assert!(!marked || notified, "marked full but nobody will notify the owner");
-            assert_eq!(marked, notified);
-        });
-    }
-
-    #[test]
-    fn clearing_the_mark_and_a_racing_remote_free_stay_consistent() {
-        loom::model(|| {
-            let state = Exhausted::new();
-            assert!(state.owner().try_mark_full());
-            let pusher = {
-                let state = state.clone();
-                thread::spawn(move || state.push(0))
-            };
-            state.owner().clear_full();
-            let notified = pusher.join().unwrap();
-            // A notification that was sent must still be recorded after the owner cleared its mark.
-            assert_eq!(state.owner().is_queued(), notified);
-            // The pushed block is never lost either way.
-            assert!(state.owner().collect(true));
-            assert_eq!(state.owner().take_free(), state.blocks[0]);
-        });
-    }
-
-    #[test]
-    fn concurrent_remote_frees_are_all_collected_with_one_notification() {
-        loom::model(|| {
-            let state = Exhausted::new();
-            assert!(state.owner().try_mark_full());
-            let pushers: std::vec::Vec<_> = (0..2)
-                .map(|index| {
-                    let state = state.clone();
-                    thread::spawn(move || usize::from(state.push(index)))
-                })
-                .collect();
-            let notifications: usize = pushers.into_iter().map(|p| p.join().unwrap()).sum();
-            assert_eq!(notifications, 1);
-            assert!(state.owner().collect(true));
-            assert_eq!(state.owner().used() as usize, state.blocks.len() - 2);
-        });
-    }
-
-    #[test]
-    fn racing_chains_are_collected_whole_with_one_notification() {
-        loom::model(|| {
-            let state = Exhausted::new();
-            assert!(state.owner().try_mark_full());
-            let pushers: std::vec::Vec<_> = [0, 2]
-                .into_iter()
-                .map(|first| {
-                    let state = state.clone();
-                    thread::spawn(move || usize::from(state.push_pair(first)))
-                })
-                .collect();
-            let notifications: usize = pushers.into_iter().map(|p| p.join().unwrap()).sum();
-            assert_eq!(notifications, 1);
-            assert!(state.owner().collect(true));
-            assert_eq!(state.owner().used() as usize, state.blocks.len() - 4);
-        });
-    }
-
-    #[test]
-    fn a_chain_and_the_owner_marking_full_never_lose_the_notification() {
-        loom::model(|| {
-            let state = Exhausted::new();
-            let pusher = {
-                let state = state.clone();
-                thread::spawn(move || state.push_pair(0))
-            };
-            let marked = state.owner().try_mark_full();
-            let notified = pusher.join().unwrap();
-            assert_eq!(marked, notified);
-            assert!(state.owner().collect(true) || !marked);
-        });
+        // SAFETY: an all-zero bit pattern is valid for every field.
+        let zeroed: Slab = unsafe { core::mem::zeroed() };
+        let owned = Owned(&zeroed);
+        assert_eq!(owned.list(), List::None);
+        assert_eq!(owned.used(), 0);
+        assert!(owned.next().is_null() && owned.prev().is_null());
     }
 }

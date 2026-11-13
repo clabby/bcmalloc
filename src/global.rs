@@ -45,9 +45,6 @@ use crate::{
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
 const MIN_CAPACITY: usize = 256 << 20;
 
-/// The value of [`Bcmalloc`] key field before the key exists.
-const NO_KEY: usize = usize::MAX;
-
 /// A global allocator that reserves its memory up front.
 ///
 /// Declare one as the program's allocator and everything else follows.
@@ -102,7 +99,7 @@ const NO_KEY: usize = usize::MAX;
 pub struct Bcmalloc {
     config: Config,
     region: AtomicPtr<Region<'static>>,
-    /// The thread-specific key under which threads keep their heap, or `NO_KEY`.
+    /// The thread-specific key under which threads keep their heap, or `tls::NO_KEY`.
     key: AtomicUsize,
 }
 
@@ -114,7 +111,7 @@ impl Bcmalloc {
 
     /// An allocator with the given configuration.
     pub const fn with_config(config: Config) -> Self {
-        Self { config, region: AtomicPtr::new(ptr::null_mut()), key: AtomicUsize::new(NO_KEY) }
+        Self { config, region: AtomicPtr::new(ptr::null_mut()), key: AtomicUsize::new(tls::NO_KEY) }
     }
 
     /// The configuration the region was or will be created with.
@@ -206,18 +203,17 @@ impl Bcmalloc {
     /// This thread's heap, or null if it has not bound one.
     #[inline(always)]
     fn thread_heap(&self) -> *const HeapData {
-        let key = self.key.load(Ordering::Relaxed);
-        if key == NO_KEY { ptr::null() } else { tls::get(key) }
+        tls::get(self.key.load(Ordering::Relaxed))
     }
 
     /// The key under which threads bind their heap, created on first use.
     fn key(&self) -> Option<usize> {
         let key = self.key.load(Ordering::Acquire);
-        if key != NO_KEY {
+        if key != tls::NO_KEY {
             return Some(key);
         }
         let created = tls::create_key()?;
-        match self.key.compare_exchange(NO_KEY, created, Ordering::AcqRel, Ordering::Acquire) {
+        match self.key.compare_exchange(tls::NO_KEY, created, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Some(created),
             // Another thread created the key first. Ours has no users.
             Err(existing) => {

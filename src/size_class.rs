@@ -85,29 +85,41 @@ const BLOCK_SIZES: [u32; CLASSES] = {
     sizes
 };
 
-/// How many bytes of freed blocks a heap holds back per class before handing them to their slab.
-const BATCH_BYTES: usize = 16 << 10;
+/// The cache line width that decides whether two blocks of a class can share a line. Apple silicon
+/// has 128-byte lines, and x86-64 keeps coherence in 64-byte lines.
+const LINE: usize = if cfg!(target_arch = "aarch64") { 128 } else { 64 };
 
-/// The most freed blocks a heap holds back per class.
-const BATCH_MAX: usize = 64;
-
-/// The batch limit of every class.
-const BATCH_LIMITS: [u8; CLASSES] = {
-    let mut limits = [0; CLASSES];
-    let mut index = 0;
-    while index < CLASSES {
-        let blocks = BATCH_BYTES / block_size_of(index);
-        limits[index] = if blocks < 1 {
-            1
-        } else if blocks > BATCH_MAX {
-            BATCH_MAX as u8
-        } else {
-            blocks as u8
-        };
-        index += 1;
+/// How many block pointers a heap's bin of class index `i` holds. Small blocks get many and big
+/// blocks few, so that a full bin of a small class holds about 32 KiB and one of a class above
+/// 8 KiB about 64 KiB.
+const fn bin_capacity_of(i: usize) -> usize {
+    let size = block_size_of(i);
+    let (bytes, min, max) = if size <= TABLE_MAX { (32 << 10, 8, 128) } else { (64 << 10, 1, 8) };
+    let count = bytes / size;
+    if count < min {
+        min
+    } else if count > max {
+        max
+    } else {
+        count
     }
-    limits
+}
+
+/// Where each class's bin starts in a heap's slot array, and the total number of slots.
+const BIN_STARTS: ([u16; CLASSES], usize) = {
+    let mut starts = [0; CLASSES];
+    let mut total = 0;
+    let mut i = 0;
+    while i < CLASSES {
+        starts[i] = total as u16;
+        total += bin_capacity_of(i);
+        i += 1;
+    }
+    (starts, total)
 };
+
+/// The number of block pointers in all the bins of one heap.
+pub(crate) const BIN_SLOTS: usize = BIN_STARTS.1;
 
 /// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
 const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
@@ -152,10 +164,27 @@ impl Class {
         Self((8 + (top_bit - 7) * 8 + step) as u8)
     }
 
-    /// How many freed blocks of this class a heap collects for one slab before it hands them over.
-    /// Big blocks are not worth holding back, and small ones are held in larger batches.
-    pub(crate) const fn batch_limit(self) -> u32 {
-        BATCH_LIMITS[self.0 as usize] as u32
+    /// How many block pointers the bin of this class holds.
+    pub(crate) const fn bin_capacity(self) -> usize {
+        bin_capacity_of(self.0 as usize)
+    }
+
+    /// Where the bin of this class starts in a heap's slot array.
+    pub(crate) const fn bin_start(self) -> usize {
+        BIN_STARTS.0[self.0 as usize] as usize
+    }
+
+    /// Whether a heap may keep blocks of this class that belong to another heap's slab and hand
+    /// them out again.
+    ///
+    /// That needs two things. A block must not share a cache line with any other block, or the
+    /// thread that reuses it would write next to a block that its owner still uses, which is the
+    /// false sharing that Hoard's ownership rule exists to prevent. Blocks start at multiples of
+    /// their size, so a size that is a multiple of the line width is enough. And a block must not
+    /// pin much memory while a foreign heap holds it, so only classes with one-chunk slabs qualify.
+    pub(crate) const fn reusable_anywhere(self) -> bool {
+        let size = self.block_size();
+        size.is_multiple_of(LINE) && size <= TABLE_MAX
     }
 
     /// The position of this class in per-heap tables.

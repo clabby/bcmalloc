@@ -6,10 +6,10 @@
 
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence,
 };
 
 #[cfg(not(loom))]
 pub(crate) use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+    AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence,
 };

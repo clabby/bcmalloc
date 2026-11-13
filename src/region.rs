@@ -6,17 +6,19 @@
 //! any size is instant and costs nothing until it is used.
 //!
 //! ```text
-//!   +--------+------------+------------------+---------+-----+-----------------------------+
-//!   | Region | heap slots | slab descriptors | bitmaps | pad | chunks (the managed memory) |
-//!   | header | max_heaps  | 256 B per chunk  | 4 bits  |     | 64 KiB each, 4 MiB aligned  |
-//!   +--------+------------+------------------+---------+-----+-----------------------------+
-//!   |<-------- metadata, about 0.4% of the region --------->|<----- the other 99.6% ----->|
+//!   +--------+------------+-------------+-----------+---------+-----+--------------------------+
+//!   | Region | heap slots | descriptors | chunk map | bitmaps | pad | chunks (managed memory)  |
+//!   | header | max_heaps  | 128 B/chunk | 8 B/chunk | 4 bits  |     | 64 KiB each, 4 MiB align |
+//!   +--------+------------+-------------+-----------+---------+-----+--------------------------+
+//!   |<------------ metadata, about 0.2% of the region ------------>|<---- the other 99.8% --->|
 //! ```
 //!
 //! Metadata sits next to the data it describes but never inside it. The descriptor of a block is
-//! found by arithmetic on its address. No header is read from user memory, so a buffer overflow in
-//! the program cannot corrupt the bookkeeping of the allocator, and freeing needs no lookup
-//! structure.
+//! found by arithmetic on its address, and so is its entry in the chunk map, which records the heap
+//! that owns each chunk and the size class of the slab it belongs to. That map is what TCMalloc and
+//! snmalloc call a pagemap, and here it is a flat array because the region is one reservation. No
+//! header is read from user memory, so a buffer overflow in the program cannot corrupt the
+//! bookkeeping of the allocator, and freeing needs no lookup structure.
 //!
 //! A [`Region`] is the shared, thread-safe half of the allocator. Threads take a [`Heap`] from it
 //! to allocate. A [`Mapping`] owns the memory behind a region and unmaps it on drop.
@@ -33,7 +35,7 @@ use crate::{
     config::{Commit, Config},
     heap::{Heap, HeapData},
     size_class::{Class, Request, classify},
-    slab::{Block, Slab},
+    slab::Slab,
     sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     sys,
 };
@@ -93,6 +95,8 @@ pub struct Region<'a> {
     base: *mut u8,
     chunks: Chunks<'a>,
     slabs: &'a [Slab],
+    /// For every chunk of a slab, the owning heap and the class. See [`Entry`].
+    map: &'a [AtomicU64],
     heaps: &'a [HeapData],
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
@@ -122,7 +126,8 @@ impl<'a> Region<'a> {
     /// * `base` must point to `chunk_count` chunks of writable memory aligned to 4 MiB, valid for
     ///   as long as `'a`, and used by nothing else.
     /// * `words` must be zeroed bitmap storage for `chunk_count` chunks, `slabs` must hold
-    ///   `chunk_count` unused descriptors, and `heaps` unclaimed heap slots.
+    ///   `chunk_count` unused descriptors, `map` `chunk_count` entries, and `heaps` unclaimed heap
+    ///   slots.
     /// * `purge_granule` is how many chunks the purge clock gives back together, a power of two of
     ///   at most 64 that `base` is aligned to in chunks.
     pub(crate) unsafe fn from_parts(
@@ -130,14 +135,17 @@ impl<'a> Region<'a> {
         words: &'a [AtomicU64],
         chunk_count: usize,
         slabs: &'a [Slab],
+        map: &'a [AtomicU64],
         heaps: &'a [HeapData],
         purge_granule: usize,
     ) -> Self {
         debug_assert_eq!(slabs.len(), chunk_count);
+        debug_assert_eq!(map.len(), chunk_count);
         Self {
             base,
             chunks: Chunks::with_granule(words, chunk_count, purge_granule),
             slabs,
+            map,
             heaps,
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
@@ -164,8 +172,8 @@ impl<'a> Region<'a> {
     /// Frees a block without a heap, from any thread.
     ///
     /// This is what a thread uses when it has no heap of its own, for instance because it is being
-    /// torn down. The block is handed back to the slab that owns it, and that slab's heap reclaims
-    /// it the next time it looks.
+    /// torn down. The block is sent to the heap that owns its slab, which takes it back the next
+    /// time it looks at its inbox.
     ///
     /// # Safety
     ///
@@ -173,8 +181,11 @@ impl<'a> Region<'a> {
     /// used or freed again.
     pub unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
         match classify(layout) {
-            // SAFETY: forwarded.
-            Some(Request::Small(class)) => unsafe { self.free_remote(ptr, class) },
+            Some(Request::Small(_)) => {
+                let owner = self.entry(self.chunk_index(ptr.as_ptr())).owner();
+                // SAFETY: the caller gives the block up, and the chunk map names its owner.
+                unsafe { self.heap_slot(owner).post_block(ptr.as_ptr().cast()) };
+            }
             Some(Request::Huge { chunks }) => {
                 self.free_chunks(self.chunk_index(ptr.as_ptr()), chunks);
                 self.purge_if_due();
@@ -191,11 +202,19 @@ impl<'a> Region<'a> {
     /// it when the program is not close to full.
     pub fn trim(&self) {
         let claimed = self.claimed_mark.load(Ordering::Acquire);
-        for (id, data) in self.heaps[..claimed].iter().enumerate() {
-            if data.claim(id as u32, self) {
-                // SAFETY: we just claimed the slot.
-                unsafe { data.flush(self) };
-                data.release_claim();
+        // Flushing one heap can send blocks to another that was flushed before it, so a few more
+        // passes take in what arrived. Each pass sends less, because a heap only sends blocks of
+        // other heaps and those come to rest in their own slabs.
+        for _ in 0..4 {
+            for (id, data) in self.heaps[..claimed].iter().enumerate() {
+                if data.claim(id as u32, self) {
+                    // SAFETY: we just claimed the slot.
+                    unsafe { data.flush(self) };
+                    data.release_claim();
+                }
+            }
+            if self.heaps[..claimed].iter().all(|data| data.is_claimed() || !data.has_mail()) {
+                break;
             }
         }
         self.purges_active.fetch_add(1, Ordering::Release);
@@ -357,30 +376,54 @@ impl<'a> Region<'a> {
         self.slab(self.chunk_index(ptr.as_ptr()) & !(class.slab_chunks() - 1))
     }
 
-    /// Frees a small block by pushing it onto its slab's remote list.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be a live block of this region of `class`, and must not be used again.
-    pub(crate) unsafe fn free_remote(&self, ptr: NonNull<u8>, class: Class) {
-        let block = ptr.as_ptr().cast::<Block>();
-        // SAFETY: a single block is a chain whose head and tail are the same.
-        unsafe { self.free_remote_chain(self.slab_of(ptr, class), block, block) };
+    /// The heap slot with id `id`.
+    pub(crate) const fn heap_slot(&self, id: u32) -> &HeapData {
+        &self.heaps[id as usize]
     }
 
-    /// Frees a chain of blocks of `slab`, which the caller has linked from `head` to `tail`, by
-    /// pushing them onto the slab's remote list in one step.
+    /// The chunk map entry of chunk `index`.
+    pub(crate) fn entry(&self, index: usize) -> Entry {
+        Entry(self.map[index].load(Ordering::Relaxed))
+    }
+
+    /// The first chunk map entry, with provenance over the whole map.
+    pub(crate) const fn map_ptr(&self) -> *const AtomicU64 {
+        self.map.as_ptr()
+    }
+
+    /// Records that the `n` chunks from `first` hold a slab of `class` owned by heap `owner`.
     ///
-    /// # Safety
-    ///
-    /// The blocks must satisfy the contract of `push_remote_chain` on the slab.
-    pub(crate) unsafe fn free_remote_chain(&self, slab: &Slab, head: *mut Block, tail: *mut Block) {
-        // SAFETY: forwarded.
-        if unsafe { slab.push_remote_chain(head, tail) } {
-            // We turned the slab's full mark into a notification. The slab cannot be recycled until
-            // its owner processes that notification, so the descriptor is still ours to read.
-            slab.enqueue(self.heaps[slab.owner() as usize].unfull());
+    /// The entries are read by threads that free blocks of the slab. Those threads got the blocks
+    /// from the owner through some synchronisation of their own, which carries these stores with
+    /// it, so relaxed stores are enough.
+    pub(crate) fn set_owner(&self, first: usize, n: usize, owner: u32, class: Class) {
+        let entry = Entry::new(owner, class);
+        for slot in &self.map[first..first + n] {
+            slot.store(entry.0, Ordering::Relaxed);
         }
+    }
+}
+
+/// What the chunk map records for a chunk: the heap that owns the slab and the slab's size class.
+///
+/// The owner sits in the low 32 bits, so the free path reads it with one load and a truncation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Entry(pub(crate) u64);
+
+impl Entry {
+    /// The entry for a slab of `class` owned by heap `owner`.
+    pub(crate) const fn new(owner: u32, class: Class) -> Self {
+        Self(owner as u64 | (class.index() as u64) << 32)
+    }
+
+    /// The id of the heap that owns the slab.
+    pub(crate) const fn owner(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// The size class of the slab.
+    pub(crate) const fn class(self) -> Class {
+        Class::from_index((self.0 >> 32) as u8 as usize)
     }
 }
 
@@ -389,6 +432,7 @@ impl<'a> Region<'a> {
 struct Geometry {
     heaps: usize,
     slabs: usize,
+    map: usize,
     words: usize,
     data: usize,
     total: usize,
@@ -400,12 +444,13 @@ impl Geometry {
         let heaps_at =
             mem::size_of::<Region<'_>>().checked_next_multiple_of(mem::align_of::<HeapData>())?;
         let slabs_at = heaps_at.checked_add(heaps.checked_mul(mem::size_of::<HeapData>())?)?;
-        let words_at = slabs_at.checked_add(chunks.checked_mul(mem::size_of::<Slab>())?)?;
+        let map_at = slabs_at.checked_add(chunks.checked_mul(mem::size_of::<Slab>())?)?;
+        let words_at = map_at.checked_add(chunks.checked_mul(mem::size_of::<AtomicU64>())?)?;
         let words_end =
             words_at.checked_add(Chunks::storage_words(chunks) * mem::size_of::<AtomicU64>())?;
         let data = words_end.checked_next_multiple_of(SLAB_ALIGN)?;
         let total = data.checked_add(chunks.checked_mul(CHUNK_SIZE)?)?;
-        Some(Self { heaps: heaps_at, slabs: slabs_at, words: words_at, data, total })
+        Some(Self { heaps: heaps_at, slabs: slabs_at, map: map_at, words: words_at, data, total })
     }
 }
 
@@ -462,6 +507,7 @@ impl Mapping {
             let at = |offset: usize| base.as_ptr().add(offset);
             let heap_slots = slice::from_raw_parts(at(geometry.heaps).cast::<HeapData>(), heaps);
             let slabs = slice::from_raw_parts(at(geometry.slabs).cast::<Slab>(), chunks);
+            let map = slice::from_raw_parts(at(geometry.map).cast::<AtomicU64>(), chunks);
             let words = slice::from_raw_parts(
                 at(geometry.words).cast::<AtomicU64>(),
                 Chunks::storage_words(chunks),
@@ -472,8 +518,15 @@ impl Mapping {
             } else {
                 1
             };
-            let region =
-                Region::from_parts(at(geometry.data), words, chunks, slabs, heap_slots, granule);
+            let region = Region::from_parts(
+                at(geometry.data),
+                words,
+                chunks,
+                slabs,
+                map,
+                heap_slots,
+                granule,
+            );
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
         }
 

@@ -127,6 +127,7 @@ unsafe impl Sync for Buffer {}
 pub struct TestRegion {
     words: Vec<AtomicU64>,
     slabs: Vec<Slab>,
+    map: Vec<AtomicU64>,
     heaps: Vec<HeapData>,
     memory: Buffer,
     chunks: usize,
@@ -143,6 +144,7 @@ impl TestRegion {
         Self {
             words: (0..Chunks::storage_words(chunks)).map(|_| AtomicU64::new(0)).collect(),
             slabs: (0..chunks).map(|_| Slab::new()).collect(),
+            map: (0..chunks).map(|_| AtomicU64::new(0)).collect(),
             heaps: (0..heaps).map(|_| HeapData::new()).collect(),
             memory: Buffer::new(chunks << CHUNK_SHIFT),
             chunks,
@@ -159,6 +161,7 @@ impl TestRegion {
                 &self.words,
                 self.chunks,
                 &self.slabs,
+                &self.map,
                 &self.heaps,
                 1,
             )
@@ -270,10 +273,13 @@ impl<'r> Harness<'r> {
         true
     }
 
-    /// Checks the structural invariants of every heap.
+    /// Checks the structural invariants of every heap, and that no block is held in two places
+    /// at once or is held anywhere while it is live.
     pub fn validate(&self) {
+        let mut seen: std::collections::BTreeSet<usize> =
+            self.live.iter().map(|block| block.ptr.as_ptr().addr()).collect();
         for heap in &self.heaps {
-            heap.validate();
+            heap.validate_into(&mut seen);
         }
     }
 
@@ -299,9 +305,9 @@ impl<'r> Harness<'r> {
             round += 1;
         }
         self.validate();
-        // The first round hands over what each heap still holds for the others, and the second
-        // lets every owner collect it.
-        for _ in 0..2 {
+        // The first round sends what each heap holds for the others, and the next ones let every
+        // owner take it in and send back the messages it was carried in.
+        for _ in 0..3 {
             for heap in &self.heaps {
                 heap.flush();
             }
