@@ -28,6 +28,30 @@ mimalloc = "0.1"
 snmalloc-rs = "0.3"
 tikv-jemallocator = "0.6"
 
+[[bench]]
+name = "system"
+harness = false
+
+[[bench]]
+name = "cwmalloc"
+harness = false
+
+[[bench]]
+name = "mimalloc"
+harness = false
+
+[[bench]]
+name = "jemalloc"
+harness = false
+
+[[bench]]
+name = "snmalloc"
+harness = false
+
+[[bench]]
+name = "report"
+harness = false
+
 [lints.rust]
 missing_debug_implementations = "warn"
 missing_docs = "warn"
