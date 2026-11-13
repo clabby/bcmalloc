@@ -84,7 +84,7 @@ use crate::{
     allocator::{Backend, allocator},
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
-    region::{Entry, Region},
+    region::{Entry, HUGE_PAGE_CHUNKS, Region},
     size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -123,6 +123,11 @@ const HUGE_CACHE: usize = 4;
 /// The largest huge block a heap keeps, and the most it keeps in all.
 const HUGE_CACHE_BLOCK: usize = 8 << 20;
 const HUGE_CACHE_BYTES: usize = 16 << 20;
+
+/// How many chunks of filled slabs a heap holds before its chunks come from the zone of
+/// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
+/// little memory each, whose huge pages would be mostly empty.
+const HUGE_ZONE_CHUNKS: usize = 16;
 
 /// The last miss of a bin was a refill of an empty bin.
 const UNDERFLOW: u8 = 0b01;
@@ -223,6 +228,10 @@ struct Private {
     /// where single-chunk searches start.
     node: Cell<usize>,
     cursor: Cell<usize>,
+    /// How many chunks this heap's slabs that have been filled once take up, which decides whether
+    /// its chunks come from the zone of transparent huge pages. A slab that was never filled may
+    /// have most of its pages untouched, so counting it would move heaps that are small in memory.
+    held: Cell<usize>,
     bins: [Bin; CLASSES],
     /// This heap's bin slots in the region, set at every claim.
     slots: Cell<*mut *mut Block>,
@@ -276,6 +285,7 @@ impl HeapData {
                 region: Cell::new(ptr::null()),
                 node: Cell::new(0),
                 cursor: Cell::new(0),
+                held: Cell::new(0),
                 bins: [const {
                     Bin {
                         top: Cell::new(ptr::null_mut()),
@@ -329,11 +339,18 @@ impl HeapData {
 
     /// Makes the heap take its chunks from the part of the region of NUMA node `node`.
     fn settle_on(&self, region: &Region<'_>, node: usize) {
-        let home = region.home(node);
         self.private.node.set(node);
+        let home = region.home(self.part(region, false));
         if !home.contains(&self.private.cursor.get()) {
             self.private.cursor.set(home.start);
         }
+    }
+
+    /// The part of the region this heap's next chunks come from, in the zone of transparent huge
+    /// pages if `huge` or if the heap is big enough. See [`Region::part`].
+    const fn part(&self, region: &Region<'_>, huge: bool) -> usize {
+        let huge = huge || self.private.held.get() >= HUGE_ZONE_CHUNKS;
+        region.part(self.private.node.get(), huge)
     }
 
     /// Points every bin at its range of the slot array, empty and at its initial capacity. A slot
@@ -682,6 +699,9 @@ impl HeapData {
             });
             if slab.is_exhausted() {
                 self.move_to(slab, List::Full);
+                if slab.mark_filled() {
+                    self.private.held.set(self.private.held.get() + class.slab_chunks());
+                }
             }
         }
         let top = end.wrapping_sub(got);
@@ -697,8 +717,11 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let (cursor, node) = (self.private.cursor.get(), self.private.node.get());
-        let Some(first) = region.alloc_chunks(chunks, chunks, cursor, node) else {
+        let part = self.part(region, false);
+        let home = region.home(part);
+        let cursor = self.private.cursor.get();
+        let cursor = if home.contains(&cursor) { cursor } else { home.start };
+        let Some(first) = region.alloc_chunks(chunks, chunks, cursor, part) else {
             return false;
         };
         region.set_owner(first, chunks, self.private.id.get(), class);
@@ -708,7 +731,7 @@ impl HeapData {
         // SAFETY: the chunks are a slab-sized, slab-aligned run that is ours alone.
         unsafe { owned.init(class, region.chunk_ptr(first)) };
         self.push_front(owned, List::Active);
-        if chunks == 1 && region.home(node).contains(&(first / 64)) {
+        if chunks == 1 && home.contains(&(first / 64)) {
             self.private.cursor.set(first / 64);
         }
         true
@@ -1198,11 +1221,15 @@ impl HeapData {
     fn release(&self, region: &Region<'_>, slab: Owned<'_>) {
         self.unlink(slab);
         let first = region.chunk_index(slab.start());
-        region.free_chunks(first, slab.class().slab_chunks());
+        let chunks = slab.class().slab_chunks();
+        if slab.was_filled() {
+            self.private.held.set(self.private.held.get().saturating_sub(chunks));
+        }
+        region.free_chunks(first, chunks);
         region.purge_if_due();
         // Prefer the lowest free word of the home part next time, so slabs stay packed towards the
         // bottom of it.
-        if region.home(self.private.node.get()).contains(&(first / 64)) {
+        if region.home(self.part(region, false)).contains(&(first / 64)) {
             self.private.cursor.set(self.private.cursor.get().min(first / 64));
         }
     }
@@ -1243,7 +1270,10 @@ impl HeapData {
                 return region.chunk_ptr(block.first);
             }
         }
-        let Some(first) = region.alloc_chunks(chunks, 1, 0, self.private.node.get()) else {
+        // A block of a huge page or more is all touched by most programs, so it gains from huge
+        // pages whatever the size of the heap.
+        let part = self.part(region, chunks >= HUGE_PAGE_CHUNKS);
+        let Some(first) = region.alloc_chunks(chunks, 1, 0, part) else {
             return ptr::null_mut();
         };
         region.set_huge(first, chunks);
@@ -2048,6 +2078,33 @@ mod test {
         assert!(chunk(huge) >= 128, "huge blocks come from the node's part too");
         near.validate();
         far.validate();
+    }
+
+    #[test]
+    fn big_heaps_and_big_blocks_take_chunks_from_the_huge_page_zone() {
+        // Four bitmap words: chunks 0 to 127 are the small zone and 128 up the huge one.
+        let test = TestRegion::new(256, 2).with_huge_zone();
+        let region = test.region();
+        let (big, small) = (region.heap().unwrap(), region.heap().unwrap());
+        let chunk = |block: NonNull<u8>| region.chunk_index(block.as_ptr());
+        let blocks = layout(8192, 8);
+        let first = alloc_many(&big, blocks, 8 * (HUGE_ZONE_CHUNKS - 4));
+        assert!(first.iter().all(|&block| chunk(block) < 128), "a small heap uses small pages");
+        let later = alloc_many(&big, blocks, 8 * 16);
+        assert!(chunk(*later.last().unwrap()) >= 128, "a big heap moves to the huge page zone");
+        let medium = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(medium) < 128, "a block smaller than a huge page follows its heap");
+        let large = small.alloc(layout(HUGE_PAGE_CHUNKS * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(large) >= 128, "a block of a huge page or more uses huge pages");
+        for block in first.into_iter().chain(later) {
+            // SAFETY: allocated above with this layout.
+            unsafe { big.dealloc(block, blocks) };
+        }
+        big.flush();
+        let again = big.alloc(blocks).unwrap();
+        assert!(chunk(again) < 128, "a heap that shrank goes back to small pages");
+        big.validate();
+        small.validate();
     }
 
     #[test]

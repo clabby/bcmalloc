@@ -1,6 +1,6 @@
 # How bcmalloc works
 
-**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A thread allocates by popping a pointer off a small stack for the size class, and frees by pushing it back, with no atomic instructions and without touching the block. Blocks freed by another thread travel home in batches of pointers, so neither thread walks or writes memory that the other core holds. Idle memory goes back to the operating system on a clock, in whole huge pages on Linux.
+**Tldr.** bcmalloc is a global allocator for Rust programs that run for a long time, on many threads, and free memory on threads other than the one that allocated it. It reserves one region of address space when the program starts and carves everything out of it. A thread allocates by popping a pointer off a small stack for the size class, and frees by pushing it back, with no atomic instructions and without touching the block. Blocks freed by another thread travel home in batches of pointers, so neither thread walks or writes memory that the other core holds. Idle memory goes back to the operating system on a clock. On Linux, heaps big enough to fill transparent huge pages get them, and give them back whole.
 
 This document explains the design, where each idea comes from, and what each choice costs. Benchmark results close the document.
 
@@ -62,14 +62,14 @@ A few parts of the OS interface differ between the supported platforms, and the 
 | Operation    | Linux                              | macOS                          |
 | ------------ | ---------------------------------- | ------------------------------ |
 | reserve      | mmap with MAP_NORESERVE            | mmap with MAP_NORESERVE        |
-| huge pages   | madvise MADV_HUGEPAGE              | none, there is no THP          |
+| huge pages   | madvise MADV_HUGEPAGE on one zone  | none, there is no THP          |
 | NUMA parts   | mbind with a preferred node        | none                           |
 | populate     | MADV_POPULATE_WRITE, else touch    | touch every page               |
 | lock         | mlock                              | mlock                          |
 | discard      | MADV_DONTNEED, reads back zeros    | MADV_FREE_REUSABLE, not zeroed |
 | reuse        | nothing                            | MADV_FREE_REUSE                |
 
-**Huge pages.** On Linux the region asks for transparent huge pages, as mimalloc does by default there[^mimalloc-thp]. A 2 MiB page needs one TLB entry where 4 KiB pages need 512, so programs whose working set is larger than the TLB covers stop paying for address translation. The cost is that memory is backed, and given back, 2 MiB at a time. Section 9 explains how the allocator keeps that cost down.
+**Huge pages.** On Linux part of the region asks for transparent huge pages. A 2 MiB page needs one TLB entry where 4 KiB pages need 512, so programs whose working set is larger than the TLB covers stop paying for address translation, and a fresh huge page costs one page fault instead of 512. The cost is that memory is backed, and given back, 2 MiB at a time, so a thread that touches a little memory in each of several huge pages holds all of them. The part of the region of each NUMA node is therefore split into two zones. The lower one uses small pages, and the upper one is a single range advised with `MADV_HUGEPAGE`. A heap takes its chunks from the small-page zone until its slabs that have been filled once add up to 1 MiB, and from the huge-page zone after that, while a block of 2 MiB or more always comes from the huge-page zone. Many threads that each use a little memory then pay nothing for huge pages, and a heap that is big enough to fill them gets them. Section 9 explains how the allocator keeps them whole.
 
 **NUMA.** On a machine with more than one NUMA node, the chunks are split into one contiguous part per node, and each part asks the kernel to prefer its node's memory. A heap takes its slabs from the part of the node its thread was running on when it claimed the heap, and borrows from the other parts only when its own is full. A thread's memory therefore sits on its own node without the allocator ever asking where it runs on the fast path.
 
@@ -175,7 +175,7 @@ A program that frees a gigabyte and then runs for a month should not keep the gi
 
 Every bitmap word has a timestamp, which is the latest time that a chunk in it was freed. A second bitmap marks the chunks that were freed since they were last given back. A third marks the chunks whose pages are already gone. The clock runs from paths that are slow anyway, which are refills, slab releases and huge frees. When it is due, and a flag says that some chunk may be waiting, one thread makes a pass over the words. A word whose newest free is at least 10 ms old has its idle chunks claimed with a compare-and-swap on the used word, the same operation that allocation uses, so a chunk in use can never be handed to the kernel. The pass advises the kernel about each claimed run, marks it as given back, and releases it. A program that stays quiet pays nothing, and a busy one pays a clock read now and then.
 
-With huge pages, a pass only takes a 2 MiB page whose 32 chunks are all free. Giving back part of a huge page would split it into small pages and lose the TLB reach it was there for. Temeraire releases whole huge pages for the same reason[^temeraire], and mimalloc's default on Linux is to purge no less than 2 MiB[^mimalloc-thp]. The placement rule of section 4 is what makes whole pages come free: allocations crowd into pages that are already in use.
+In the huge-page zone, a pass only takes a 2 MiB page whose 32 chunks are all free. Giving back part of a huge page would split it into small pages and lose the TLB reach it was there for. Temeraire releases whole huge pages for the same reason[^temeraire], and mimalloc's default on Linux is to purge no less than 2 MiB[^mimalloc-thp]. The placement rule of section 4 is what makes whole pages come free: allocations crowd into pages that are already in use. The small-page zone gives chunks back one at a time.
 
 The next claim of a purged chunk has to know. Allocation checks the given-back bitmap for the run it just claimed and, on macOS, tells the kernel that the pages are in use again. macOS has two ways to give pages back. The lazy one leaves them in the process's footprint until the system is short of memory. The reusable one takes them out of the footprint at once, and wants a matching call before reuse so that the accounting is right. Linux needs no second call, because discarded pages come back as zeros.
 
@@ -209,7 +209,7 @@ The design spends a little memory and some bookkeeping to keep three things chea
 
 **Scattered frees stay cheap.** A free that lands in a cold part of memory costs a bitmap bit and not a write into the block, and a refill hands out a slab's free blocks in address order whatever order they came back in. Programs that free large structures in random order, and then build new ones, get memory that is laid out for them again.
 
-**Memory comes back.** Any empty slab can serve any class, idle chunks go back to the system on a clock, and on Linux they go back in whole huge pages that the placement rule keeps whole. The capacity is a hard limit, and with `Commit::Lock` the allocator never takes a page fault at all.
+**Memory comes back.** Any empty slab can serve any class, idle chunks go back to the system on a clock, and in the huge-page zone they go back in whole huge pages that the placement rule keeps whole. The capacity is a hard limit, and with `Commit::Lock` the allocator never takes a page fault at all.
 
 **Locality is kept without asking.** Huge pages widen the reach of the TLB, and on a machine with several NUMA nodes a heap takes its memory from its own node. Neither costs anything on the fast path.
 
@@ -219,7 +219,7 @@ These are the costs.
 - **Bursts larger than a bin.** A block that overflows a bin goes back to its slab and comes out again on the next refill, one bitmap operation each way, where a list would move a whole chain at once. Bins that keep overflowing grow to make this rare, within a budget.
 - **Blocks that share lines always go home.** For small classes the freeing thread cannot keep the block, so a producer and a consumer pay one message per batch, and blocks wait in an outbox until it fills, is needed for another destination, or is flushed.
 - **Per-thread caches hold memory.** A heap's bins and outboxes keep blocks that other threads cannot use until the heap flushes them, and a thread that goes quiet keeps them until it exits or calls `flush_thread`.
-- **Huge pages raise the floor.** Memory is backed and returned 2 MiB at a time, so a lightly used region holds more than it would with small pages.
+- **Huge pages raise the floor for big heaps.** In the huge-page zone memory is backed and returned 2 MiB at a time, so a heap past the threshold can hold up to a few huge pages that are partly empty.
 
 ## 12. Limits
 
@@ -229,7 +229,8 @@ These are the costs.
 - The capacity is a hard limit. A purge pass or a trim makes some chunks look allocated while it holds them, so a request that needs those chunks waits for the pass to finish. It does not fail.
 - A heap holds blocks in its bins and outboxes until it needs them, fills a message, or is flushed. A thread that goes quiet keeps them until it exits or calls `flush_thread`. The bins of one heap hold at most their initial capacity plus 2 MiB.
 - Each heap keeps up to 16 MiB of freed huge blocks for reuse until its maintenance steps or a flush return them. A thread that only allocates huge blocks never runs maintenance, so only a flush or its exit returns them.
-- Memory in a slab that is only partly free is never returned, and with huge pages neither is a huge page that is partly in use, except by `trim`.
+- Memory in a slab that is only partly free is never returned, and in the huge-page zone neither is a huge page that is partly in use, except by `trim`.
+- A heap picks its zone from its own size, not from how much of each page it touches, so a heap of large, sparsely used slabs can still hold huge pages it barely uses.
 - Fresh pages are zero, but the allocator does not track that, so zeroed allocations always write zeros.
 - The NUMA parts are fixed when the region is created, and a heap keeps the node of the CPU its thread first ran on.
 

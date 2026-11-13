@@ -48,9 +48,8 @@ const PURGE_INTERVAL_MS: u64 = 10;
 /// The alignment of the managed memory, which is the size of the largest slab.
 const SLAB_ALIGN: usize = 64 * CHUNK_SIZE;
 
-/// The chunks in one transparent huge page of 2 MiB, which is the unit the purge clock gives back
-/// when the region asks for huge pages.
-const HUGE_PAGE_CHUNKS: usize = (2 << 20) / CHUNK_SIZE;
+/// The chunks in one transparent huge page of 2 MiB.
+pub(crate) const HUGE_PAGE_CHUNKS: usize = (2 << 20) / CHUNK_SIZE;
 
 /// Why a region could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,8 +100,10 @@ pub struct Region<'a> {
     heaps: &'a [HeapData],
     /// The bin slots of every heap, [`BIN_SLOTS`] for each, owned by whoever claims the heap.
     bin_slots: *mut *mut Block,
-    /// How many NUMA nodes the region is split between, and how many bitmap words there are.
+    /// How many NUMA nodes the region is split between, into how many zones the part of each node
+    /// is split, and how many bitmap words there are. See [`Region::part`].
     nodes: usize,
+    zones: usize,
     words: usize,
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
@@ -133,8 +134,6 @@ unsafe impl Sync for Region<'_> {}
 ///   slots.
 /// * `bin_slots` must point to [`BIN_SLOTS`] writable pointers for each heap slot, valid for as
 ///   long as `'a` and used by nothing else.
-/// * `purge_granule` is how many chunks the purge clock gives back together, a power of two of at
-///   most 64 that `base` is aligned to in chunks.
 pub(crate) struct Parts<'a> {
     pub(crate) base: *mut u8,
     pub(crate) words: &'a [AtomicU64],
@@ -143,9 +142,10 @@ pub(crate) struct Parts<'a> {
     pub(crate) map: &'a [AtomicU64],
     pub(crate) heaps: &'a [HeapData],
     pub(crate) bin_slots: *mut *mut Block,
-    pub(crate) purge_granule: usize,
     /// How many NUMA nodes to split the chunks between, at least 1.
     pub(crate) nodes: usize,
+    /// Whether the part of each node has a zone for transparent huge pages. See [`Region::part`].
+    pub(crate) huge_zone: bool,
 }
 
 impl<'a> Region<'a> {
@@ -159,16 +159,26 @@ impl<'a> Region<'a> {
         debug_assert_eq!(parts.map.len(), parts.chunk_count);
         let words = Chunks::words_for(parts.chunk_count);
         // A region too small to give every node a word of its own is not split at all, because
-        // the parts are numbered by physical node.
+        // the parts are numbered by physical node. Zones are given up first, since they only
+        // decide placement.
         let nodes = if parts.nodes <= words { parts.nodes.max(1) } else { 1 };
+        let zones = if parts.huge_zone && 2 * nodes <= words { 2 } else { 1 };
+        // Huge pages go back whole, and small pages one chunk at a time.
+        let chunks = if zones > 1 {
+            Chunks::with_granule(parts.words, parts.chunk_count, HUGE_PAGE_CHUNKS)
+                .coarse_in_odd_parts(nodes * zones)
+        } else {
+            Chunks::with_granule(parts.words, parts.chunk_count, 1)
+        };
         Self {
             base: parts.base,
-            chunks: Chunks::with_granule(parts.words, parts.chunk_count, parts.purge_granule),
+            chunks,
             slabs: parts.slabs,
             map: parts.map,
             heaps: parts.heaps,
             bin_slots: parts.bin_slots,
             nodes,
+            zones,
             words,
             claimed_mark: AtomicUsize::new(0),
             next_purge: AtomicU64::new(0),
@@ -268,16 +278,16 @@ impl<'a> Region<'a> {
         offset < self.chunks.len() << CHUNK_SHIFT
     }
 
-    /// Claims `n` chunks as `Chunks`::alloc does, and makes the pages of any that were given back
-    /// to the OS ready for use.
+    /// Claims `n` chunks as `Chunks`::alloc does, preferring part `part` (see [`Region::part`]),
+    /// and makes the pages of any that were given back to the OS ready for use.
     pub(crate) fn alloc_chunks(
         &self,
         n: usize,
         align: usize,
         hint: usize,
-        node: usize,
+        part: usize,
     ) -> Option<usize> {
-        let home = self.home(node);
+        let home = self.home(part);
         let first = match self.chunks.alloc_near(n, align, hint, home.clone()) {
             Some(first) => first,
             None => self.alloc_chunks_after_purge(n, align, hint, home)?,
@@ -294,10 +304,28 @@ impl<'a> Region<'a> {
         Some(first)
     }
 
-    /// The bitmap words of the part of the region that belongs to NUMA node `node`.
-    pub(crate) const fn home(&self, node: usize) -> Range<usize> {
+    /// The part of the region that the chunks of NUMA node `node` come from, in its zone for
+    /// transparent huge pages if `huge`.
+    ///
+    /// The part of each node is split in two. The upper zone is backed by huge pages and holds the
+    /// chunks of heaps that have grown past a threshold, and of blocks of a huge page or more, so
+    /// that a thread that uses little memory never holds a 2 MiB page it barely touches. Each zone
+    /// is one range of addresses, so the advice is given once.
+    pub(crate) const fn part(&self, node: usize, huge: bool) -> usize {
+        (node % self.nodes) * self.zones + (huge && self.zones > 1) as usize
+    }
+
+    /// The bitmap words of part `part`. The parts of a node are next to each other.
+    pub(crate) const fn home(&self, part: usize) -> Range<usize> {
+        let parts = self.nodes * self.zones;
+        let part = part % parts;
+        part * self.words / parts..(part + 1) * self.words / parts
+    }
+
+    /// The bitmap words of all the parts of NUMA node `node`.
+    pub(crate) const fn node_words(&self, node: usize) -> Range<usize> {
         let node = node % self.nodes;
-        node * self.words / self.nodes..(node + 1) * self.words / self.nodes
+        self.home(self.part(node, false)).start..self.home(self.part(node, true)).end
     }
 
     /// The NUMA node of the CPU the calling thread runs on, as the region numbers its parts.
@@ -662,13 +690,7 @@ impl Mapping {
                 at(geometry.words).cast::<AtomicU64>(),
                 Chunks::storage_words(chunks),
             );
-            // With huge pages, giving back less than a whole one would split it.
             let nodes = if config.wants_numa() { sys::numa_nodes() } else { 1 };
-            let granule = if config.wants_huge_pages() && cfg!(target_os = "linux") {
-                HUGE_PAGE_CHUNKS
-            } else {
-                1
-            };
             let region = Region::from_parts(Parts {
                 base: at(geometry.data),
                 words,
@@ -677,8 +699,8 @@ impl Mapping {
                 map,
                 heaps: heap_slots,
                 bin_slots: at(geometry.bins).cast::<*mut Block>(),
-                purge_granule: granule,
                 nodes,
+                huge_zone: config.wants_huge_pages() && cfg!(target_os = "linux"),
             });
             ptr::write(base.as_ptr().cast::<Region<'static>>(), region);
         }
@@ -707,22 +729,30 @@ impl Mapping {
         let data_len = config.capacity_bytes();
         // SAFETY: the data range is inside the reservation.
         let data = unsafe { NonNull::new_unchecked(self.base.as_ptr().add(geometry.data)) };
-        if config.wants_huge_pages() {
-            // SAFETY: as above.
-            unsafe { sys::advise_huge(data, data_len) };
-        }
         let region = self.region();
         for node in 0..region.nodes {
-            let words = region.home(node);
-            let start = (words.start * 64).min(region.chunks.len());
-            let end = (words.end * 64).min(region.chunks.len());
-            if region.nodes > 1 && start < end {
+            let chunks = |words: Range<usize>| {
+                (words.start * 64).min(region.chunks.len())..
+                    (words.end * 64).min(region.chunks.len())
+            };
+            let all = chunks(region.node_words(node));
+            if region.nodes > 1 && !all.is_empty() {
                 // SAFETY: the range is inside the data range.
                 unsafe {
                     sys::prefer_node(
-                        NonNull::new_unchecked(region.chunk_ptr(start)),
-                        (end - start) << CHUNK_SHIFT,
+                        NonNull::new_unchecked(region.chunk_ptr(all.start)),
+                        all.len() << CHUNK_SHIFT,
                         node,
+                    );
+                }
+            }
+            let huge = chunks(region.home(region.part(node, true)));
+            if region.zones > 1 && !huge.is_empty() {
+                // SAFETY: as above.
+                unsafe {
+                    sys::advise_huge(
+                        NonNull::new_unchecked(region.chunk_ptr(huge.start)),
+                        huge.len() << CHUNK_SHIFT,
                     );
                 }
             }
@@ -778,6 +808,20 @@ mod test {
         assert_eq!(next, 5);
         let tiny = crate::testing::TestRegion::with_nodes(64, 1, 4);
         assert_eq!(tiny.region().home(3), 0..1, "a region smaller than the nodes is not split");
+    }
+
+    #[test]
+    fn every_node_gets_a_small_and_a_huge_page_zone_side_by_side() {
+        let test = crate::testing::TestRegion::with_nodes(512, 1, 2).with_huge_zone();
+        let region = test.region();
+        let parts = [(0, false), (0, true), (1, false), (1, true)]
+            .map(|(node, huge)| region.home(region.part(node, huge)));
+        assert_eq!(parts, [0..2, 2..4, 4..6, 6..8], "the zones of a node are next to each other");
+        assert_eq!(region.node_words(1), 4..8);
+        let one = crate::testing::TestRegion::new(64, 1).with_huge_zone();
+        let region = one.region();
+        assert_eq!(region.part(0, true), region.part(0, false), "one word is not split");
+        assert_eq!(region.node_words(0), 0..1);
     }
 
     #[test]

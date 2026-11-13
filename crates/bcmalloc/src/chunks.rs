@@ -54,10 +54,12 @@
 //! caller returns the pages to the OS, and the next claim of a purged chunk learns that it must
 //! prepare them for use again.
 //!
-//! Pages are given back in granules of a fixed number of chunks. With transparent huge pages a
-//! granule is one 2 MiB page, 32 chunks, and a pass only takes a granule whose every chunk is free.
-//! Returning part of a huge page would split it into small pages, which costs the TLB reach that
-//! huge pages exist for. This is the rule Temeraire follows in TCMalloc.
+//! Pages are given back in granules of a fixed number of chunks. In memory backed by transparent
+//! huge pages a granule is one 2 MiB page, 32 chunks, and a pass only takes a granule whose every
+//! chunk is free. Returning part of a huge page would split it into small pages, which costs the
+//! TLB reach that huge pages exist for. This is the rule Temeraire follows in TCMalloc. The
+//! bitmap can be split into parts of which only every second one is purged in granules, for the
+//! zones of a region.
 //!
 //! # Placement within a word
 //!
@@ -99,6 +101,12 @@ pub(crate) struct Chunks<'a> {
     len: usize,
     /// How many chunks are purged together, a power of two of at most 64.
     granule: usize,
+    /// If not zero, the words are split into this many parts as [`Region::home`] splits them,
+    /// and only the words of the odd parts are purged in granules. The others go a chunk at a
+    /// time.
+    ///
+    /// [`Region::home`]: crate::region::Region::home
+    coarse_parts: usize,
 }
 
 impl<'a> Chunks<'a> {
@@ -126,7 +134,25 @@ impl<'a> Chunks<'a> {
         let (used, rest) = words.split_at(each);
         let (dirty, rest) = rest.split_at(each);
         let (purged, rest) = rest.split_at(each);
-        Self { used, dirty, purged, stamps: &rest[..each], len, granule }
+        Self { used, dirty, purged, stamps: &rest[..each], len, granule, coarse_parts: 0 }
+    }
+
+    /// These chunks with only the odd ones of `parts` parts purged in granules. See
+    /// [`Chunks::coarse_parts`](Self#structfield.coarse_parts).
+    pub(crate) const fn coarse_in_odd_parts(self, parts: usize) -> Self {
+        Self { coarse_parts: parts, ..self }
+    }
+
+    /// How many chunks of word `w` are purged together.
+    const fn granule_of(&self, w: usize) -> usize {
+        let parts = self.coarse_parts;
+        if parts == 0 {
+            return self.granule;
+        }
+        // The part whose words `p * words / parts..(p + 1) * words / parts` hold `w`.
+        let words = Self::words_for(self.len);
+        let part = ((w + 1) * parts).div_ceil(words) - 1;
+        if part % 2 == 1 { self.granule } else { 1 }
     }
 
     /// The number of chunks tracked.
@@ -322,7 +348,8 @@ impl<'a> Chunks<'a> {
             }
             if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < delay {
                 let free = !self.used[w].load(Ordering::Relaxed) & valid;
-                pending |= self.purgeable(free, self.dirty[w].load(Ordering::Relaxed), valid) != 0;
+                let dirty = self.dirty[w].load(Ordering::Relaxed);
+                pending |= self.purgeable(w, free, dirty, valid) != 0;
                 continue;
             }
             // Claim the free granules that hold a dirty chunk. A dirty chunk in use was reclaimed
@@ -330,7 +357,7 @@ impl<'a> Chunks<'a> {
             let mut seen = self.used[w].load(Ordering::Relaxed);
             let claimed = loop {
                 let want =
-                    self.purgeable(!seen & valid, self.dirty[w].load(Ordering::Relaxed), valid);
+                    self.purgeable(w, !seen & valid, self.dirty[w].load(Ordering::Relaxed), valid);
                 if want == 0 {
                     break 0;
                 }
@@ -360,20 +387,21 @@ impl<'a> Chunks<'a> {
         pending
     }
 
-    /// The chunks of a word that a purge would take: every granule that is entirely `free` and has
-    /// a `dirty` chunk. A granule that runs past the end of the region counts its valid part.
-    const fn purgeable(&self, free: u64, dirty: u64, valid: u64) -> u64 {
-        if self.granule == 1 {
+    /// The chunks of word `w` that a purge would take: every granule that is entirely `free` and
+    /// has a `dirty` chunk. A granule that runs past the end of the region counts its valid part.
+    const fn purgeable(&self, w: usize, free: u64, dirty: u64, valid: u64) -> u64 {
+        let granule = self.granule_of(w);
+        if granule == 1 {
             return dirty & free & valid;
         }
         let mut want = 0;
         let mut offset = 0;
         while offset < WORD {
-            let mask = run_mask(self.granule, offset) & valid;
+            let mask = run_mask(granule, offset) & valid;
             if mask != 0 && free & mask == mask && dirty & mask != 0 {
                 want |= mask;
             }
-            offset += self.granule;
+            offset += granule;
         }
         want
     }
@@ -793,6 +821,36 @@ mod test {
         purged.clear();
         chunks.purge_pass(200, 10, |run| purged.push(run));
         assert_eq!(purged.first(), Some(&(0..32)));
+    }
+
+    #[test]
+    fn only_the_odd_parts_are_purged_in_huge_pages() {
+        // Four words in two parts, so the huge page granule applies from chunk 128 on.
+        let bitmap = Bitmap::with_granule(256, 32);
+        let chunks = bitmap.chunks().coarse_in_odd_parts(2);
+        for first in [0, 128] {
+            assert!(chunks.claim_at(first, 2));
+            chunks.free_at(first + 1, 1, 0);
+        }
+        let mut purged = Vec::new();
+        chunks.purge_pass(100, 10, |run| purged.push(run));
+        assert_eq!(purged, vec![(1..2)], "small pages go one chunk at a time, huge pages whole");
+    }
+
+    #[test]
+    fn the_granule_of_a_word_follows_the_parts_of_the_region() {
+        for words in 1..40 {
+            for parts in (2..=8).step_by(2).filter(|&parts| parts <= words) {
+                let bitmap = Bitmap::with_granule(words * WORD, 32);
+                let chunks = bitmap.chunks().coarse_in_odd_parts(parts);
+                for part in 0..parts {
+                    for w in part * words / parts..(part + 1) * words / parts {
+                        let want = if part % 2 == 1 { 32 } else { 1 };
+                        assert_eq!(chunks.granule_of(w), want, "word {w} of {words} in {parts}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

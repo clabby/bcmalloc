@@ -66,8 +66,8 @@ assert_eq!(numbers.iter().sum::<u32>(), 499_500);
 | `capacity`   | 64 GiB  | Size of the region. It is address space until memory is touched.     |
 | `max_heaps`  | 4096    | How many threads can allocate at once.                               |
 | `commit`     | `Lazy`  | `Populate` backs every page now and `Lock` also pins them in RAM.    |
-| `huge_pages` | on      | Backs the region with transparent huge pages on Linux. macOS has none. |
-| `numa`       | on      | Splits the region between NUMA nodes on Linux machines with several.   |
+| `huge_pages` | on      | Huge pages on Linux for big heaps and big blocks. macOS has none.    |
+| `numa`       | on      | Splits the region between NUMA nodes on Linux machines with several. |
 
 If the operating system refuses the default reservation, the global allocator retries with half the capacity down to 256 MiB.
 

@@ -135,6 +135,7 @@ pub struct TestRegion {
     memory: Buffer,
     chunks: usize,
     nodes: usize,
+    huge_zone: bool,
 }
 
 impl TestRegion {
@@ -157,6 +158,7 @@ impl TestRegion {
                 memory: Buffer::new(chunks << CHUNK_SHIFT),
                 chunks,
                 nodes: 1,
+                huge_zone: false,
             }
         }
     }
@@ -165,6 +167,13 @@ impl TestRegion {
     /// that many would split them.
     pub fn with_nodes(chunks: usize, heaps: usize, nodes: usize) -> Self {
         Self { nodes, ..Self::new(chunks, heaps) }
+    }
+
+    /// This region with the part of every node split into a zone for small pages and one for
+    /// transparent huge pages, as on Linux.
+    #[must_use]
+    pub fn with_huge_zone(self) -> Self {
+        Self { huge_zone: true, ..self }
     }
 
     /// The region over this storage.
@@ -180,8 +189,8 @@ impl TestRegion {
                 map: &self.map,
                 heaps: &self.heaps,
                 bin_slots: self.bins.as_ptr().cast::<*mut Block>().cast_mut(),
-                purge_granule: 1,
                 nodes: self.nodes,
+                huge_zone: self.huge_zone,
             })
         }
     }

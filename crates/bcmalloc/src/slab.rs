@@ -77,6 +77,8 @@ pub(crate) struct Slab {
     cursor: Cell<u16>,
     class: Cell<u8>,
     list: Cell<List>,
+    /// Whether every block has been handed out once since the slab was set up.
+    filled: Cell<bool>,
     bits: [Cell<u64>; BITMAP_WORDS],
 }
 
@@ -105,6 +107,7 @@ impl Slab {
             cursor: Cell::new(0),
             class: Cell::new(0),
             list: Cell::new(List::None),
+            filled: Cell::new(false),
             bits: [const { Cell::new(0) }; BITMAP_WORDS],
         }
     }
@@ -148,6 +151,7 @@ impl<'a> Owned<'a> {
         slab.cursor.set(0);
         slab.class.set(class.index() as u8);
         slab.list.set(List::None);
+        slab.filled.set(false);
         for (index, word) in slab.bits.iter().enumerate() {
             let below = capacity.saturating_sub(index * 64);
             word.set(if below >= 64 { u64::MAX } else { (1 << below) - 1 });
@@ -172,6 +176,17 @@ impl<'a> Owned<'a> {
     /// Whether every block is in use, so a refill can take nothing from this slab.
     pub(crate) const fn is_exhausted(self) -> bool {
         self.0.free_len.get() == 0
+    }
+
+    /// Records that every block has been handed out, and returns whether this is the first time
+    /// since the slab was set up.
+    pub(crate) const fn mark_filled(self) -> bool {
+        !self.0.filled.replace(true)
+    }
+
+    /// Whether every block has been handed out at some point since the slab was set up.
+    pub(crate) const fn was_filled(self) -> bool {
+        self.0.filled.get()
     }
 
     /// The list this slab is on.
