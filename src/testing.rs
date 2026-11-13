@@ -475,14 +475,10 @@ impl ChunkModel {
                 // Every purged chunk of the run must be reported, once.
                 let mut reported = Vec::new();
                 self.bitmap.chunks().take_purged(first, n, |run| reported.extend(run));
-                for (chunk, purged) in (first..first + n).zip(&mut self.purged[first..first + n]) {
-                    assert_eq!(
-                        reported.contains(&chunk),
-                        *purged,
-                        "chunk {chunk} was reported as purged wrongly"
-                    );
-                    *purged = false;
-                }
+                let expected: Vec<usize> =
+                    (first..first + n).filter(|&chunk| self.purged[chunk]).collect();
+                assert_eq!(reported, expected, "the purged chunks of the run were misreported");
+                self.purged[first..first + n].fill(false);
             }
             None => assert!(!self.has_room(n, align), "refused {n} chunks although they fit"),
         }

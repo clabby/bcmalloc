@@ -150,8 +150,9 @@ impl<'a> Chunks<'a> {
             let (word, offset) = (chunk / WORD, chunk % WORD);
             let take = (WORD - offset).min(end - chunk);
             let mask = run_mask(take, offset);
-            // These change before the chunks become free, so that a purge pass cannot take them
-            // on the strength of an older time.
+            // These change before the chunks become free, so that a pass that sees the chunks free
+            // also sees them dirty. A pass that read the time before it moved may still take the
+            // chunks at once, which costs them a page fault and nothing else.
             self.dirty[word].fetch_or(mask, Ordering::Relaxed);
             self.stamps[word].fetch_max(now, Ordering::Relaxed);
             let before = self.used[word].fetch_and(!mask, Ordering::Release);

@@ -243,28 +243,32 @@ impl<'a> Region<'a> {
     #[cold]
     fn alloc_chunks_after_purge(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
         loop {
-            while self.purges_active.load(Ordering::Acquire) != 0 {
-                core::hint::spin_loop();
-            }
+            let active = self.purges_active.load(Ordering::Acquire);
             let done = self.purges_done.load(Ordering::Acquire);
+            // Every round looks at the bitmap, so chunks that are free for some other reason can
+            // be used even while a pass that was descheduled is still holding its own.
             if let Some(first) = self.chunks.alloc(n, align, hint) {
                 return Some(first);
             }
             // The attempt may have failed because of chunks that a pass claimed. Seeing such a
             // claim synchronises with the pass, so after this fence its counters are visible.
             fence(Ordering::Acquire);
-            if self.purges_active.load(Ordering::Acquire) == 0 &&
+            if active == 0 &&
+                self.purges_active.load(Ordering::Acquire) == 0 &&
                 self.purges_done.load(Ordering::Acquire) == done
             {
                 return None;
             }
+            core::hint::spin_loop();
         }
     }
 
     /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge.
     pub(crate) fn free_chunks(&self, first: usize, n: usize) {
         self.chunks.free_at(first, n, sys::monotonic_ms());
-        self.aging.store(true, Ordering::Relaxed);
+        // A read-modify-write, so that the pass that consumes the flag also sees the bits above no
+        // matter which free it read the flag from.
+        self.aging.fetch_or(true, Ordering::Release);
     }
 
     /// Runs the purge clock if free chunks are ageing and an interval has passed. Chunks that stay
@@ -297,8 +301,9 @@ impl<'a> Region<'a> {
 
     /// One tick of the purge clock at time `now` in milliseconds.
     pub(crate) fn purge_pass(&self, now: u64) {
-        // Clear the flag first so that a free that races with the pass sets it again.
-        self.aging.store(false, Ordering::Relaxed);
+        // Take the flag first so that a free that races with the pass sets it again. Taking it
+        // acquires the bits of every free that set it.
+        self.aging.swap(false, Ordering::Acquire);
         self.purges_active.fetch_add(1, Ordering::Release);
         let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
             // SAFETY: the pass holds the run, so no allocation overlaps it.
@@ -312,7 +317,7 @@ impl<'a> Region<'a> {
         self.purges_done.fetch_add(1, Ordering::Release);
         self.purges_active.fetch_sub(1, Ordering::Release);
         if pending {
-            self.aging.store(true, Ordering::Relaxed);
+            self.aging.fetch_or(true, Ordering::Release);
         }
     }
 
@@ -548,6 +553,29 @@ mod test {
     }
 
     #[test]
+    fn a_retry_does_not_wait_for_a_purge_pass_while_other_chunks_are_free() {
+        use std::{sync::mpsc, time::Duration};
+
+        use crate::testing::TestRegion;
+
+        let test = TestRegion::new(2, 1);
+        let region = test.region();
+        let a = region.alloc_chunks(1, 1, 0).unwrap();
+        region.alloc_chunks(1, 1, 0).unwrap();
+        // A pass that was descheduled while holding some other chunks.
+        region.purges_active.fetch_add(1, Ordering::Release);
+        region.free_chunks(a, 1);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| sender.send(region.alloc_chunks_after_purge(1, 1, 0)).unwrap());
+            let found = receiver.recv_timeout(Duration::from_secs(5));
+            // Let the retry finish whatever happened, so that the scope can end.
+            region.purges_active.fetch_sub(1, Ordering::Release);
+            assert_eq!(found, Ok(Some(a)), "the retry waited for the pass");
+        });
+    }
+
+    #[test]
     fn allocation_never_fails_because_a_purge_pass_holds_the_free_chunks() {
         use crate::testing::{TestRegion, iterations};
 
@@ -629,5 +657,36 @@ mod test {
     fn huge_page_advice_is_harmless() {
         let mapping = Mapping::new(&config(16 * MIB).huge_pages(true)).unwrap();
         assert!(mapping.region().heap().unwrap().alloc(Layout::new::<u64>()).is_some());
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_test {
+    use loom::thread;
+
+    use super::*;
+    use crate::testing::TestRegion;
+
+    #[test]
+    fn a_free_racing_a_purge_pass_never_strands_a_dirty_chunk() {
+        loom::model(|| {
+            // The threads share one region value, because the purge state lives in it.
+            let test: &'static TestRegion =
+                std::boxed::Box::leak(std::boxed::Box::new(TestRegion::new(1, 1)));
+            let region: &'static Region<'static> =
+                std::boxed::Box::leak(std::boxed::Box::new(test.region()));
+            let chunk = region.alloc_chunks(1, 1, 0).unwrap();
+            let freer = thread::spawn(move || region.free_chunks(chunk, 1));
+            let purger = thread::spawn(move || region.purge_pass(u64::MAX));
+            freer.join().unwrap();
+            purger.join().unwrap();
+            // Whatever the pass missed has to be announced, or nothing would ever look again.
+            let mut missed = 0;
+            region.chunks.purge_pass(u64::MAX, 0, |run| missed += run.len());
+            assert!(
+                missed == 0 || region.aging.load(Ordering::Acquire),
+                "a free chunk is dirty and nothing is going to purge it"
+            );
+        });
     }
 }
