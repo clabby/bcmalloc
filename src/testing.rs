@@ -3,7 +3,11 @@
 //! This module only exists in test builds and behind the `testing` feature, so none of it is part
 //! of the allocator.
 
-use std::vec::Vec;
+use core::{alloc::Layout, ptr::NonNull};
+use std::{
+    alloc::{alloc, dealloc},
+    vec::Vec,
+};
 
 use crate::{chunks::Chunks, sync::AtomicU64};
 
@@ -65,3 +69,40 @@ impl Bitmap {
         Chunks::new(&self.words, self.len)
     }
 }
+
+/// Memory aligned like a slab, for tests that need real memory under a descriptor or a region.
+#[derive(Debug)]
+pub(crate) struct Buffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+/// The alignment of the largest slab, which is 64 chunks of 64 KiB.
+pub(crate) const SLAB_ALIGN: usize = 4 << 20;
+
+impl Buffer {
+    /// `size` bytes aligned to [`SLAB_ALIGN`].
+    pub(crate) fn new(size: usize) -> Self {
+        let layout = Layout::from_size_align(size, SLAB_ALIGN).expect("valid test layout");
+        // SAFETY: the layout has a non-zero size.
+        let ptr = NonNull::new(unsafe { alloc(layout) }).expect("test allocation failed");
+        Self { ptr, layout }
+    }
+
+    /// The start of the buffer.
+    pub(crate) const fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+// SAFETY: a buffer is plain owned memory.
+unsafe impl Send for Buffer {}
+// SAFETY: sharing the buffer shares only its address.
+unsafe impl Sync for Buffer {}
