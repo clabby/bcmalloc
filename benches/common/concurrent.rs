@@ -162,34 +162,46 @@ pub(crate) fn thread_lifecycle(scale: Scale) -> Outcome {
     Outcome::Throughput { ops: (waves * THREADS * 2000) as u64, elapsed: start.elapsed() }
 }
 
-/// The passive false sharing test from the Hoard paper. The main thread allocates small objects
-/// that sit side by side, hands one to each thread, and each thread frees it and then allocates
-/// its own and writes to it. An allocator that reuses the freed object for the freeing thread puts
-/// every thread's object on one cache line. Throughput is in writes.
-pub(crate) fn cache_scratch(threads: usize, scale: Scale) -> Outcome {
-    let writes = scale.ops(20_000_000);
-    let objects = Mutex::new((0..threads).map(|_| Some(Block::new(8))).collect::<Vec<_>>());
-    parallel(threads, |id| {
-        let given = objects.lock().unwrap()[id].take();
-        drop(given);
+/// How many times a false sharing workload allocates and frees an object per thread.
+const OBJECTS: usize = 100_000;
+
+/// How many times a false sharing workload writes to an object before it frees it.
+const WRITES: usize = 8_000;
+
+/// Allocates an object of 8 bytes, writes to it [`WRITES`] times and frees it, `objects` times. The
+/// object is small so that neighbouring objects of different threads can share a cache line. The
+/// allocation in every round is what lets the allocator decide where the object goes. A program
+/// that allocated once and then only wrote would score the same with every allocator.
+fn scratch_loop(objects: usize) -> u64 {
+    for _ in 0..objects {
         let object = Block::new(8);
-        for i in 0..writes {
+        for i in 0..WRITES {
             object.touch(i as u8);
         }
-        writes as u64
+    }
+    (objects * WRITES) as u64
+}
+
+/// The passive false sharing test from the Hoard paper. The main thread allocates one small
+/// object per thread, which sit side by side, and hands one to each thread. Each thread frees the
+/// object it was given and then repeatedly allocates a small object, writes to it and frees it. An
+/// allocator that puts the freed object on the freeing thread's free list gives that thread the
+/// same line as the thread that got the next object, and the writes of the two fight over it.
+/// Throughput is in writes, so a pass of 8 threads is 6.4 billion.
+pub(crate) fn cache_scratch(threads: usize, scale: Scale) -> Outcome {
+    let objects = scale.ops(OBJECTS);
+    let given = Mutex::new((0..threads).map(|_| Some(Block::new(8))).collect::<Vec<_>>());
+    parallel(threads, |id| {
+        drop(given.lock().unwrap()[id].take());
+        scratch_loop(objects)
     })
 }
 
-/// The active false sharing test. Each thread allocates a small object and writes to it. An
-/// allocator that hands out neighbouring blocks to different threads makes them fight over a
-/// line. Throughput is in writes.
+/// The active false sharing test from the Hoard paper. Each thread repeatedly allocates a small
+/// object, writes to it and frees it. An allocator that hands neighbouring blocks to different
+/// threads makes them fight over a line, and one that gives each thread its own memory does not.
+/// Throughput is in writes.
 pub(crate) fn cache_thrash(threads: usize, scale: Scale) -> Outcome {
-    let writes = scale.ops(20_000_000);
-    parallel(threads, |_| {
-        let object = Block::new(8);
-        for i in 0..writes {
-            object.touch(i as u8);
-        }
-        writes as u64
-    })
+    let objects = scale.ops(OBJECTS);
+    parallel(threads, |_| scratch_loop(objects))
 }

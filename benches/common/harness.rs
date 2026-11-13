@@ -2,6 +2,7 @@
 //!
 //! One operation in every workload is one allocation together with its free, so that throughput
 //! figures can be compared across workloads. Workloads that resize or write report their own unit.
+//! Latency workloads time batches of calls and report percentiles of the time of one call.
 
 use std::{
     alloc::{Layout, alloc, dealloc},
@@ -33,6 +34,8 @@ pub(crate) enum Outcome {
     Throughput { ops: u64, elapsed: Duration },
     /// A memory footprint in MiB.
     Footprint(f64),
+    /// Percentiles of the time of one call, in nanoseconds.
+    Latency { p50: f64, p99: f64, p999: f64 },
 }
 
 /// Runs `work` on this thread and times it. The closure returns how many operations it did.
@@ -61,6 +64,52 @@ pub(crate) fn parallel(threads: usize, body: impl Fn(usize) -> u64 + Sync) -> Ou
         let ops = handles.into_iter().map(|handle| handle.join().unwrap()).sum();
         Outcome::Throughput { ops, elapsed: start.elapsed() }
     })
+}
+
+/// Runs `body` on `threads` threads that start together and collects what each returns, in thread
+/// order. Unlike [`parallel`] it does no timing, for workloads that time themselves.
+pub(crate) fn parallel_collect<T: Send>(
+    threads: usize,
+    body: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
+    let barrier = Barrier::new(threads);
+    thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|id| {
+                let (barrier, body) = (&barrier, &body);
+                scope.spawn(move || {
+                    barrier.wait();
+                    body(id)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    })
+}
+
+/// How many calls one latency sample covers. A clock read costs about as much as a fast
+/// allocation, so timing a batch keeps the clock out of the figure. The price is that a sample is
+/// an average over its batch, which smooths out a single slow call.
+pub(crate) const BATCH: usize = 32;
+
+/// Times `work` and returns the elapsed nanoseconds. The clock on macOS ticks every 41 ns, which
+/// is small next to a batch.
+pub(crate) fn time_batch(work: impl FnOnce()) -> u32 {
+    let start = Instant::now();
+    work();
+    start.elapsed().as_nanos().min(u128::from(u32::MAX)) as u32
+}
+
+/// Turns the batch times of a run into percentiles of the time of one call. Each sample is the
+/// time of a batch that made `calls` calls.
+pub(crate) fn latency(mut samples: Vec<u32>, calls: usize) -> Outcome {
+    assert!(!samples.is_empty(), "no latency samples");
+    samples.sort_unstable();
+    let at = |quantile: f64| {
+        let rank = (samples.len() as f64 * quantile).ceil() as usize;
+        f64::from(samples[rank.clamp(1, samples.len()) - 1]) / calls as f64
+    };
+    Outcome::Latency { p50: at(0.5), p99: at(0.99), p999: at(0.999) }
 }
 
 /// A tiny xorshift generator, so that every allocator sees the same sequence of requests.
@@ -126,6 +175,26 @@ impl Block {
             // SAFETY: the offset is inside the allocation.
             unsafe { self.ptr.add(offset).write_volatile(1) };
         }
+    }
+
+    /// Fills the whole block with a pattern that depends on `seed` and returns a hash of what it
+    /// reads back, as a program would when it puts data in a new block and then uses it.
+    pub(crate) fn fill_and_hash(&mut self, seed: u64) -> u64 {
+        // SAFETY: the pointer is valid for `size` bytes and this block owns them. The slice is
+        // written before it is read, and so no byte is read uninitialized.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) };
+        let mut word = seed | 1;
+        for chunk in bytes.chunks_mut(8) {
+            chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+            word = word.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        }
+        let mut hash = 0xCBF2_9CE4_8422_2325_u64;
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            hash = (hash ^ u64::from_le_bytes(word)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
     }
 }
 

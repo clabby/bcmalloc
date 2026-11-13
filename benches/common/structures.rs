@@ -128,3 +128,50 @@ pub(crate) fn tree_rewrite(scale: Scale) -> Outcome {
         nodes
     })
 }
+struct ValueNode {
+    left: Option<Box<Self>>,
+    right: Option<Box<Self>>,
+    value: u64,
+}
+
+fn build_values(height: u32, next: &mut u64) -> Option<Box<ValueNode>> {
+    (height > 0).then(|| {
+        *next += 1;
+        let value = *next;
+        Box::new(ValueNode {
+            value,
+            left: build_values(height - 1, next),
+            right: build_values(height - 1, next),
+        })
+    })
+}
+
+fn sum(node: &Option<Box<ValueNode>>) -> u64 {
+    node.as_ref()
+        .map_or(0, |node| node.value.wrapping_add(sum(&node.left)).wrapping_add(sum(&node.right)))
+}
+
+/// Binary trees again, but each node holds a value, and the program walks every tree four times and
+/// sums the values before it drops the tree. The walks run over the memory that the allocator laid
+/// out, so a layout with good locality pays off, and the allocator is only part of the time. One
+/// operation is a node.
+pub(crate) fn binary_trees_with_work(scale: Scale) -> Outcome {
+    const HEIGHT: u32 = 16;
+    const WALKS: u32 = 4;
+    let reps = scale.ops(300);
+    timed(|| {
+        let long_lived = build_values(HEIGHT, &mut 0);
+        let mut nodes = 0;
+        let mut total = 0_u64;
+        for _ in 0..reps {
+            let mut built = 0;
+            let tree = build_values(HEIGHT, &mut built);
+            for _ in 0..WALKS {
+                total = total.wrapping_add(sum(black_box(&tree)));
+            }
+            nodes += built;
+        }
+        black_box((&long_lived, total));
+        nodes
+    })
+}
