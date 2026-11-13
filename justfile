@@ -54,13 +54,7 @@ fuzz target='heap_ops' seconds='60':
 bench-build:
     cargo bench --no-run
 
-# Run every allocator benchmark and print one comparison table. Pass --quick for a short run.
+# Run every workload under every allocator and print the comparison. Options are --quick,
+# --rounds N, --filter TEXT and --baseline ALLOCATOR. The raw rows go to target/bench.tsv.
 bench *args='':
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p target
-    : > target/bench.tsv
-    for allocator in system cwmalloc mimalloc jemalloc snmalloc; do
-        cargo bench --bench "$allocator" -- "$@" >> target/bench.tsv
-    done
-    cargo bench --bench report -- target/bench.tsv 2>/dev/null
+    cargo bench --bench report -- $@

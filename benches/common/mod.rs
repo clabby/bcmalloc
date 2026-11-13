@@ -1,187 +1,122 @@
 //! The workloads shared by every allocator benchmark.
 //!
 //! A program has exactly one global allocator, so each allocator gets its own benchmark binary
-//! that installs it and calls [`run`]. Results go to stdout as tab-separated rows so that the
-//! `report` benchmark can line the allocators up side by side. Progress goes to stderr.
+//! that installs it and calls [`run`]. A binary runs one workload per invocation, which keeps the
+//! workloads from influencing each other and lets the peak memory of a run belong to that
+//! workload alone. The `report` benchmark drives all of them and lines the results up.
 //!
-//! Every figure is the best of several runs, which filters out interference from the rest of the
-//! machine. Throughput is in millions of operations per second, so higher is better, except for
-//! peak memory.
+//! Binaries accept these arguments.
+//!
+//! | Argument           | Effect                                                   |
+//! | ------------------ | -------------------------------------------------------- |
+//! | --list             | Print every workload as group, name and unit.            |
+//! | --workload NAME    | Run only that workload and print one tab-separated row.  |
+//! | --quick            | Do a quarter of the work.                                |
+//!
+//! A row holds the allocator, the workload, the value, the unit and the peak resident memory of
+//! the process in MiB. Throughput is in millions of operations per second, where one operation is
+//! an allocation together with its free unless the workload says otherwise.
 
-use std::{
-    hint::black_box,
-    mem::MaybeUninit,
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+mod churn;
+mod concurrent;
+mod harness;
+mod memory;
+mod micro;
+mod resize;
+mod structures;
 
-/// Request sizes for the churn workloads, weighted towards small blocks like most programs.
-const SIZES: [usize; 12] = [16, 24, 32, 48, 64, 64, 96, 128, 256, 512, 1024, 4096];
+use churn::{MEDIUM, MIXED, SMALL, Sizes};
+use harness::{Outcome, Scale, peak_resident_mib};
 
-/// A block that is never read, so that the benchmark measures the allocator and not a memset.
-type Block = Box<[MaybeUninit<u8>]>;
+type Run = fn(Scale) -> Outcome;
 
-/// A tiny xorshift generator so that every allocator sees the same sequence of requests.
-struct Rng(u64);
-
-impl Rng {
-    const fn next(&mut self) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 as usize
-    }
+/// A named workload in a group.
+struct Workload {
+    group: &'static str,
+    name: &'static str,
+    run: Run,
 }
 
-fn block(size: usize) -> Block {
-    let mut block = Box::<[u8]>::new_uninit_slice(size);
-    // Touch the first byte so the memory is really used, as a program would.
-    block[0].write(1);
-    block
+const fn w(group: &'static str, name: &'static str, run: Run) -> Workload {
+    Workload { group, name, run }
 }
 
-/// Runs every workload against the allocator that this binary installed.
+const SKEWED: Sizes = Sizes::Skewed;
+
+/// Every workload, in the order the report prints them.
+const WORKLOADS: &[Workload] = &[
+    w("pair", "pair 16 B", micro::pair::<16>),
+    w("pair", "pair 64 B", micro::pair::<64>),
+    w("pair", "pair 256 B", micro::pair::<256>),
+    w("pair", "pair 1 KiB", micro::pair::<1024>),
+    w("pair", "pair 4 KiB", micro::pair::<4096>),
+    w("pair", "pair 16 KiB", micro::pair::<16384>),
+    w("pair", "pair 64 KiB", micro::pair::<65536>),
+    w("pair", "pair 256 KiB", micro::pair::<262_144>),
+    w("pair", "pair 1 MiB", micro::pair::<1_048_576>),
+    w("bulk", "bulk 32 B in order", micro::bulk::<32, false>),
+    w("bulk", "bulk 32 B shuffled", micro::bulk::<32, true>),
+    w("bulk", "bulk 512 B shuffled", micro::bulk::<512, true>),
+    w("churn", "churn small", |s| churn::churn(1, SMALL, s)),
+    w("churn", "churn medium", |s| churn::churn(1, MEDIUM, s)),
+    w("churn", "churn mixed", |s| churn::churn(1, MIXED, s)),
+    w("churn", "churn skewed", |s| churn::churn(1, SKEWED, s)),
+    w("churn", "churn mixed 4 threads", |s| churn::churn(4, MIXED, s)),
+    w("churn", "churn mixed 8 threads", |s| churn::churn(8, MIXED, s)),
+    w("churn", "churn mixed 16 threads", |s| churn::churn(16, MIXED, s)),
+    w("churn", "churn skewed 8 threads", |s| churn::churn(8, SKEWED, s)),
+    w("sharing", "larson 8 threads", concurrent::larson),
+    w("sharing", "ring 4 threads", |s| concurrent::ring(4, s)),
+    w("sharing", "ring 8 threads", |s| concurrent::ring(8, s)),
+    w("sharing", "channel 1 pair", |s| concurrent::channel_pairs(1, s)),
+    w("sharing", "channel 4 pairs", |s| concurrent::channel_pairs(4, s)),
+    w("sharing", "shared table 8 threads", |s| concurrent::shared_table(8, s)),
+    w("sharing", "thread lifecycle", concurrent::thread_lifecycle),
+    w("false sharing", "cache scratch 8 threads", |s| concurrent::cache_scratch(8, s)),
+    w("false sharing", "cache thrash 8 threads", |s| concurrent::cache_thrash(8, s)),
+    w("collections", "hash map", structures::hash_map),
+    w("collections", "btree map", structures::btree_map),
+    w("collections", "strings", structures::strings),
+    w("collections", "linked list", structures::linked_list),
+    w("collections", "binary trees", structures::binary_trees),
+    w("collections", "tree rewrite", structures::tree_rewrite),
+    w("resizing", "vec growth", resize::vec_growth),
+    w("resizing", "string growth", resize::string_growth),
+    w("resizing", "many vectors", resize::many_vectors),
+    w("resizing", "realloc random", micro::realloc_random),
+    w("large", "medium blocks", churn::medium_blocks),
+    w("large", "large blocks", churn::large_blocks),
+    w("memory", "burst retention", memory::burst_retention),
+    w("memory", "half freed", memory::half_freed),
+];
+
+/// Runs the workload that the arguments select, or lists them.
 pub(crate) fn run(allocator: &str) {
-    let quick = std::env::args().any(|arg| arg == "--quick");
-    let runs = if quick { 2 } else { 5 };
-    let scale = if quick { 1 } else { 4 };
-    let cores = thread::available_parallelism().map_or(4, usize::from);
-    let report = |workload: &str, value: f64, unit: &str| {
-        eprintln!("{allocator:>10}  {workload:<28} {value:>10.2} {unit}");
-        println!("{allocator}\t{workload}\t{value:.3}\t{unit}");
+    let args: Vec<String> = std::env::args().collect();
+    let value_of = |flag: &str| {
+        args.iter().position(|arg| arg == flag).and_then(|at| args.get(at + 1)).cloned()
     };
-
-    let ops = 1_000_000 * scale;
-    report("single-thread churn", best(runs, || churn(1, ops)), "Mops/s");
-    for threads in [4, 8, 16].into_iter().filter(|&t| t <= cores) {
-        let name = format!("{threads}-thread churn");
-        report(&name, best(runs, || churn(threads, ops)), "Mops/s");
-    }
-    for pairs in [1, 4].into_iter().filter(|&p| p * 2 <= cores) {
-        let name = format!("{pairs}-pair cross-thread free");
-        report(&name, best(runs, || cross_thread(pairs, 250_000 * scale)), "Mops/s");
-    }
-    report("vec growth", best(runs, || vec_growth(5 * scale)), "Mops/s");
-    report("binary trees", best(runs, || binary_trees(16, 8 * scale)), "Mops/s");
-    report("large blocks", best(runs, || large_blocks(200 * scale)), "Mops/s");
-    report("peak memory", peak_memory_mib(), "MiB");
-}
-
-/// The best throughput over `runs` runs of a workload that returns how many operations it did.
-fn best(runs: usize, mut workload: impl FnMut() -> (u64, Duration)) -> f64 {
-    let _ = workload();
-    (0..runs)
-        .map(|_| {
-            let (operations, elapsed) = workload();
-            operations as f64 / elapsed.as_secs_f64() / 1e6
-        })
-        .fold(0.0, f64::max)
-}
-
-/// Each thread keeps 4096 live blocks and keeps replacing random ones, so blocks live for a while
-/// and are freed out of order.
-fn churn(threads: usize, ops_per_thread: usize) -> (u64, Duration) {
-    let start = Instant::now();
-    thread::scope(|scope| {
-        for id in 0..threads {
-            scope.spawn(move || {
-                let mut rng = Rng(0x9E37_79B9 + id as u64 * 7919);
-                let mut live: Vec<Option<Block>> = (0..4096).map(|_| None).collect();
-                for _ in 0..ops_per_thread {
-                    let slot = rng.next() % live.len();
-                    live[slot] = Some(block(SIZES[rng.next() % SIZES.len()]));
-                }
-                black_box(live);
-            });
+    if args.iter().any(|arg| arg == "--list") {
+        for workload in WORKLOADS {
+            let unit = if workload.group == "memory" { "MiB" } else { "Mops/s" };
+            println!("{}\t{}\t{unit}", workload.group, workload.name);
         }
-    });
-    ((threads * ops_per_thread) as u64, start.elapsed())
-}
-
-/// Producers allocate blocks and send them to consumers on other threads, which free them. This is
-/// the pattern that makes allocators with thread-local heaps either slow or hungry.
-fn cross_thread(pairs: usize, messages: usize) -> (u64, Duration) {
-    let start = Instant::now();
-    thread::scope(|scope| {
-        for pair in 0..pairs {
-            let (sender, receiver) = mpsc::sync_channel::<Block>(512);
-            scope.spawn(move || {
-                let mut rng = Rng(0xBEEF + pair as u64);
-                for _ in 0..messages {
-                    sender.send(block(32 + rng.next() % 480)).unwrap();
-                }
-            });
-            scope.spawn(move || {
-                for received in receiver {
-                    black_box(&received);
-                }
-            });
-        }
-    });
-    ((pairs * messages) as u64, start.elapsed())
-}
-
-/// Grows vectors one push at a time, which is a long chain of reallocations.
-fn vec_growth(repetitions: usize) -> (u64, Duration) {
-    const ELEMENTS: u64 = 1_000_000;
-    let start = Instant::now();
-    for _ in 0..repetitions {
-        let mut numbers = Vec::new();
-        for i in 0..ELEMENTS {
-            numbers.push(i);
-        }
-        black_box(&numbers);
+        return;
     }
-    (repetitions as u64 * ELEMENTS, start.elapsed())
-}
-
-struct Tree(Option<Box<(Self, Self)>>);
-
-fn build(depth: u32) -> Tree {
-    if depth == 0 { Tree(None) } else { Tree(Some(Box::new((build(depth - 1), build(depth - 1))))) }
-}
-
-fn count(tree: &Tree) -> u64 {
-    tree.0.as_ref().map_or(0, |pair| 1 + count(&pair.0) + count(&pair.1))
-}
-
-/// The classic allocation benchmark. It builds and drops full binary trees, which is a flood of
-/// tiny blocks that all die together.
-fn binary_trees(depth: u32, repetitions: usize) -> (u64, Duration) {
-    let start = Instant::now();
-    let long_lived = build(depth);
-    let mut nodes = 0;
-    for _ in 0..repetitions {
-        nodes += count(&build(depth));
-    }
-    black_box(&long_lived);
-    (nodes, start.elapsed())
-}
-
-/// Allocates, touches and frees blocks of a few hundred kilobytes up to megabytes.
-fn large_blocks(repetitions: usize) -> (u64, Duration) {
-    const SIZES: [usize; 4] = [256 << 10, 1 << 20, 4 << 20, 16 << 20];
-    let start = Instant::now();
-    for i in 0..repetitions {
-        let mut block = Box::<[u8]>::new_uninit_slice(SIZES[i % SIZES.len()]);
-        for offset in (0..block.len()).step_by(4096) {
-            block[offset].write(1);
+    let scale = Scale::new(args.iter().any(|arg| arg == "--quick"));
+    let wanted = value_of("--workload");
+    for workload in WORKLOADS.iter().filter(|w| wanted.as_ref().is_none_or(|name| *name == w.name))
+    {
+        // The first run warms up the allocator and the page cache, and the second is measured.
+        if workload.group != "memory" {
+            let _ = (workload.run)(scale);
         }
-        black_box(&block);
+        let (value, unit) = match (workload.run)(scale) {
+            Outcome::Throughput { ops, elapsed } => {
+                (ops as f64 / elapsed.as_secs_f64() / 1e6, "Mops/s")
+            }
+            Outcome::Footprint(mib) => (mib, "MiB"),
+        };
+        println!("{allocator}\t{}\t{value:.3}\t{unit}\t{:.1}", workload.name, peak_resident_mib());
     }
-    (repetitions as u64, start.elapsed())
-}
-
-/// The peak resident set size of the whole process so far, in MiB.
-fn peak_memory_mib() -> f64 {
-    // SAFETY: getrusage fills the struct we pass and has no other effects.
-    let usage = unsafe {
-        let mut usage = std::mem::zeroed::<libc::rusage>();
-        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
-        usage
-    };
-    // macOS reports bytes and Linux reports kilobytes.
-    let unit = if cfg!(target_os = "macos") { 1.0 } else { 1024.0 };
-    usage.ru_maxrss as f64 * unit / (1 << 20) as f64
 }
