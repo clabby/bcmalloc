@@ -159,12 +159,40 @@ pub(crate) unsafe fn reuse(ptr: NonNull<u8>, len: usize) {
     let _ = (ptr, len);
 }
 
-/// A monotonic clock in milliseconds.
+/// A monotonic clock in milliseconds, cheap enough to read on the paths that free chunks.
+///
+/// On aarch64 it reads the architected counter, which takes no system call and ticks at a fixed
+/// rate on both supported systems. Elsewhere it asks for the coarse clock where there is one.
 pub(crate) fn monotonic_ms() -> u64 {
-    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: the pointer is valid for the call.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
-    now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    {
+        let (ticks, frequency): (u64, u64);
+        // SAFETY: both registers are readable from user space and reading them has no effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, cntvct_el0",
+                out(reg) ticks,
+                options(nomem, nostack, preserves_flags)
+            );
+            core::arch::asm!(
+                "mrs {}, cntfrq_el0",
+                out(reg) frequency,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        ticks / (frequency / 1000).max(1)
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(miri))))]
+    {
+        #[cfg(target_os = "linux")]
+        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_COARSE;
+        #[cfg(not(target_os = "linux"))]
+        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: the pointer is valid for the call.
+        unsafe { libc::clock_gettime(CLOCK, &raw mut now) };
+        now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +256,14 @@ mod test {
             assert_eq!(ptr.as_ptr().read(), 3);
             release(ptr, LEN);
         }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn the_clock_never_runs_backwards_and_keeps_real_time() {
+        let before = monotonic_ms();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let after = monotonic_ms();
+        assert!(after >= before + 25 && after <= before + 1000, "{before} then {after}");
     }
 }
