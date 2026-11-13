@@ -26,8 +26,8 @@ loom = "0.7"
 
 [dev-dependencies]
 mimalloc = "0.1"
-snmalloc-rs = "0.3"
-tikv-jemallocator = "0.6"
+snmalloc-rs = "0.7"
+tikv-jemallocator = "0.7"
 
 [[bench]]
 name = "system"
@@ -80,3 +80,11 @@ debug = "line-tables-only"
 
 [profile.bench]
 debug = "line-tables-only"
+
+# snmalloc-sys 0.7 builds snmalloc as a CMake Debug build at -O0 whenever its build script sees
+# debug info enabled, so the comparison builds it without debug info.
+[profile.release.package.snmalloc-sys]
+debug = false
+
+[profile.bench.package.snmalloc-sys]
+debug = false

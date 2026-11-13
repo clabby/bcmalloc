@@ -122,6 +122,10 @@ On Linux bcmalloc is the fastest on 11 of the 41 speed workloads and within 5% o
 
 The lock-free code is checked with loom, the unsafe code with Miri under strict provenance, and the allocator and its chunk bitmap with fuzz targets. `just` has a recipe for each, and `just --list` shows them all.
 
+## LLM Disclosure
+
+bcmalloc's implementation and design was aided by LLMs (namely Claude Opus 5.5 and OpenAI's Sol 6.1).
+
 ## License
 
 Licensed under the Apache License, Version 2.0.
