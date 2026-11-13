@@ -262,6 +262,21 @@ impl<'r> Harness<'r> {
         true
     }
 
+    /// Checks the structural invariants of every heap.
+    pub fn validate(&self) {
+        for heap in &self.heaps {
+            heap.validate();
+        }
+    }
+
+    /// Releases heap number `heap` (wrapping) and claims a slot again, which is the same one. The
+    /// new handle inherits the slabs and hot lists that the old one left behind.
+    pub fn recycle(&mut self, heap: usize) {
+        let slot = heap % self.heaps.len();
+        drop(self.heaps.remove(slot));
+        self.heaps.insert(slot, self.region.heap().expect("the released slot is free"));
+    }
+
     /// Flushes heap number `heap` (wrapping).
     pub fn flush(&self, heap: usize) {
         self.heaps[heap % self.heaps.len()].flush();
@@ -270,13 +285,16 @@ impl<'r> Harness<'r> {
     /// Frees everything, flushes every heap and checks that the region is whole again, which proves
     /// that nothing leaked and that all free memory coalesced.
     pub fn finish(mut self) {
+        self.validate();
         let mut round = 0;
         while self.free(round, 0) {
             round += 1;
         }
+        self.validate();
         for heap in &self.heaps {
             heap.flush();
         }
+        self.validate();
         let stats = self.region.stats();
         assert_eq!(stats.free, stats.capacity, "memory leaked or failed to coalesce");
     }
@@ -333,9 +351,9 @@ const fn random_size(rng: &mut Rng) -> usize {
 pub fn random_traffic(region: &Region<'_>, seed: u64, steps: usize) {
     let mut rng = Rng::new(seed);
     let mut harness = Harness::new(region, 3);
-    for _ in 0..steps {
+    for step in 0..steps {
         let heap = rng.below(3);
-        match rng.below(20) {
+        match rng.below(21) {
             0..=9 => {
                 let widest = if rng.below(8) == 0 { 17 } else { 5 };
                 let align = 1 << rng.below(widest);
@@ -347,7 +365,12 @@ pub fn random_traffic(region: &Region<'_>, seed: u64, steps: usize) {
             17..=18 => {
                 harness.realloc(heap, rng.below(1 << 20), random_size(&mut rng));
             }
-            _ => harness.flush(heap),
+            19 => harness.flush(heap),
+            _ => harness.recycle(heap),
+        }
+        // The check walks every list, which Miri does slowly, so it samples there.
+        if step % if cfg!(miri) { 32 } else { 8 } == 0 {
+            harness.validate();
         }
     }
     harness.finish();
@@ -367,8 +390,11 @@ pub fn run_ops(data: &[u8]) {
 
 /// Runs operations read from `bytes` until they run out.
 fn interpret(harness: &mut Harness<'_>, bytes: &mut impl Iterator<Item = usize>) -> Option<()> {
-    loop {
+    for step in 0_usize.. {
         let (op, heap) = (bytes.next()?, bytes.next()?);
+        if step % 4 == 0 {
+            harness.validate();
+        }
         match op % 16 {
             0..=7 => {
                 let limit = [256, 4 << 10, 600 << 10, 6 << 20][bytes.next()? % 4];
@@ -383,9 +409,11 @@ fn interpret(harness: &mut Harness<'_>, bytes: &mut impl Iterator<Item = usize>)
                     (bytes.next()? | bytes.next()? << 8 | bytes.next()? << 16) % (1 << 20) + 1;
                 harness.realloc(heap, bytes.next()? | bytes.next()? << 8, size);
             }
-            _ => harness.flush(heap),
+            14 => harness.flush(heap),
+            _ => harness.recycle(heap),
         }
     }
+    None
 }
 
 /// A plain reference implementation of the chunk allocator's contract, checked against the real

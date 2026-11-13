@@ -129,7 +129,7 @@ impl<'a> Region<'a> {
         // been used. Bounding it by `claimed_mark` instead would make concurrent claims race for
         // that one slot and fail although others are free.
         for (id, data) in self.heaps.iter().enumerate() {
-            if data.claim(id as u32) {
+            if data.claim(id as u32, self) {
                 self.claimed_mark.fetch_max(id + 1, Ordering::Release);
                 return Some(Heap::new(self, data));
             }
@@ -167,7 +167,7 @@ impl<'a> Region<'a> {
     pub fn trim(&self) {
         let claimed = self.claimed_mark.load(Ordering::Acquire);
         for (id, data) in self.heaps[..claimed].iter().enumerate() {
-            if data.claim(id as u32) {
+            if data.claim(id as u32, self) {
                 // SAFETY: we just claimed the slot.
                 unsafe { data.flush(self) };
                 data.release_claim();
@@ -205,6 +205,11 @@ impl<'a> Region<'a> {
     /// The descriptor stored for the slab whose first chunk is chunk `first`.
     pub(crate) const fn slab(&self, first: usize) -> &Slab {
         &self.slabs[first]
+    }
+
+    /// The first descriptor, with provenance over the whole table.
+    pub(crate) const fn slabs_ptr(&self) -> *const Slab {
+        self.slabs.as_ptr()
     }
 
     /// The address of chunk `index`.

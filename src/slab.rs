@@ -101,7 +101,7 @@ const EXTEND_BYTES: usize = 4096;
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct Block {
-    next: *mut Self,
+    pub(crate) next: *mut Self,
 }
 
 /// Which of the owner's slab lists a slab is on.
@@ -124,7 +124,8 @@ struct Local {
     next: Cell<*const Slab>,
     prev: Cell<*const Slab>,
     start: Cell<*mut u8>,
-    used: Cell<u32>,
+    free_len: Cell<u32>,
+    local_count: Cell<u32>,
     bumped: Cell<u32>,
     capacity: Cell<u32>,
     class: Cell<u8>,
@@ -173,7 +174,8 @@ impl Slab {
                 next: Cell::new(ptr::null()),
                 prev: Cell::new(ptr::null()),
                 start: Cell::new(ptr::null_mut()),
-                used: Cell::new(0),
+                free_len: Cell::new(0),
+                local_count: Cell::new(0),
                 bumped: Cell::new(0),
                 capacity: Cell::new(0),
                 class: Cell::new(0),
@@ -278,6 +280,34 @@ impl Slab {
     }
 }
 
+/// What [`Owned`] reports from inspect.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Inspection {
+    pub(crate) free: *mut Block,
+    pub(crate) local_free: *mut Block,
+    pub(crate) remote: *mut Block,
+    pub(crate) flags: usize,
+    pub(crate) free_len: u32,
+    pub(crate) local_count: u32,
+    pub(crate) bumped: u32,
+    pub(crate) capacity: u32,
+    pub(crate) start: *mut u8,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Inspection {
+    /// Whether the remote word carries the full mark.
+    pub(crate) const fn is_marked_full(&self) -> bool {
+        self.flags & FULL != 0
+    }
+
+    /// Whether the remote word records a pending notification.
+    pub(crate) const fn is_queued(&self) -> bool {
+        self.flags & QUEUED != 0
+    }
+}
+
 /// The owner-only half of a [`Slab`], obtained from [`Slab::owned`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Owned<'a>(&'a Slab);
@@ -304,7 +334,8 @@ impl<'a> Owned<'a> {
         local.next.set(ptr::null());
         local.prev.set(ptr::null());
         local.start.set(start);
-        local.used.set(0);
+        local.free_len.set(0);
+        local.local_count.set(0);
         local.bumped.set(0);
         local.capacity.set(class.blocks_per_slab() as u32);
         local.class.set(class.index() as u8);
@@ -323,9 +354,10 @@ impl<'a> Owned<'a> {
         self.local().start.get()
     }
 
-    /// How many blocks are handed out or waiting on the remote list.
+    /// How many blocks are handed out, held on a heap's hot list or waiting on the remote list.
     pub(crate) fn used(self) -> u32 {
-        self.local().used.get()
+        let local = self.local();
+        local.bumped.get() - local.free_len.get() - local.local_count.get()
     }
 
     /// The list this slab is on.
@@ -358,17 +390,12 @@ impl<'a> Owned<'a> {
         self.local().prev.set(prev);
     }
 
-    /// Pops a block off the free list, or returns null if it is empty.
-    pub(crate) fn pop(self) -> *mut Block {
+    /// Takes the whole free list, which is null if the slab has no free block. The blocks count as
+    /// used from now on, and the caller hands them out one at a time.
+    pub(crate) fn take_free(self) -> *mut Block {
         let local = self.local();
-        let block = local.free.get();
-        if !block.is_null() {
-            // SAFETY: every block on the free list is unused slab memory whose first word is a
-            // link.
-            local.free.set(unsafe { (*block).next });
-            local.used.set(local.used.get() + 1);
-        }
-        block
+        local.free_len.set(0);
+        local.free.replace(ptr::null_mut())
     }
 
     /// Frees a block from the owning thread.
@@ -381,7 +408,7 @@ impl<'a> Owned<'a> {
         // SAFETY: the caller has given us the block.
         unsafe { (*block).next = local.local_free.get() };
         local.local_free.set(block);
-        local.used.set(local.used.get() - 1);
+        local.local_count.set(local.local_count.get() + 1);
     }
 
     /// Folds the local and remote free lists into the free list, and returns whether it has
@@ -390,6 +417,7 @@ impl<'a> Owned<'a> {
         let local = self.local();
         if local.free.get().is_null() {
             local.free.set(local.local_free.replace(ptr::null_mut()));
+            local.free_len.set(local.local_count.replace(0));
         }
         let head = self.0.take_remote(clear);
         if !head.is_null() {
@@ -404,7 +432,7 @@ impl<'a> Owned<'a> {
                 (*tail).next = local.free.get();
             }
             local.free.set(head);
-            local.used.set(local.used.get() - count);
+            local.free_len.set(local.free_len.get() + count);
         }
         !local.free.get().is_null()
     }
@@ -431,6 +459,7 @@ impl<'a> Owned<'a> {
         }
         local.free.set(head);
         local.bumped.set((bumped + count) as u32);
+        local.free_len.set(local.free_len.get() + count as u32);
         true
     }
 
@@ -463,6 +492,24 @@ impl<'a> Owned<'a> {
         }
     }
 
+    /// A snapshot of everything the owner knows, for the consistency checks.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn inspect(self) -> Inspection {
+        let local = self.local();
+        let word = self.0.shared.remote.load(Ordering::Acquire);
+        Inspection {
+            free: local.free.get(),
+            local_free: local.local_free.get(),
+            remote: list(word),
+            flags: flags(word),
+            free_len: local.free_len.get(),
+            local_count: local.local_count.get(),
+            bumped: local.bumped.get(),
+            capacity: local.capacity.get(),
+            start: local.start.get(),
+        }
+    }
+
     /// Whether a notification about this slab is waiting to be processed.
     pub(crate) fn is_queued(self) -> bool {
         flags(self.0.shared.remote.load(Ordering::Acquire)) & QUEUED != 0
@@ -491,6 +538,8 @@ mod test {
     /// A slab of `class` over its own memory, with the descriptor initialised.
     struct Fixture {
         slab: Slab,
+        /// Stands in for the heap's hot list, which hands out the blocks of a refill.
+        hot: Cell<*mut Block>,
         _memory: Buffer,
     }
 
@@ -501,7 +550,7 @@ mod test {
             let slab = Slab::new();
             // SAFETY: the buffer is slab sized and aligned, and we are the only user of the slab.
             unsafe { slab.owned().init(7, class, memory.as_ptr()) };
-            Self { slab, _memory: memory }
+            Self { slab, hot: Cell::new(ptr::null_mut()), _memory: memory }
         }
 
         const fn owned(&self) -> Owned<'_> {
@@ -509,17 +558,31 @@ mod test {
             unsafe { self.slab.owned() }
         }
 
-        /// Pops blocks until the slab is exhausted, extending as needed.
-        fn exhaust(&self) -> Vec<*mut Block> {
+        /// Hands out the next block the way a heap does, refilling from the slab when its hot list
+        /// is empty. Returns null when the slab has nothing left.
+        fn pop(&self) -> *mut Block {
             let owned = self.owned();
+            if self.hot.get().is_null() {
+                if !(owned.collect(false) || owned.extend()) {
+                    return ptr::null_mut();
+                }
+                self.hot.set(owned.take_free());
+            }
+            let block = self.hot.get();
+            // SAFETY: blocks on the hot list are unused slab memory whose first word is a link.
+            self.hot.set(unsafe { (*block).next });
+            block
+        }
+
+        /// Pops blocks until the slab is exhausted.
+        fn exhaust(&self) -> Vec<*mut Block> {
             let mut blocks = Vec::new();
             loop {
-                let block = owned.pop();
-                if !block.is_null() {
-                    blocks.push(block);
-                } else if !owned.extend() {
+                let block = self.pop();
+                if block.is_null() {
                     return blocks;
                 }
+                blocks.push(block);
             }
         }
     }
@@ -535,7 +598,7 @@ mod test {
             assert_eq!(*block, start.wrapping_add(i * size).cast());
         }
         assert_eq!(fixture.owned().used() as usize, blocks.len());
-        assert!(fixture.owned().pop().is_null());
+        assert!(fixture.pop().is_null());
     }
 
     #[test]
@@ -549,8 +612,8 @@ mod test {
             owned.push_local(blocks[9]);
         }
         assert!(owned.collect(false));
-        assert_eq!((owned.pop(), owned.pop()), (blocks[9], blocks[3]));
-        assert!(owned.pop().is_null());
+        assert_eq!((fixture.pop(), fixture.pop()), (blocks[9], blocks[3]));
+        assert!(fixture.pop().is_null());
     }
 
     #[test]
@@ -567,7 +630,7 @@ mod test {
         assert_eq!(owned.used(), used, "pending remote frees still count as used");
         assert!(owned.collect(false));
         assert_eq!(owned.used(), used - 2);
-        assert_eq!((owned.pop(), owned.pop()), (blocks[1], blocks[0]));
+        assert_eq!((fixture.pop(), fixture.pop()), (blocks[1], blocks[0]));
     }
 
     #[test]
@@ -598,7 +661,7 @@ mod test {
         unsafe { assert!(fixture.slab.push_remote(blocks[0])) };
         assert!(owned.collect(true));
         assert!(!owned.is_queued());
-        assert!(owned.pop() == blocks[0]);
+        assert!(fixture.pop() == blocks[0]);
         assert!(owned.try_mark_full());
     }
 
@@ -656,7 +719,7 @@ mod test {
         let (zeroed, fresh) = unsafe { (slab.owned(), fresh.owned()) };
         assert_eq!(zeroed.used(), fresh.used());
         assert_eq!(zeroed.list(), List::None);
-        assert!(zeroed.pop().is_null());
+        assert!(zeroed.take_free().is_null());
         assert!(slab.shared.remote.load(Ordering::Relaxed).is_null());
     }
 }
@@ -692,11 +755,17 @@ mod loom_test {
             unsafe { owned.init(1, class, memory.as_ptr()) };
             let mut blocks = std::vec::Vec::new();
             loop {
-                let block = owned.pop();
-                if !block.is_null() {
+                let mut block = owned.take_free();
+                if block.is_null() {
+                    if !owned.extend() {
+                        break;
+                    }
+                    continue;
+                }
+                while !block.is_null() {
                     blocks.push(block);
-                } else if !owned.extend() {
-                    break;
+                    // SAFETY: the block is unused slab memory whose first word is a link.
+                    block = unsafe { (*block).next };
                 }
             }
             Arc::new(Self { slab, blocks, _memory: memory })
@@ -747,7 +816,7 @@ mod loom_test {
             assert_eq!(state.owner().is_queued(), notified);
             // The pushed block is never lost either way.
             assert!(state.owner().collect(true));
-            assert_eq!(state.owner().pop(), state.blocks[0]);
+            assert_eq!(state.owner().take_free(), state.blocks[0]);
         });
     }
 

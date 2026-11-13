@@ -43,6 +43,9 @@ pub const MAX_ALIGN: usize = CHUNK_SIZE;
 /// The largest block served from a slab. Bigger requests are huge allocations.
 pub const MAX_SMALL: usize = 512 << 10;
 
+/// Requests of up to this many bytes are classified by a table lookup.
+pub(crate) const TABLE_MAX: usize = 1024;
+
 /// The number of size classes.
 pub(crate) const CLASSES: usize = 104;
 
@@ -82,7 +85,31 @@ const BLOCK_SIZES: [u32; CLASSES] = {
     sizes
 };
 
+/// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
+const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
+    let mut table = [0; TABLE_MAX / MIN_ALIGN + 1];
+    let mut step = 0;
+    while step < table.len() {
+        table[step] = Class::for_size(step * MIN_ALIGN).0;
+        step += 1;
+    }
+    table
+};
+
 impl Class {
+    /// The class of a request that [`Class`::is_table_request] accepts.
+    #[inline(always)]
+    pub(crate) const fn from_table(size: usize) -> Self {
+        Self(TABLE[size.div_ceil(MIN_ALIGN)])
+    }
+
+    /// Whether the layout is small and aligned loosely enough to be classified by the table,
+    /// which is the common case and a single load.
+    #[inline(always)]
+    pub(crate) const fn is_table_request(layout: Layout) -> bool {
+        layout.size() <= TABLE_MAX && layout.align() <= MIN_ALIGN
+    }
+
     /// The class with table index `index`.
     pub(crate) const fn from_index(index: usize) -> Self {
         assert!(index < CLASSES);
@@ -177,6 +204,13 @@ mod test {
                 let smaller = Class::from_index(class.index() - 1);
                 assert!(smaller.block_size() < size, "{size} would fit {smaller:?}");
             }
+        }
+    }
+
+    #[test]
+    fn the_table_agrees_with_the_arithmetic() {
+        for size in 0..=TABLE_MAX {
+            assert_eq!(Class::from_table(size), Class::for_size(size), "{size}");
         }
     }
 

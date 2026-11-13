@@ -57,6 +57,7 @@ use core::{alloc::Layout, cell::Cell, fmt, marker::PhantomData, ptr, ptr::NonNul
 
 use crate::{
     cache::CacheLine,
+    chunks::CHUNK_SHIFT,
     region::Region,
     size_class::{CLASSES, Class, Request, classify},
     slab::{Block, List, Owned, Slab},
@@ -82,6 +83,14 @@ struct Private {
     _line: [CacheLine; 0],
     id: Cell<u32>,
     cursor: Cell<usize>,
+    /// The region this slot was claimed from, and its slab table, so that the fast paths reach
+    /// both without loading the region first. They are set at every claim and valid while the
+    /// claim lasts.
+    region: Cell<*const Region<'static>>,
+    base: Cell<*mut u8>,
+    slabs: Cell<*const Slab>,
+    /// For each class, blocks of the front active slab that the allocation fast path hands out.
+    hot: [Cell<*mut Block>; CLASSES],
     classes: [Lists; CLASSES],
 }
 
@@ -122,6 +131,10 @@ impl HeapData {
                 _line: [],
                 id: Cell::new(0),
                 cursor: Cell::new(0),
+                region: Cell::new(ptr::null()),
+                base: Cell::new(ptr::null_mut()),
+                slabs: Cell::new(ptr::null()),
+                hot: [const { Cell::new(ptr::null_mut()) }; CLASSES],
                 classes: [const {
                     Lists {
                         active: Cell::new(ptr::null()),
@@ -133,8 +146,8 @@ impl HeapData {
         }
     }
 
-    /// Tries to claim this slot as heap number `id`.
-    pub(crate) fn claim(&self, id: u32) -> bool {
+    /// Tries to claim this slot as heap number `id` of the region.
+    pub(crate) fn claim(&self, id: u32, region: &Region<'_>) -> bool {
         let won = !self.shared.claimed.load(Ordering::Relaxed) &&
             self.shared
                 .claimed
@@ -142,6 +155,9 @@ impl HeapData {
                 .is_ok();
         if won {
             self.private.id.set(id);
+            self.private.region.set(ptr::from_ref(region).cast());
+            self.private.base.set(region.chunk_ptr(0));
+            self.private.slabs.set(region.slabs_ptr());
         }
         won
     }
@@ -173,6 +189,246 @@ impl HeapData {
         }
     }
 
+    /// Allocates memory for the layout, returning null if the region is out of room or the layout
+    /// is not supported. Common requests take a table lookup and a pop from the hot list.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    #[inline(always)]
+    pub(crate) unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if Class::is_table_request(layout) {
+            let hot = &self.private.hot[Class::from_table(layout.size()).index()];
+            let block = hot.get();
+            if !block.is_null() {
+                // SAFETY: every block on a hot list is unused slab memory whose first word is a
+                // link.
+                hot.set(unsafe { (*block).next });
+                return block.cast();
+            }
+        }
+        // SAFETY: forwarded.
+        unsafe { self.alloc_general(layout) }
+    }
+
+    /// Allocates anything that the fast path in [`alloc`] does not take.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    #[inline(never)]
+    unsafe fn alloc_general(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        let Some(request) = classify(layout) else { return ptr::null_mut() };
+        let block = self.try_alloc(region, request);
+        if !block.is_null() {
+            return block;
+        }
+        // The region looks full, but this heap may be sitting on empty slabs. Give them back and
+        // retry.
+        // SAFETY: the caller holds the claim.
+        unsafe { self.flush(region) };
+        self.try_alloc(region, request)
+    }
+
+    /// Resizes a block, returning null and leaving the block untouched if there is no room.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, the block must be live with exactly the old
+    /// layout, and the new size must be non-zero and not overflow when rounded up to the
+    /// alignment.
+    pub(crate) unsafe fn realloc(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller guarantees the size is valid for the alignment.
+        let new = unsafe { Layout::from_size_align_unchecked(new_size, old.align()) };
+        if classify(old) == classify(new) {
+            return ptr.as_ptr();
+        }
+        // SAFETY: forwarded.
+        let block = unsafe { self.alloc(new) };
+        if block.is_null() {
+            return block;
+        }
+        // SAFETY: both blocks are live and distinct, and the smaller size fits in each.
+        unsafe {
+            ptr::copy_nonoverlapping(ptr.as_ptr(), block, old.size().min(new_size));
+            self.dealloc(ptr, old);
+        }
+        block
+    }
+
+    /// Checks every structural invariant of this heap and panics on a violation.
+    ///
+    /// It walks all lists, so it is for tests. Each slab's counters must match its lists, no block
+    /// may appear twice anywhere, the hot lists must hold blocks of their class's front active
+    /// slab, and the flags in the remote word must agree with the list the slab is on.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot and must not run it concurrently with remote
+    /// frees, which would change the remote lists under the walk.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) unsafe fn validate(&self) {
+        use std::collections::BTreeSet;
+
+        let mut seen = BTreeSet::new();
+        let mut claim = |block: *mut Block, what: &str| {
+            assert!(seen.insert(block.addr()), "block {block:p} appears twice, last on {what}");
+        };
+        for index in 0..CLASSES {
+            let class = Class::from_index(index);
+            let size = class.block_size();
+            let lists = &self.private.classes[index];
+            let mut slabs = [(List::Active, lists.active.get()), (List::Full, lists.full.get())];
+            let mut last = ptr::null();
+            for (list, head) in &mut slabs {
+                let mut prev: *const Slab = ptr::null();
+                let mut current = *head;
+                // SAFETY: slabs on our lists are ours.
+                while let Some(slab) = unsafe { current.as_ref() } {
+                    // SAFETY: as above.
+                    let owned = unsafe { slab.owned() };
+                    assert_eq!(owned.list(), *list, "slab is on the wrong list");
+                    assert_eq!(owned.class(), class, "slab is on the wrong class");
+                    assert!(ptr::eq(owned.prev(), prev), "broken back link");
+                    assert_eq!(slab.owner(), self.private.id.get(), "slab owned by another heap");
+                    let state = owned.inspect();
+                    match list {
+                        List::Active => assert!(!state.is_marked_full(), "active slab marked full"),
+                        _ => assert!(
+                            state.is_marked_full() || state.is_queued(),
+                            "full slab nobody will notify"
+                        ),
+                    }
+                    assert!(state.bumped <= state.capacity);
+                    assert!(
+                        state.free_len + state.local_count <= state.bumped,
+                        "more free blocks than blocks that were ever handed out"
+                    );
+                    let in_slab = |block: *mut Block| {
+                        let offset = block.addr().wrapping_sub(state.start.addr());
+                        offset % size == 0 && offset / size < state.bumped as usize
+                    };
+                    let mut walk = |mut block: *mut Block, expected: Option<u32>, what: &str| {
+                        let mut count = 0;
+                        while !block.is_null() {
+                            assert!(in_slab(block), "{what} holds a block outside its slab");
+                            claim(block, what);
+                            count += 1;
+                            // SAFETY: the block is unused slab memory whose first word is a link.
+                            block = unsafe { (*block).next };
+                        }
+                        if let Some(expected) = expected {
+                            assert_eq!(count, expected, "{what} length disagrees with its counter");
+                        }
+                        count
+                    };
+                    walk(state.free, Some(state.free_len), "the free list");
+                    walk(state.local_free, Some(state.local_count), "the local free list");
+                    let pending = walk(state.remote, None, "the remote list");
+                    assert!(
+                        pending <= state.bumped - state.free_len - state.local_count,
+                        "pending remote blocks must count as used"
+                    );
+                    prev = current;
+                    current = owned.next();
+                    last = prev;
+                }
+                if *list == List::Active {
+                    assert!(ptr::eq(lists.active_last.get(), prev), "wrong last active slab");
+                    last = ptr::null();
+                }
+            }
+            let _ = last;
+            let mut hot = self.private.hot[index].get();
+            if !hot.is_null() {
+                // SAFETY: slabs on our lists are ours.
+                let front = unsafe { lists.active.get().as_ref() }
+                    .expect("a hot list needs a front active slab");
+                // SAFETY: as above.
+                let state = unsafe { front.owned() }.inspect();
+                while !hot.is_null() {
+                    let offset = hot.addr().wrapping_sub(state.start.addr());
+                    assert!(
+                        offset % size == 0 && offset / size < state.bumped as usize,
+                        "hot block outside the front active slab"
+                    );
+                    claim(hot, "a hot list");
+                    // SAFETY: the block is unused slab memory whose first word is a link.
+                    hot = unsafe { (*hot).next };
+                }
+            }
+        }
+    }
+
+    /// The region this slot is claimed from.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    #[inline(always)]
+    unsafe fn region(&self) -> &Region<'_> {
+        // SAFETY: the claim was made on this region, which outlives every claim on its slots.
+        unsafe { &*self.private.region.get() }
+    }
+
+    fn try_alloc(&self, region: &Region<'_>, request: Request) -> *mut u8 {
+        match request {
+            // SAFETY: the caller of the public entry point holds the claim.
+            Request::Small(class) => unsafe { self.alloc_small(region, class) },
+            Request::Huge { chunks } => self.alloc_huge(region, chunks),
+        }
+    }
+
+    /// Frees a block.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, and the block must have been allocated from
+    /// this region with exactly the layout and not be used again.
+    #[inline(always)]
+    pub(crate) unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
+        if Class::is_table_request(layout) {
+            // Table classes have one-chunk slabs, so the chunk index is the slab index.
+            let index = (ptr.as_ptr().addr() - self.private.base.get().addr()) >> CHUNK_SHIFT;
+            // SAFETY: the block lies in the region, which has a descriptor for every chunk.
+            let slab = unsafe { &*self.private.slabs.get().add(index) };
+            if slab.owner() == self.private.id.get() {
+                // SAFETY: we own the slab and hold the claim, and the caller vouches for the
+                // block.
+                unsafe { self.free_local(slab.owned(), ptr.as_ptr().cast()) };
+            } else {
+                // SAFETY: the caller vouches for the block, and the claim keeps the region alive.
+                unsafe { self.region().free_remote(ptr, Class::from_table(layout.size())) };
+            }
+        } else {
+            // SAFETY: forwarded.
+            unsafe { self.dealloc_general(ptr, layout) };
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn dealloc_general(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        match classify(layout) {
+            Some(Request::Small(class)) => {
+                let slab = region.slab_of(ptr, class);
+                if slab.owner() == self.private.id.get() {
+                    // SAFETY: we own the slab and hold the claim, and the caller vouches for the
+                    // block.
+                    unsafe { self.free_local(slab.owned(), ptr.as_ptr().cast()) };
+                } else {
+                    // SAFETY: the caller vouches for the block.
+                    unsafe { region.free_remote(ptr, class) };
+                }
+            }
+            // SAFETY: forwarded.
+            _ => unsafe { region.dealloc(ptr, layout) },
+        }
+    }
+
     /// Allocates one block of `class`, returning null if the region is out of room.
     ///
     /// # Safety
@@ -180,19 +436,19 @@ impl HeapData {
     /// The caller must hold the claim on this slot.
     #[inline]
     pub(crate) unsafe fn alloc_small(&self, region: &Region<'_>, class: Class) -> *mut u8 {
-        // SAFETY: slabs on our lists are ours.
-        if let Some(slab) = unsafe { self.lists(class).active.get().as_ref() } {
-            // SAFETY: as above.
-            let block = unsafe { slab.owned() }.pop();
-            if !block.is_null() {
-                return block.cast();
-            }
+        let hot = &self.private.hot[class.index()];
+        let block = hot.get();
+        if !block.is_null() {
+            // SAFETY: every block on a hot list is unused slab memory whose first word is a link.
+            hot.set(unsafe { (*block).next });
+            return block.cast();
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_slow(region, class) }
     }
 
-    /// Everything the fast path cannot do.
+    /// Everything the fast path cannot do. Refills the hot list from the front active slab and
+    /// hands out its first block.
     #[cold]
     unsafe fn alloc_slow(&self, region: &Region<'_>, class: Class) -> *mut u8 {
         loop {
@@ -210,12 +466,12 @@ impl HeapData {
             };
             // SAFETY: as above.
             let slab = unsafe { slab.owned() };
-            let block = slab.pop();
-            if !block.is_null() {
-                return block.cast();
-            }
             if slab.collect(false) || slab.extend() {
-                continue;
+                let block = slab.take_free();
+                // SAFETY: the slab has free blocks, so the list is not empty, and its blocks are
+                // unused slab memory whose first word is a link.
+                self.private.hot[class.index()].set(unsafe { (*block).next });
+                return block.cast();
             }
             self.park_full(slab);
         }
@@ -292,22 +548,29 @@ impl HeapData {
     ///
     /// The caller must hold the claim, `slab` must be owned by this heap, and `block` must be an
     /// allocated block of `slab`.
-    pub(crate) unsafe fn free_local(
-        &self,
-        region: &Region<'_>,
-        slab: Owned<'_>,
-        block: *mut Block,
-    ) {
+    #[inline(always)]
+    pub(crate) unsafe fn free_local(&self, slab: Owned<'_>, block: *mut Block) {
         let was_full = slab.list() == List::Full;
         // SAFETY: forwarded.
         unsafe { slab.push_local(block) };
+        if was_full || slab.used() == 0 {
+            self.free_local_rare(slab, was_full);
+        }
+    }
+
+    /// The part of [`free_local`](Self::free_local) that changes which list a slab is on or gives
+    /// it back.
+    #[cold]
+    #[inline(never)]
+    fn free_local_rare(&self, slab: Owned<'_>, was_full: bool) {
         if was_full {
             // It has a free block again, so it belongs where allocation looks. A full slab holds
             // every block but this one, so it cannot be empty.
             slab.clear_full();
             self.move_to(slab, List::Active);
-        } else if slab.used() == 0 {
-            self.retire(region, slab);
+        } else {
+            // SAFETY: the caller of free_local holds the claim.
+            self.retire(unsafe { self.region() }, slab);
         }
     }
 
@@ -339,6 +602,8 @@ impl HeapData {
     /// The caller must hold the claim.
     pub(crate) unsafe fn flush(&self, region: &Region<'_>) {
         // SAFETY: forwarded.
+        unsafe { self.give_back_hot(region) };
+        // SAFETY: forwarded.
         unsafe { self.drain_notified(region) };
         for index in 0..CLASSES {
             let class = Class::from_index(index);
@@ -351,6 +616,29 @@ impl HeapData {
                     next = slab.next();
                     self.sweep(region, slab);
                 }
+            }
+        }
+    }
+
+    /// Returns the blocks on the hot lists to their slabs, which cannot be released while those
+    /// blocks count as in use.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    unsafe fn give_back_hot(&self, region: &Region<'_>) {
+        for (index, hot) in self.private.hot.iter().enumerate() {
+            let class = Class::from_index(index);
+            let mut block = hot.replace(ptr::null_mut());
+            let Some(first) = NonNull::new(block) else { continue };
+            // SAFETY: a hot list holds blocks of the front active slab, which is ours.
+            let slab = unsafe { region.slab_of(first.cast(), class).owned() };
+            while !block.is_null() {
+                // SAFETY: the block is unused slab memory whose first word is a link.
+                let next = unsafe { (*block).next };
+                // SAFETY: the block belongs to this slab and nobody is using it.
+                unsafe { slab.push_local(block) };
+                block = next;
             }
         }
     }
@@ -493,8 +781,8 @@ impl<'r> Heap<'r> {
     /// The memory is uninitialised. Zero-sized layouts are served like one-byte ones.
     #[inline]
     pub fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let request = classify(layout)?;
-        NonNull::new(self.try_alloc(request)).or_else(|| self.alloc_after_flush(request))
+        // SAFETY: this handle holds the claim.
+        NonNull::new(unsafe { self.data.alloc(layout) })
     }
 
     /// As [`alloc`](Self::alloc), but the memory is zeroed.
@@ -514,23 +802,8 @@ impl<'r> Heap<'r> {
     /// exactly `layout`, and must not be used or freed again.
     #[inline]
     pub unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
-        match classify(layout) {
-            Some(Request::Small(class)) => {
-                let slab = self.region.slab_of(ptr, class);
-                if slab.owner() == self.data.private.id.get() {
-                    // SAFETY: we own the slab, hold the claim, and the caller vouches for the
-                    // block.
-                    unsafe {
-                        self.data.free_local(self.region, slab.owned(), ptr.as_ptr().cast());
-                    }
-                } else {
-                    // SAFETY: forwarded.
-                    unsafe { self.region.free_remote(ptr, class) };
-                }
-            }
-            // SAFETY: forwarded.
-            _ => unsafe { self.region.dealloc(ptr, layout) },
-        }
+        // SAFETY: this handle holds the claim, and the caller vouches for the block.
+        unsafe { self.data.dealloc(ptr, layout) };
     }
 
     /// Resizes a block, returning `None` (and leaving the block untouched) if there is no room.
@@ -548,18 +821,24 @@ impl<'r> Heap<'r> {
         old: Layout,
         new_size: usize,
     ) -> Option<NonNull<u8>> {
-        // SAFETY: the caller guarantees the size is valid for the alignment.
-        let new = unsafe { Layout::from_size_align_unchecked(new_size, old.align()) };
-        if classify(old) == classify(new) {
-            return Some(ptr);
-        }
-        let block = self.alloc(new)?;
-        // SAFETY: both blocks are live and distinct, and the smaller size fits in each.
-        unsafe {
-            ptr::copy_nonoverlapping(ptr.as_ptr(), block.as_ptr(), old.size().min(new_size));
-            self.dealloc(ptr, old);
-        }
-        Some(block)
+        // SAFETY: this handle holds the claim, and the caller vouches for the block and size.
+        NonNull::new(unsafe { self.data.realloc(ptr, old, new_size) })
+    }
+
+    /// Checks the heap's structural invariants. See [`HeapData`::validate].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn validate(&self) {
+        // SAFETY: this handle holds the claim. Tests do not free remotely while it runs.
+        unsafe { self.data.validate() };
+    }
+
+    /// Gives up this handle without releasing the claim, which the caller takes over. The slot
+    /// stays claimed until [`release_claim`](HeapData::release_claim) is called on it.
+    #[cfg(all(feature = "std", not(loom)))]
+    pub(crate) const fn leak(self) -> &'r HeapData {
+        let data = self.data;
+        core::mem::forget(self);
+        data
     }
 
     /// Returns every empty slab of this heap to the region, so that other heaps (and large
@@ -567,23 +846,6 @@ impl<'r> Heap<'r> {
     pub fn flush(&self) {
         // SAFETY: this handle holds the claim.
         unsafe { self.data.flush(self.region) };
-    }
-
-    #[inline]
-    fn try_alloc(&self, request: Request) -> *mut u8 {
-        match request {
-            // SAFETY: this handle holds the claim.
-            Request::Small(class) => unsafe { self.data.alloc_small(self.region, class) },
-            Request::Huge { chunks } => self.data.alloc_huge(self.region, chunks),
-        }
-    }
-
-    /// The region looks full, but this heap may be sitting on empty slabs. Give them back and
-    /// retry.
-    #[cold]
-    fn alloc_after_flush(&self, request: Request) -> Option<NonNull<u8>> {
-        self.flush();
-        NonNull::new(self.try_alloc(request))
     }
 }
 
@@ -943,11 +1205,13 @@ mod test {
     fn an_all_zero_slot_is_an_unclaimed_heap() {
         // SAFETY: the claim under test. Miri verifies that no field is read while invalid.
         let data: HeapData = unsafe { MaybeUninit::zeroed().assume_init() };
+        let test = TestRegion::new(4, 1);
+        let region = test.region();
         assert!(!data.is_claimed());
-        assert!(data.claim(3));
-        assert!(!data.claim(4), "a claimed slot cannot be claimed again");
+        assert!(data.claim(3, &region));
+        assert!(!data.claim(4, &region), "a claimed slot cannot be claimed again");
         data.release_claim();
-        assert!(data.claim(5));
+        assert!(data.claim(5, &region));
     }
 
     #[test]
