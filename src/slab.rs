@@ -214,16 +214,31 @@ impl Slab {
     /// # Safety
     ///
     /// `block` must be an allocated block of this slab that the caller has just stopped using.
+    #[cfg(test)]
+    #[cfg(test)]
     pub(crate) unsafe fn push_remote(&self, block: *mut Block) -> bool {
+        // SAFETY: a single block is a chain whose head and tail are the same.
+        unsafe { self.push_remote_chain(block, block) }
+    }
+
+    /// Pushes a chain of blocks, linked from `head` to `tail`, with one compare-and-swap. Returns
+    /// whether the push turned the full mark into a notification, as `push_remote` does.
+    ///
+    /// # Safety
+    ///
+    /// Every block in the chain must be an allocated block of this slab that the caller has stopped
+    /// using, linked by their first words from `head` down to `tail`. The link of `tail` is
+    /// overwritten.
+    pub(crate) unsafe fn push_remote_chain(&self, head: *mut Block, tail: *mut Block) -> bool {
         let mut seen = self.shared.remote.load(Ordering::Relaxed);
         loop {
-            // SAFETY: the caller owns the block until the compare-and-swap below publishes it.
-            unsafe { (*block).next = list(seen) };
+            // SAFETY: the caller owns the chain until the compare-and-swap below publishes it.
+            unsafe { (*tail).next = list(seen) };
             let notify = flags(seen) & FULL != 0;
             let kept = if notify { QUEUED } else { flags(seen) & QUEUED };
             match self.shared.remote.compare_exchange_weak(
                 seen,
-                tagged(block, kept),
+                tagged(head, kept),
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
@@ -782,6 +797,17 @@ mod loom_test {
             // SAFETY: the block was handed out by `new` and each test frees it once.
             unsafe { self.slab.push_remote(self.blocks[index]) }
         }
+
+        /// Frees blocks `first` and `first + 1` together as one chain.
+        fn push_pair(&self, first: usize) -> bool {
+            let (head, tail) = (self.blocks[first], self.blocks[first + 1]);
+            // SAFETY: the blocks were handed out by `new`, each test frees them once, and the
+            // caller owns them until the push publishes the chain.
+            unsafe {
+                (*head).next = tail;
+                self.slab.push_remote_chain(head, tail)
+            }
+        }
     }
 
     #[test]
@@ -835,6 +861,40 @@ mod loom_test {
             assert_eq!(notifications, 1);
             assert!(state.owner().collect(true));
             assert_eq!(state.owner().used() as usize, state.blocks.len() - 2);
+        });
+    }
+
+    #[test]
+    fn racing_chains_are_collected_whole_with_one_notification() {
+        loom::model(|| {
+            let state = Exhausted::new();
+            assert!(state.owner().try_mark_full());
+            let pushers: std::vec::Vec<_> = [0, 2]
+                .into_iter()
+                .map(|first| {
+                    let state = state.clone();
+                    thread::spawn(move || usize::from(state.push_pair(first)))
+                })
+                .collect();
+            let notifications: usize = pushers.into_iter().map(|p| p.join().unwrap()).sum();
+            assert_eq!(notifications, 1);
+            assert!(state.owner().collect(true));
+            assert_eq!(state.owner().used() as usize, state.blocks.len() - 4);
+        });
+    }
+
+    #[test]
+    fn a_chain_and_the_owner_marking_full_never_lose_the_notification() {
+        loom::model(|| {
+            let state = Exhausted::new();
+            let pusher = {
+                let state = state.clone();
+                thread::spawn(move || state.push_pair(0))
+            };
+            let marked = state.owner().try_mark_full();
+            let notified = pusher.join().unwrap();
+            assert_eq!(marked, notified);
+            assert!(state.owner().collect(true) || !marked);
         });
     }
 }

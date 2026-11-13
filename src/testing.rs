@@ -291,8 +291,12 @@ impl<'r> Harness<'r> {
             round += 1;
         }
         self.validate();
-        for heap in &self.heaps {
-            heap.flush();
+        // The first round hands over what each heap still holds for the others, and the second
+        // lets every owner collect it.
+        for _ in 0..2 {
+            for heap in &self.heaps {
+                heap.flush();
+            }
         }
         self.validate();
         let stats = self.region.stats();

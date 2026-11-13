@@ -71,6 +71,24 @@ struct Lists {
     full: Cell<*const Slab>,
 }
 
+/// Blocks that a heap has freed into one slab of another heap and has not handed over yet.
+///
+/// They are linked from `head` to `tail` through their first words. Handing them over takes one
+/// atomic operation for the whole chain, where freeing them one by one takes one each, and the
+/// stores that link them can all be in flight at once because nothing waits for them.
+#[derive(Clone, Copy)]
+struct Batch {
+    slab: *const Slab,
+    head: *mut Block,
+    tail: *mut Block,
+    count: u32,
+}
+
+impl Batch {
+    const EMPTY: Self =
+        Self { slab: ptr::null(), head: ptr::null_mut(), tail: ptr::null_mut(), count: 0 };
+}
+
 /// What other threads touch in a heap slot, kept on a line of its own.
 struct Shared {
     _line: [CacheLine; 0],
@@ -91,6 +109,8 @@ struct Private {
     slabs: Cell<*const Slab>,
     /// For each class, blocks of the front active slab that the allocation fast path hands out.
     hot: [Cell<*mut Block>; CLASSES],
+    /// For each class, the blocks of one foreign slab that this heap has freed lately.
+    remote: [Cell<Batch>; CLASSES],
     classes: [Lists; CLASSES],
 }
 
@@ -135,6 +155,7 @@ impl HeapData {
                 base: Cell::new(ptr::null_mut()),
                 slabs: Cell::new(ptr::null()),
                 hot: [const { Cell::new(ptr::null_mut()) }; CLASSES],
+                remote: [const { Cell::new(Batch::EMPTY) }; CLASSES],
                 classes: [const {
                     Lists {
                         active: Cell::new(ptr::null()),
@@ -160,6 +181,18 @@ impl HeapData {
             self.private.slabs.set(region.slabs_ptr());
         }
         won
+    }
+
+    /// Hands over everything this heap still holds for other heaps and gives the slot up for
+    /// another thread to claim.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    pub(crate) unsafe fn give_up(&self) {
+        // SAFETY: forwarded.
+        unsafe { self.hand_over_all() };
+        self.release_claim();
     }
 
     /// Gives the slot up for another thread to claim.
@@ -341,6 +374,37 @@ impl HeapData {
                 }
             }
             let _ = last;
+            let held = self.private.remote[index].get();
+            if !held.slab.is_null() {
+                assert!(held.count >= 1 && held.count < class.batch_limit().max(2));
+                assert_ne!(
+                    // SAFETY: the slab is live because the batch's blocks are in use, and the
+                    // owner id is never written while it is.
+                    unsafe { (*held.slab).owner() },
+                    self.private.id.get(),
+                    "a batch holds blocks of another heap's slab"
+                );
+                // The slab belongs to another heap, whose private fields may be changing, so its
+                // extent comes from the position of its descriptor instead.
+                let index =
+                    (held.slab.addr() - self.private.slabs.get().addr()) / size_of::<Slab>();
+                let start = self.private.base.get().wrapping_add(index << CHUNK_SHIFT);
+                let mut block = held.head;
+                for position in 0..held.count {
+                    let offset = block.addr().wrapping_sub(start.addr());
+                    assert!(
+                        offset % size == 0 && offset / size < class.blocks_per_slab(),
+                        "batched block outside its slab"
+                    );
+                    claim(block, "a remote batch");
+                    if position + 1 == held.count {
+                        assert_eq!(block, held.tail, "the batch tail is not the last block");
+                    } else {
+                        // SAFETY: the block is ours and its first word links the batch.
+                        block = unsafe { (*block).next };
+                    }
+                }
+            }
             let mut hot = self.private.hot[index].get();
             if !hot.is_null() {
                 // SAFETY: slabs on our lists are ours.
@@ -359,6 +423,63 @@ impl HeapData {
                     hot = unsafe { (*hot).next };
                 }
             }
+        }
+    }
+
+    /// Frees a block of another heap's slab. The block joins the batch for its class, which is
+    /// handed over when it is full or when the next remote free of that class is for another slab.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the block must be a live block of `slab` that is freed
+    /// exactly once. The slab must belong to another heap.
+    #[inline(never)]
+    unsafe fn free_remote(&self, slab: &Slab, block: *mut Block, class: Class) {
+        let entry = &self.private.remote[class.index()];
+        let mut batch = entry.get();
+        if ptr::eq(batch.slab, slab) {
+            // SAFETY: the block is ours until the batch is handed over.
+            unsafe { (*block).next = batch.head };
+            batch.head = block;
+        } else {
+            // SAFETY: the claim keeps the region alive, and the batch holds blocks of one slab.
+            unsafe { self.hand_over(batch) };
+            batch = Batch { slab, head: block, tail: block, count: 0 };
+        }
+        batch.count += 1;
+        if batch.count >= class.batch_limit() {
+            // SAFETY: as above.
+            unsafe { self.hand_over(batch) };
+            batch = Batch::EMPTY;
+        }
+        entry.set(batch);
+    }
+
+    /// Pushes a batch onto its slab's remote list. An empty batch needs nothing.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the batch must hold blocks of one live slab that nobody
+    /// else is freeing.
+    unsafe fn hand_over(&self, batch: Batch) {
+        // SAFETY: a batch with blocks has a slab, which cannot be recycled while it has blocks
+        // that are still in use, and the caller holds the claim that keeps the region alive.
+        if let Some(slab) = unsafe { batch.slab.as_ref() } {
+            // SAFETY: the batch holds blocks of the slab, linked head to tail.
+            unsafe { self.region().free_remote_chain(slab, batch.head, batch.tail) };
+        }
+    }
+
+    /// Hands over every batch.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    unsafe fn hand_over_all(&self) {
+        for entry in &self.private.remote {
+            let batch = entry.replace(Batch::EMPTY);
+            // SAFETY: forwarded.
+            unsafe { self.hand_over(batch) };
         }
     }
 
@@ -400,7 +521,9 @@ impl HeapData {
                 unsafe { self.free_local(slab.owned(), ptr.as_ptr().cast()) };
             } else {
                 // SAFETY: the caller vouches for the block, and the claim keeps the region alive.
-                unsafe { self.region().free_remote(ptr, Class::from_table(layout.size())) };
+                unsafe {
+                    self.free_remote(slab, ptr.as_ptr().cast(), Class::from_table(layout.size()));
+                }
             }
         } else {
             // SAFETY: forwarded.
@@ -420,8 +543,9 @@ impl HeapData {
                     // block.
                     unsafe { self.free_local(slab.owned(), ptr.as_ptr().cast()) };
                 } else {
-                    // SAFETY: the caller vouches for the block.
-                    unsafe { region.free_remote(ptr, class) };
+                    // SAFETY: the caller vouches for the block, and the claim keeps the region
+                    // alive.
+                    unsafe { self.free_remote(slab, ptr.as_ptr().cast(), class) };
                 }
             }
             // SAFETY: forwarded.
@@ -601,6 +725,8 @@ impl HeapData {
     ///
     /// The caller must hold the claim.
     pub(crate) unsafe fn flush(&self, region: &Region<'_>) {
+        // SAFETY: forwarded.
+        unsafe { self.hand_over_all() };
         // SAFETY: forwarded.
         unsafe { self.give_back_hot(region) };
         // SAFETY: forwarded.
@@ -851,7 +977,8 @@ impl<'r> Heap<'r> {
 
 impl Drop for Heap<'_> {
     fn drop(&mut self) {
-        self.data.release_claim();
+        // SAFETY: this handle holds the claim.
+        unsafe { self.data.give_up() };
     }
 }
 
@@ -970,6 +1097,7 @@ mod test {
         let baseline = used(&region);
 
         free_all(&other, layout, blocks);
+        other.flush();
         let again = alloc_many(&owner, layout, 500);
         assert_eq!(used(&region), baseline, "the owner must recycle what the other heap freed");
         free_all(&owner, layout, again);
@@ -989,9 +1117,54 @@ mod test {
 
         // SAFETY: allocated by the owner with this layout and freed once.
         unsafe { other.dealloc(first[3], layout) };
+        other.flush();
         // Both slabs are full now, so the owner has to learn about the notification.
         assert_eq!(owner.alloc(layout), Some(first[3]));
         assert_eq!(used(&region), 2 * CHUNK_SIZE, "no third slab should be needed");
+    }
+
+    #[test]
+    fn remote_frees_are_held_back_until_a_batch_fills_moves_on_or_is_flushed() {
+        let test = TestRegion::new(128, 2);
+        let region = test.region();
+        let (owner, other) = (region.heap().unwrap(), region.heap().unwrap());
+        // 8 KiB blocks, so a slab holds eight and a batch of the class holds two.
+        let layout = layout(8192, 8);
+        let class = Class::for_size(8192);
+        assert_eq!(class.batch_limit(), 2);
+        let blocks = alloc_many(&owner, layout, 16);
+        let pending = |block: NonNull<u8>| {
+            // SAFETY: single-threaded test, so nothing else touches the owner's half.
+            unsafe { region.slab_of(block, class).owned() }.inspect().remote
+        };
+        let free = |block: NonNull<u8>| {
+            // SAFETY: the block is live, from this region, with this layout, and freed once.
+            unsafe { other.dealloc(block, layout) };
+        };
+        let batched = || other.data.private.remote[class.index()].get().count;
+
+        free(blocks[0]);
+        assert_eq!(batched(), 1);
+        assert!(pending(blocks[0]).is_null(), "a held back block is not visible to the owner yet");
+
+        // The second block fills the batch, so both blocks are handed over.
+        free(blocks[1]);
+        assert_eq!(batched(), 0);
+        assert!(!pending(blocks[0]).is_null());
+
+        // A block of another slab makes the heap hand over what it holds for the first.
+        free(blocks[2]);
+        assert_eq!(batched(), 1);
+        free(blocks[8]);
+        assert_eq!(batched(), 1, "the block of the second slab starts a new batch");
+        assert!(!pending(blocks[2]).is_null(), "the batch for the first slab was handed over");
+        assert!(pending(blocks[8]).is_null());
+
+        other.flush();
+        assert_eq!(batched(), 0);
+        assert!(!pending(blocks[8]).is_null());
+        owner.validate();
+        other.validate();
     }
 
     #[test]
@@ -1027,6 +1200,7 @@ mod test {
 
         // SAFETY: allocated by the owner with this layout and freed once.
         unsafe { other.dealloc(blocks[1], layout) };
+        other.flush();
         owner.data.park_full(slab);
         assert_eq!(slab.list(), List::Active);
         assert_eq!(owner.alloc(layout), Some(blocks[1]));

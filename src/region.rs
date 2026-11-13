@@ -237,9 +237,20 @@ impl<'a> Region<'a> {
     ///
     /// `ptr` must be a live block of this region of `class`, and must not be used again.
     pub(crate) unsafe fn free_remote(&self, ptr: NonNull<u8>, class: Class) {
-        let slab = self.slab_of(ptr, class);
+        let block = ptr.as_ptr().cast::<Block>();
+        // SAFETY: a single block is a chain whose head and tail are the same.
+        unsafe { self.free_remote_chain(self.slab_of(ptr, class), block, block) };
+    }
+
+    /// Frees a chain of blocks of `slab`, which the caller has linked from `head` to `tail`, by
+    /// pushing them onto the slab's remote list in one step.
+    ///
+    /// # Safety
+    ///
+    /// The blocks must satisfy the contract of `push_remote_chain` on the slab.
+    pub(crate) unsafe fn free_remote_chain(&self, slab: &Slab, head: *mut Block, tail: *mut Block) {
         // SAFETY: forwarded.
-        if unsafe { slab.push_remote(ptr.as_ptr().cast::<Block>()) } {
+        if unsafe { slab.push_remote_chain(head, tail) } {
             // We turned the slab's full mark into a notification. The slab cannot be recycled until
             // its owner processes that notification, so the descriptor is still ours to read.
             slab.enqueue(self.heaps[slab.owner() as usize].unfull());

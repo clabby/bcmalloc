@@ -85,6 +85,30 @@ const BLOCK_SIZES: [u32; CLASSES] = {
     sizes
 };
 
+/// How many bytes of freed blocks a heap holds back per class before handing them to their slab.
+const BATCH_BYTES: usize = 16 << 10;
+
+/// The most freed blocks a heap holds back per class.
+const BATCH_MAX: usize = 64;
+
+/// The batch limit of every class.
+const BATCH_LIMITS: [u8; CLASSES] = {
+    let mut limits = [0; CLASSES];
+    let mut index = 0;
+    while index < CLASSES {
+        let blocks = BATCH_BYTES / block_size_of(index);
+        limits[index] = if blocks < 1 {
+            1
+        } else if blocks > BATCH_MAX {
+            BATCH_MAX as u8
+        } else {
+            blocks as u8
+        };
+        index += 1;
+    }
+    limits
+};
+
 /// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
 const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
     let mut table = [0; TABLE_MAX / MIN_ALIGN + 1];
@@ -126,6 +150,12 @@ impl Class {
         let top_bit = (usize::BITS - 1 - below.leading_zeros()) as usize;
         let step = (below >> (top_bit - 3)) & 7;
         Self((8 + (top_bit - 7) * 8 + step) as u8)
+    }
+
+    /// How many freed blocks of this class a heap collects for one slab before it hands them over.
+    /// Big blocks are not worth holding back, and small ones are held in larger batches.
+    pub(crate) const fn batch_limit(self) -> u32 {
+        BATCH_LIMITS[self.0 as usize] as u32
     }
 
     /// The position of this class in per-heap tables.

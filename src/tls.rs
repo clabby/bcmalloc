@@ -89,7 +89,7 @@ unsafe extern "C" fn release_heap(value: *mut c_void) {
         return;
     }
     // SAFETY: only bind stores values under the key, and they are live heap slots.
-    unsafe { (*value.cast::<HeapData>()).release_claim() };
+    unsafe { (*value.cast::<HeapData>()).give_up() };
     slot::clear();
     EXITED.with(|exited| exited.set(true));
 }
