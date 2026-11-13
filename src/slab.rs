@@ -7,41 +7,48 @@
 //!
 //! ```text
 //!   slab memory, one size class (64-byte blocks here)
-//!   +-------+-------+-------+-------+-------+-------+-------+-------+--------------+
-//!   | block | block | block | block | block | block | block | block |  never used  |
-//!   +-------+-------+-------+-------+-------+-------+-------+-------+--------------+
-//!   0                                             bumped --^                capacity
+//!   +-------+-------+-------+-------+-------+-------+-------+-------+------
+//!   | block | block | block | block | block | block | block | block |  ...
+//!   +-------+-------+-------+-------+-------+-------+-------+-------+------
 //!
 //!   descriptor, owner only
-//!   +----------------------------------------+
-//!   | free -> block -> block -> block -> nil |
-//!   | free_len, bumped, capacity, class      |
-//!   | start, next, prev, list                |
-//!   +----------------------------------------+
+//!   +---------------------------------------------+
+//!   | free bitmap  0 1 1 0 0 0 1 0 ...            |  one bit per block, set while it is free
+//!   | free_len, capacity, cursor, class, list     |
+//!   | start, next, prev                           |
+//!   +---------------------------------------------+
 //! ```
 //!
 //! # Free blocks
 //!
-//! `free` is a list of blocks that came back to the slab, threaded through their first words, and
-//! the slab keeps its length so it never walks it to count. Blocks that have never been handed out
-//! are on no list. The `bumped` frontier marks how many blocks have been handed out so far,
-//! and refills take fresh blocks by arithmetic, so a new slab touches none of its memory until the
-//! program does.
+//! The descriptor keeps a bitmap with a bit for every block, set while the block is free. Taking a
+//! block back sets its bit, and a refill collects set bits a word at a time, lowest first, so a
+//! heap hands out a slab's free blocks in address order. Neither ever touches the memory of a
+//! block, which is what jemalloc does with its slab bitmaps. A list threaded through the free
+//! blocks would make a refill read every block in turn, each read waiting for the one before, and
+//! make every free write into a block whose cache line may be cold.
 //!
-//! A slab counts every block that is not on its free list and below the frontier as in use. That
-//! includes blocks sitting in a heap's bins or in a message on the way back, so a slab is only
-//! released when every block has really come home.
+//! A slab counts every block whose bit is clear as in use. That includes blocks sitting in a heap's
+//! bins or in a message on the way back, so a slab is only released when every block has really
+//! come home.
 
 use core::{cell::Cell, ptr};
 
 use crate::{cache::CacheLine, size_class::Class};
 
-/// A free block, seen as a link in an intrusive list. Blocks are at least 16 bytes.
+/// A free block seen as a link, which is how a single block travels to its owner's inbox. Blocks
+/// are at least 16 bytes.
 #[derive(Debug)]
 #[repr(C)]
 pub(crate) struct Block {
     pub(crate) next: *mut Self,
 }
+
+/// The most blocks a slab holds, which is a 64 KiB slab of 16-byte blocks.
+const MAX_BLOCKS: usize = 4096;
+
+/// The words of a slab's free bitmap.
+const BITMAP_WORDS: usize = MAX_BLOCKS / 64;
 
 /// Which of the owner's slab lists a slab is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +56,7 @@ pub(crate) struct Block {
 pub(crate) enum List {
     /// On neither list. This is an unused descriptor or a slab in the middle of a move.
     None = 0,
-    /// Has free blocks or may have, and refills draw from here.
+    /// Has free blocks, and refills draw from here.
     Active = 1,
     /// Every block is in use.
     Full = 2,
@@ -61,15 +68,16 @@ pub(crate) enum List {
 /// descriptors straight from zeroed memory.
 pub(crate) struct Slab {
     _line: [CacheLine; 0],
-    free: Cell<*mut Block>,
     next: Cell<*const Self>,
     prev: Cell<*const Self>,
     start: Cell<*mut u8>,
     free_len: Cell<u32>,
-    bumped: Cell<u32>,
     capacity: Cell<u32>,
+    /// No word of the bitmap below this one has a bit set.
+    cursor: Cell<u16>,
     class: Cell<u8>,
     list: Cell<List>,
+    bits: [Cell<u64>; BITMAP_WORDS],
 }
 
 impl core::fmt::Debug for Slab {
@@ -89,15 +97,15 @@ impl Slab {
     pub(crate) const fn new() -> Self {
         Self {
             _line: [],
-            free: Cell::new(ptr::null_mut()),
             next: Cell::new(ptr::null()),
             prev: Cell::new(ptr::null()),
             start: Cell::new(ptr::null_mut()),
             free_len: Cell::new(0),
-            bumped: Cell::new(0),
             capacity: Cell::new(0),
+            cursor: Cell::new(0),
             class: Cell::new(0),
             list: Cell::new(List::None),
+            bits: [const { Cell::new(0) }; BITMAP_WORDS],
         }
     }
 
@@ -112,17 +120,6 @@ impl Slab {
     }
 }
 
-/// What [`Owned::inspect`] reports.
-#[cfg(any(test, feature = "testing"))]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Inspection {
-    pub(crate) free: *mut Block,
-    pub(crate) free_len: u32,
-    pub(crate) bumped: u32,
-    pub(crate) capacity: u32,
-    pub(crate) start: *mut u8,
-}
-
 /// A descriptor in the hands of its owner, obtained from [`Slab::owned`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Owned<'a>(&'a Slab);
@@ -133,22 +130,28 @@ impl<'a> Owned<'a> {
         self.0
     }
 
-    /// Prepares an unused descriptor for a fresh slab of `class` whose first block is at `start`.
+    /// Prepares an unused descriptor for a fresh slab of `class` whose first block is at `start`,
+    /// with every block free.
     ///
     /// # Safety
     ///
     /// `start` must point to a slab-sized, suitably aligned region that nothing else uses.
     pub(crate) unsafe fn init(self, class: Class, start: *mut u8) {
         let slab = self.0;
-        slab.free.set(ptr::null_mut());
+        let capacity = class.blocks_per_slab();
+        debug_assert!(capacity <= MAX_BLOCKS);
         slab.next.set(ptr::null());
         slab.prev.set(ptr::null());
         slab.start.set(start);
-        slab.free_len.set(0);
-        slab.bumped.set(0);
-        slab.capacity.set(class.blocks_per_slab() as u32);
+        slab.free_len.set(capacity as u32);
+        slab.capacity.set(capacity as u32);
+        slab.cursor.set(0);
         slab.class.set(class.index() as u8);
         slab.list.set(List::None);
+        for (index, word) in slab.bits.iter().enumerate() {
+            let below = capacity.saturating_sub(index * 64);
+            word.set(if below >= 64 { u64::MAX } else { (1 << below) - 1 });
+        }
     }
 
     /// The size class of this slab's blocks.
@@ -163,12 +166,12 @@ impl<'a> Owned<'a> {
 
     /// How many blocks are handed out, held in bins or on their way back in messages.
     pub(crate) const fn used(self) -> u32 {
-        self.0.bumped.get() - self.0.free_len.get()
+        self.0.capacity.get() - self.0.free_len.get()
     }
 
     /// Whether every block is in use, so a refill can take nothing from this slab.
     pub(crate) const fn is_exhausted(self) -> bool {
-        self.0.free_len.get() == 0 && self.0.bumped.get() == self.0.capacity.get()
+        self.0.free_len.get() == 0
     }
 
     /// The list this slab is on.
@@ -202,71 +205,159 @@ impl<'a> Owned<'a> {
     }
 
     /// Takes a block back.
-    #[cfg(all(test, not(loom)))]
     ///
     /// # Safety
     ///
     /// `block` must be a block of this slab that is in use and that nobody will use again.
     pub(crate) unsafe fn push(self, block: *mut Block) {
-        let slab = self.0;
-        // SAFETY: the caller has given us the block.
-        unsafe { (*block).next = slab.free.get() };
-        slab.free.set(block);
-        slab.free_len.set(slab.free_len.get() + 1);
+        let mut returns = Returns::new(self);
+        // SAFETY: forwarded.
+        unsafe { returns.add(block) };
+        returns.finish();
     }
 
-    /// Takes back `count` blocks that the caller has linked from `head` to `tail`.
+    /// Hands up to `max` free blocks to `out`, lowest address first, and returns how many it handed
+    /// out.
+    pub(crate) fn take(self, max: usize, mut out: impl FnMut(*mut u8)) -> usize {
+        let slab = self.0;
+        let want = max.min(slab.free_len.get() as usize);
+        let (start, size) = (slab.start.get(), self.class().block_size());
+        let mut word = usize::from(slab.cursor.get());
+        let mut taken = 0;
+        while taken < want {
+            let mut bits = slab.bits[word].get();
+            if bits == u64::MAX && want - taken >= 64 {
+                // A word of fresh or wholly returned blocks needs no bit search.
+                // SAFETY: the 64 blocks of a full word lie in the slab.
+                let mut block = unsafe { start.add(word * 64 * size) };
+                for _ in 0..64 {
+                    out(block);
+                    block = block.wrapping_add(size);
+                }
+                slab.bits[word].set(0);
+                taken += 64;
+                word += 1;
+                continue;
+            }
+            while bits != 0 && taken < want {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                // SAFETY: a set bit stands for a block inside the slab.
+                out(unsafe { start.add(index * size) });
+                bits &= bits - 1;
+                taken += 1;
+            }
+            slab.bits[word].set(bits);
+            if bits == 0 {
+                word += 1;
+            }
+        }
+        slab.cursor.set(word.min(BITMAP_WORDS - 1) as u16);
+        slab.free_len.set(slab.free_len.get() - taken as u32);
+        taken
+    }
+
+    /// Checks that the bitmap agrees with the counters and has no bit set below the cursor or
+    /// past the last block, and returns how many blocks are free.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn check(self) -> usize {
+        let slab = self.0;
+        let capacity = slab.capacity.get() as usize;
+        let mut count = 0;
+        for (word, bits) in slab.bits.iter().enumerate() {
+            let bits = bits.get();
+            assert!(
+                bits == 0 || word >= usize::from(slab.cursor.get()),
+                "a free block sits below the cursor"
+            );
+            let valid = capacity.saturating_sub(word * 64);
+            if valid < 64 {
+                assert_eq!(bits >> valid, 0, "a bit past the last block is set");
+            }
+            count += bits.count_ones() as usize;
+        }
+        assert_eq!(count, slab.free_len.get() as usize, "free blocks disagree with the counter");
+        count
+    }
+
+    /// Whether `block`, a block of this slab, is free.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn is_free(self, block: *mut u8) -> bool {
+        let index = self.class().index_of(block.addr() - self.0.start.get().addr());
+        self.0.bits[index / 64].get() & 1 << (index % 64) != 0
+    }
+}
+
+/// Blocks being given back to one slab, with the bitmap word and the counter kept in registers
+/// until [`finish`](Self::finish), so that a run of returns does not wait on its own stores.
+pub(crate) struct Returns<'a> {
+    slab: Owned<'a>,
+    start: usize,
+    class: Class,
+    word: usize,
+    mask: u64,
+    count: u32,
+    lowest: usize,
+}
+
+impl<'a> Returns<'a> {
+    /// Starts giving blocks back to `slab`.
+    #[inline(always)]
+    pub(crate) fn new(slab: Owned<'a>) -> Self {
+        let lowest = usize::from(slab.0.cursor.get());
+        Self {
+            slab,
+            start: slab.start().addr(),
+            class: slab.class(),
+            word: 0,
+            mask: 0,
+            count: 0,
+            lowest,
+        }
+    }
+
+    /// The slab the blocks go to.
+    pub(crate) const fn slab(&self) -> Owned<'a> {
+        self.slab
+    }
+
+    /// Gives a block back.
     ///
     /// # Safety
     ///
-    /// The blocks must be blocks of this slab that are in use and that nobody will use again,
-    /// linked through their first words. The link of `tail` is overwritten.
-    pub(crate) unsafe fn push_chain(self, head: *mut Block, tail: *mut Block, count: u32) {
-        let slab = self.0;
-        // SAFETY: the caller has given us the blocks.
-        unsafe { (*tail).next = slab.free.get() };
-        slab.free.set(head);
-        slab.free_len.set(slab.free_len.get() + count);
+    /// `block` must be a block of the slab that is in use and that nobody will use again, and no
+    /// block may be given back twice.
+    #[inline(always)]
+    pub(crate) unsafe fn add(&mut self, block: *mut Block) {
+        let index = self.class.index_of(block.addr() - self.start);
+        let word = index / 64;
+        if word != self.word {
+            self.store();
+            self.word = word;
+        }
+        self.mask |= 1 << (index % 64);
+        self.count += 1;
     }
 
-    /// Hands up to `max` free blocks to `out` and returns how many it handed out. Blocks that
-    /// came back come first, then never-used blocks from the frontier, which are handed out from
-    /// the highest address down so that a stack that pops the last one first walks memory upwards.
-    pub(crate) fn take(self, max: usize, mut out: impl FnMut(*mut Block)) -> usize {
-        let slab = self.0;
-        let mut taken = 0;
-        let mut block = slab.free.get();
-        while taken < max && !block.is_null() {
-            out(block);
-            // SAFETY: blocks on the free list are unused memory whose first word is a link.
-            block = unsafe { (*block).next };
-            taken += 1;
+    /// Writes the pending bits of the current word.
+    #[inline(always)]
+    fn store(&mut self) {
+        if self.mask != 0 {
+            let bits = &self.slab.0.bits[self.word];
+            debug_assert_eq!(bits.get() & self.mask, 0, "a block came back twice");
+            bits.set(bits.get() | self.mask);
+            self.lowest = self.lowest.min(self.word);
+            self.mask = 0;
         }
-        slab.free.set(block);
-        slab.free_len.set(slab.free_len.get() - taken as u32);
-        let (bumped, capacity) = (slab.bumped.get() as usize, slab.capacity.get() as usize);
-        let fresh = (max - taken).min(capacity - bumped);
-        let size = self.class().block_size();
-        for index in (bumped..bumped + fresh).rev() {
-            // SAFETY: the block lies within the slab, because `capacity` blocks of `size` bytes
-            // fit.
-            out(unsafe { slab.start.get().add(index * size) }.cast());
-        }
-        slab.bumped.set((bumped + fresh) as u32);
-        taken + fresh
     }
 
-    /// A snapshot of the counters and the free list, for the consistency checks.
-    #[cfg(any(test, feature = "testing"))]
-    pub(crate) const fn inspect(self) -> Inspection {
-        let slab = self.0;
-        Inspection {
-            free: slab.free.get(),
-            free_len: slab.free_len.get(),
-            bumped: slab.bumped.get(),
-            capacity: slab.capacity.get(),
-            start: slab.start.get(),
-        }
+    /// Writes everything back to the descriptor and returns the slab.
+    #[inline(always)]
+    pub(crate) fn finish(mut self) -> Owned<'a> {
+        self.store();
+        let slab = self.slab.0;
+        slab.free_len.set(slab.free_len.get() + self.count);
+        slab.cursor.set(self.lowest as u16);
+        self.slab
     }
 }
 
@@ -284,6 +375,13 @@ mod test {
         let line = align_of::<CacheLine>();
         assert_eq!(align_of::<Slab>(), line);
         assert_eq!(size_of::<Slab>() % line, 0);
+    }
+
+    #[test]
+    fn the_bitmap_covers_the_fullest_slab() {
+        for index in 0..crate::size_class::CLASSES {
+            assert!(Class::from_index(index).blocks_per_slab() <= MAX_BLOCKS);
+        }
     }
 
     /// A slab of `class` over its own memory, with the descriptor initialised.
@@ -307,7 +405,7 @@ mod test {
             unsafe { self.slab.owned() }
         }
 
-        fn take(&self, max: usize) -> Vec<*mut Block> {
+        fn take(&self, max: usize) -> Vec<*mut u8> {
             let mut blocks = Vec::new();
             assert_eq!(self.owned().take(max, |block| blocks.push(block)), blocks.len());
             blocks
@@ -315,32 +413,33 @@ mod test {
     }
 
     #[test]
-    fn a_fresh_slab_yields_every_block_once_and_pops_upwards() {
-        let fixture = Fixture::new(1024);
-        let blocks = fixture.take(1000);
-        assert_eq!(blocks.len(), 64);
-        let mut sorted = blocks.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 64);
-        // The last block handed out is the lowest, so a stack pops them in address order.
-        assert!(blocks.windows(2).all(|pair| pair[0] > pair[1]));
-        assert!(fixture.owned().is_exhausted());
-        assert_eq!(fixture.owned().used(), 64);
-        assert!(fixture.take(1).is_empty());
+    fn a_fresh_slab_yields_every_block_once_in_address_order() {
+        for size in [16, 48, 1024, 3000, 100_000] {
+            let fixture = Fixture::new(size);
+            let capacity = Class::for_size(size).blocks_per_slab();
+            let blocks = fixture.take(usize::MAX);
+            assert_eq!(blocks.len(), capacity);
+            assert!(blocks.windows(2).all(|pair| pair[0] < pair[1]), "{size}");
+            assert!(fixture.owned().is_exhausted());
+            assert_eq!(fixture.owned().used(), capacity as u32);
+            assert!(fixture.take(1).is_empty());
+            assert_eq!(fixture.owned().check(), 0);
+        }
     }
 
     #[test]
-    fn returned_blocks_come_back_before_fresh_ones() {
+    fn returned_blocks_come_back_lowest_first() {
         let fixture = Fixture::new(256);
-        let first = fixture.take(4);
+        let first = fixture.take(200);
         // SAFETY: the blocks are in use and given back once.
-        unsafe { fixture.owned().push(first[1]) };
-        assert_eq!(fixture.owned().used(), 3);
-        let again = fixture.take(2);
-        assert_eq!(again[0], first[1], "a returned block is reused first");
-        assert!(!first.contains(&again[1]), "then the frontier moves on");
-        assert_eq!(fixture.owned().used(), 5);
+        unsafe {
+            fixture.owned().push(first[150].cast());
+            fixture.owned().push(first[3].cast());
+        }
+        assert_eq!(fixture.owned().used(), 198);
+        let again = fixture.take(3);
+        assert_eq!(again[..2], [first[3], first[150]]);
+        assert!(!first.contains(&again[2]), "then fresh blocks follow");
     }
 
     #[test]

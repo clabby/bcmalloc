@@ -86,7 +86,7 @@ use crate::{
     chunks::CHUNK_SHIFT,
     region::{Entry, Region},
     size_class::{BIN_SLOTS, CLASSES, Class, Request, classify},
-    slab::{Block, List, Owned, Slab},
+    slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
@@ -520,11 +520,15 @@ impl HeapData {
 
     /// Moves blocks from the active slabs of `class` into its bin, which must be empty, until the
     /// bin is half full. Returns how many it moved, which is zero only if the region is out of
-    /// room.
+    /// room. The blocks come out of each slab in address order, and the bin hands them out in
+    /// the same order.
     fn fill(&self, region: &Region<'_>, class: Class) -> usize {
         let bin = &self.private.bins[class.index()];
         let want = (class.bin_capacity() / 2).max(1);
-        let mut top = bin.top.get();
+        // The bin is empty, so its top is its end. Blocks are written upwards from `want` slots
+        // below the end, lowest address first, so that the bin hands them out in address order.
+        let end = bin.top.get();
+        let first = end.wrapping_sub(want);
         let mut got = 0;
         while got < want {
             // SAFETY: slabs on our lists are ours.
@@ -537,14 +541,20 @@ impl HeapData {
             };
             // SAFETY: as above.
             let slab = unsafe { slab.owned() };
+            let mut slot = first.wrapping_add(got);
             got += slab.take(want - got, |block| {
-                top = top.wrapping_sub(1);
-                // SAFETY: the bin was empty and takes at most half its capacity.
-                unsafe { *top = block };
+                // SAFETY: the slot lies in the bin, below its end.
+                unsafe { *slot = block.cast() };
+                slot = slot.wrapping_add(1);
             });
             if slab.is_exhausted() {
                 self.move_to(slab, List::Full);
             }
+        }
+        let top = end.wrapping_sub(got);
+        if got < want {
+            // SAFETY: both ranges lie in the bin.
+            unsafe { ptr::copy(first, top, got) };
         }
         bin.top.set(top);
         got
@@ -694,7 +704,7 @@ impl HeapData {
 
     /// Gives blocks of `class` that this heap holds back: blocks of its own slabs to the slab, and
     /// the others to their owners, through the outboxes or, if `directly`, on their own. Blocks
-    /// that follow each other in one slab go back as one chain, which looks the slab up once.
+    /// that follow each other in one slab look the slab up once.
     ///
     /// # Safety
     ///
@@ -709,20 +719,17 @@ impl HeapData {
     ) {
         let id = self.private.id.get();
         let span = class.slab_chunks() << CHUNK_SHIFT;
-        let mut run: Option<Owned<'_>> = None;
-        let (mut head, mut tail, mut count) = (ptr::null_mut::<Block>(), ptr::null_mut(), 0);
+        let mut run: Option<Returns<'_>> = None;
         for &block in blocks {
-            if let Some(slab) = run {
-                if block.addr().wrapping_sub(slab.start().addr()) < span {
-                    // SAFETY: the block is ours to give back, and the chain is ours to build.
-                    unsafe { (*block).next = head };
-                    head = block;
-                    count += 1;
+            if let Some(returns) = &mut run {
+                if block.addr().wrapping_sub(returns.slab().start().addr()) < span {
+                    // SAFETY: the block is an in-use block of the slab, given up.
+                    unsafe { returns.add(block) };
                     continue;
                 }
-                // SAFETY: the chain holds `count` blocks of the slab from `head` to `tail`.
-                unsafe { self.return_chain(region, slab, head, tail, count) };
-                run = None;
+                if let Some(returns) = run.take() {
+                    self.settle(region, returns.finish());
+                }
             }
             let owner = self.entry_of(block.cast()).owner();
             if owner != id {
@@ -736,34 +743,20 @@ impl HeapData {
                 continue;
             }
             // SAFETY: the chunk map says the slab is ours.
-            run = Some(unsafe {
-                region.slab_of(NonNull::new_unchecked(block.cast()), class).owned()
-            });
-            (head, tail, count) = (block, block, 1);
+            let slab =
+                unsafe { region.slab_of(NonNull::new_unchecked(block.cast()), class).owned() };
+            let mut returns = Returns::new(slab);
+            // SAFETY: the block is in use and given up.
+            unsafe { returns.add(block) };
+            run = Some(returns);
         }
-        if let Some(slab) = run {
-            // SAFETY: as above.
-            unsafe { self.return_chain(region, slab, head, tail, count) };
+        if let Some(returns) = run {
+            self.settle(region, returns.finish());
         }
     }
 
-    /// Returns a chain of blocks to one of this heap's slabs, and moves or releases the slab as
-    /// its occupancy says.
-    ///
-    /// # Safety
-    ///
-    /// The caller must hold the claim, and the chain must hold `count` in-use blocks of the slab,
-    /// linked from `head` to `tail`, which are given up.
-    unsafe fn return_chain(
-        &self,
-        region: &Region<'_>,
-        slab: Owned<'_>,
-        head: *mut Block,
-        tail: *mut Block,
-        count: u32,
-    ) {
-        // SAFETY: forwarded.
-        unsafe { slab.push_chain(head, tail, count) };
+    /// Moves or releases a slab that has just taken blocks back, as its occupancy says.
+    fn settle(&self, region: &Region<'_>, slab: Owned<'_>) {
         if slab.list() == List::Full {
             // It has free blocks again, so it belongs where refills look.
             self.move_to(slab, List::Active);
@@ -781,10 +774,13 @@ impl HeapData {
     /// The caller must hold the claim, and the block must be an in-use block of one of this heap's
     /// slabs of `class`, which is given up.
     unsafe fn free_to_slab(&self, region: &Region<'_>, block: *mut Block, class: Class) {
-        // SAFETY: the chunk map says the slab is ours.
-        let slab = unsafe { region.slab_of(NonNull::new_unchecked(block.cast()), class).owned() };
-        // SAFETY: a single block is a chain whose head and tail are the same.
-        unsafe { self.return_chain(region, slab, block, block, 1) };
+        // SAFETY: the chunk map says the slab is ours, and the caller gives the block up.
+        let slab = unsafe {
+            let slab = region.slab_of(NonNull::new_unchecked(block.cast()), class).owned();
+            slab.push(block);
+            slab
+        };
+        self.settle(region, slab);
     }
 
     /// Appends a block of another heap's slab to the outbox for that heap.
@@ -1111,11 +1107,19 @@ impl HeapData {
                     offset / class.block_size() < class.blocks_per_slab(),
                 "{what} holds a pointer that is not a block of its slab"
             );
+            if entry.owner() == id {
+                // SAFETY: the slab is ours.
+                let slab =
+                    unsafe { region.slab_of(NonNull::new_unchecked(block.cast()), class).owned() };
+                assert!(
+                    !slab.is_free(block.cast()),
+                    "{what} holds a block its slab counts as free"
+                );
+            }
             entry
         };
         for index in 0..CLASSES {
             let class = Class::from_index(index);
-            let size = class.block_size();
             let lists = &self.private.classes[index];
             for (list, head) in [(List::Active, lists.active.get()), (List::Full, lists.full.get())]
             {
@@ -1135,26 +1139,7 @@ impl HeapData {
                         list == List::Full,
                         "a slab with free blocks must be active and an exhausted one full"
                     );
-                    let state = owned.inspect();
-                    assert!(state.bumped <= state.capacity);
-                    assert!(state.free_len <= state.bumped);
-                    let mut block = state.free;
-                    let mut count = 0;
-                    while !block.is_null() {
-                        let offset = block.addr().wrapping_sub(state.start.addr());
-                        assert!(
-                            offset.is_multiple_of(size) && offset / size < state.bumped as usize,
-                            "the free list holds a block outside its slab"
-                        );
-                        claim(block, "a free list");
-                        count += 1;
-                        // SAFETY: the block is unused slab memory whose first word is a link.
-                        block = unsafe { (*block).next };
-                    }
-                    assert_eq!(
-                        count, state.free_len,
-                        "free list length disagrees with its counter"
-                    );
+                    owned.check();
                     prev = current;
                     current = owned.next();
                 }

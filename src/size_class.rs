@@ -118,8 +118,32 @@ const BIN_STARTS: ([u16; CLASSES], usize) = {
     (starts, total)
 };
 
+/// The capacity of each class's bin, as a table so that it costs a load and not a division.
+const BIN_CAPACITIES: [u16; CLASSES] = {
+    let mut capacities = [0; CLASSES];
+    let mut i = 0;
+    while i < CLASSES {
+        capacities[i] = bin_capacity_of(i) as u16;
+        i += 1;
+    }
+    capacities
+};
+
 /// The number of block pointers in all the bins of one heap.
 pub(crate) const BIN_SLOTS: usize = BIN_STARTS.1;
+
+/// For each class, a multiplier that divides an offset into a slab by the block size, as jemalloc
+/// divides by bin sizes. With `m = ceil(2^32 / size)`, `(offset * m) >> 32` is exact for every
+/// multiple of `size` below 2^32 / size * size, and slabs are at most 4 MiB.
+const RECIPROCALS: [u64; CLASSES] = {
+    let mut table = [0; CLASSES];
+    let mut i = 0;
+    while i < CLASSES {
+        table[i] = (1_u64 << 32).div_ceil(block_size_of(i) as u64);
+        i += 1;
+    }
+    table
+};
 
 /// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
 const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
@@ -166,7 +190,7 @@ impl Class {
 
     /// How many block pointers the bin of this class holds.
     pub(crate) const fn bin_capacity(self) -> usize {
-        bin_capacity_of(self.0 as usize)
+        BIN_CAPACITIES[self.0 as usize] as usize
     }
 
     /// Where the bin of this class starts in a heap's slot array.
@@ -195,6 +219,12 @@ impl Class {
     /// The size of every block of this class.
     pub(crate) const fn block_size(self) -> usize {
         BLOCK_SIZES[self.0 as usize] as usize
+    }
+
+    /// The index of the block that starts `offset` bytes into a slab of this class, without a
+    /// division. `offset` must be a multiple of the block size inside the slab.
+    pub(crate) const fn index_of(self, offset: usize) -> usize {
+        ((offset as u64 * RECIPROCALS[self.0 as usize]) >> 32) as usize
     }
 
     /// How many chunks one slab of this class spans, which is 1, 8 or 64. Slabs are aligned to this
@@ -292,6 +322,16 @@ mod test {
                     class.block_size() * 8 <= worst * 9,
                     "{class:?} wastes too much on {worst}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn index_of_divides_every_block_offset_exactly() {
+        for i in 0..CLASSES {
+            let class = Class::from_index(i);
+            for index in 0..class.blocks_per_slab() {
+                assert_eq!(class.index_of(index * class.block_size()), index, "{class:?}");
             }
         }
     }

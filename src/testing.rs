@@ -281,6 +281,18 @@ impl<'r> Harness<'r> {
         for heap in &self.heaps {
             heap.validate_into(&mut seen);
         }
+        // Huge blocks are runs of chunks and not blocks of a slab.
+        for block in &self.live {
+            if block.layout.size() > crate::MAX_SMALL {
+                seen.remove(&block.ptr.as_ptr().addr());
+            }
+        }
+        for &addr in &seen {
+            let block = NonNull::new(self.region.chunk_ptr(0).with_addr(addr)).expect("a block");
+            // SAFETY: the harness drives every heap from this thread, and none is in use now.
+            let free = unsafe { self.region.is_free_block(block) };
+            assert!(!free, "a block that is live or held is also free in its slab");
+        }
     }
 
     /// Releases heap number `heap` (wrapping) and claims a slot again, which is the same one. The

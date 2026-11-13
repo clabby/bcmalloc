@@ -376,6 +376,18 @@ impl<'a> Region<'a> {
         self.slab(self.chunk_index(ptr.as_ptr()) & !(class.slab_chunks() - 1))
     }
 
+    /// Whether `ptr`, a block of a slab, is free in its slab's bitmap.
+    ///
+    /// # Safety
+    ///
+    /// No thread may be using the heap that owns the slab, because this reads its descriptor.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) unsafe fn is_free_block(&self, ptr: NonNull<u8>) -> bool {
+        let class = self.entry(self.chunk_index(ptr.as_ptr())).class();
+        // SAFETY: forwarded.
+        unsafe { self.slab_of(ptr, class).owned() }.is_free(ptr.as_ptr())
+    }
+
     /// The heap slot with id `id`.
     pub(crate) const fn heap_slot(&self, id: u32) -> &HeapData {
         &self.heaps[id as usize]
