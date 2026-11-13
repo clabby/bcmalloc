@@ -59,7 +59,7 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unnameable_types = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(cwmalloc_portable_tls)"] }
 
 [lints.rustdoc]
 all = "warn"

@@ -7,22 +7,20 @@
 //!    alloc(layout)
 //!         |
 //!         v
-//!    region initialised? --no--> reserve and set up the region (one thread wins, the rest unmap)
-//!         | yes
-//!         v
-//!    this thread has a heap? --no--> claim one and keep it in thread-local storage
-//!         | yes
-//!         v
-//!    Heap::alloc(layout)  ... the fast path, no atomics
+//!    read this thread's heap from its slot (see the tls module)
+//!         |
+//!         +-- found ---> table lookup, then pop the hot list ... the fast path, no atomics
+//!         |
+//!         +-- empty ---> reserve the region if this is the first call, claim a heap,
+//!                        bind it to the thread, and allocate from it
 //! ```
 //!
 //! # Thread start-up and teardown
 //!
-//! Thread-local storage in `std` never allocates, which is what makes it safe to use from inside an
-//! allocator. The heap lives in a thread-local with a destructor, so a thread's heap goes back to
-//! the pool when the thread exits. Other destructors may still allocate or free after that one
-//! has run, and thread-local access fails at that point. Frees fall back to
-//! [`Region::dealloc`], and allocations borrow a heap for just that one call.
+//! A thread binds its heap on its first allocation or free, and a key destructor releases the
+//! heap when the thread exits. Other destructors may still allocate or free after that one has
+//! run. At that point the slot is empty and the thread is marked as gone, so frees fall back to
+//! [`Region`::dealloc] and allocations borrow a heap for just that one call.
 //!
 //! # Failure
 //!
@@ -32,24 +30,22 @@
 
 use core::{
     alloc::{GlobalAlloc, Layout},
-    cell::OnceCell,
     ptr::{self, NonNull},
 };
 
 use crate::{
     config::Config,
-    heap::Heap,
+    heap::{Heap, HeapData},
     region::{Error, Mapping, Region, Stats},
-    sync::{AtomicPtr, Ordering},
+    sync::{AtomicPtr, AtomicUsize, Ordering},
+    tls,
 };
 
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
 const MIN_CAPACITY: usize = 256 << 20;
 
-thread_local! {
-    /// This thread's heap, claimed on first use and released when the thread exits.
-    static HEAP: OnceCell<Heap<'static>> = const { OnceCell::new() };
-}
+/// The value of [`Cwmalloc`] key field before the key exists.
+const NO_KEY: usize = usize::MAX;
 
 /// A global allocator that reserves its memory up front.
 ///
@@ -84,6 +80,8 @@ thread_local! {
 pub struct Cwmalloc {
     config: Config,
     region: AtomicPtr<Region<'static>>,
+    /// The thread-specific key under which threads keep their heap, or `NO_KEY`.
+    key: AtomicUsize,
 }
 
 impl Cwmalloc {
@@ -94,7 +92,7 @@ impl Cwmalloc {
 
     /// An allocator with the given configuration.
     pub const fn with_config(config: Config) -> Self {
-        Self { config, region: AtomicPtr::new(ptr::null_mut()) }
+        Self { config, region: AtomicPtr::new(ptr::null_mut()), key: AtomicUsize::new(NO_KEY) }
     }
 
     /// The configuration the region was or will be created with.
@@ -163,25 +161,87 @@ impl Default for Cwmalloc {
     }
 }
 
-/// Runs `f` with this thread's heap, claiming one if needed.
-///
-/// Returns `None` when the thread has no usable heap, which happens during thread teardown, when
-/// every heap is taken, or when the thread's heap belongs to a different region.
-#[inline]
-fn with_heap<R>(
-    region: &'static Region<'static>,
-    f: impl FnOnce(&Heap<'static>) -> R,
-) -> Option<R> {
-    HEAP.try_with(|cell| {
-        if cell.get().is_none() {
-            if let Some(heap) = region.heap() {
-                let _ = cell.set(heap);
+impl Cwmalloc {
+    /// This thread's heap, or null if it has not bound one.
+    #[inline(always)]
+    fn thread_heap(&self) -> *const HeapData {
+        let key = self.key.load(Ordering::Relaxed);
+        if key == NO_KEY { ptr::null() } else { tls::get(key) }
+    }
+
+    /// The key under which threads bind their heap, created on first use.
+    fn key(&self) -> Option<usize> {
+        let key = self.key.load(Ordering::Relaxed);
+        if key != NO_KEY {
+            return Some(key);
+        }
+        let created = tls::create_key()?;
+        match self.key.compare_exchange(NO_KEY, created, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => Some(created),
+            // Another thread created the key first. Ours has no users.
+            Err(existing) => {
+                tls::delete_key(created);
+                Some(existing)
             }
         }
-        cell.get().filter(|heap| ptr::eq(heap.region(), region)).map(f)
-    })
-    .ok()
-    .flatten()
+    }
+
+    /// Claims a heap for this thread and binds it, or returns None if the thread is exiting, no
+    /// heap is free or the system has no key to give.
+    #[cold]
+    fn bind(&self, region: &'static Region<'static>) -> Option<&'static HeapData> {
+        if tls::exiting() {
+            return None;
+        }
+        let key = self.key()?;
+        let data = region.heap()?.leak();
+        tls::bind(key, data);
+        Some(data)
+    }
+
+    /// Allocates for a thread that has no heap yet.
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_unbound(&self, layout: Layout) -> *mut u8 {
+        let Some(region) = self.region() else { return ptr::null_mut() };
+        if let Some(data) = self.bind(region) {
+            // SAFETY: binding claimed the heap for this thread.
+            return unsafe { data.alloc(layout) };
+        }
+        region.heap().and_then(|heap| heap.alloc(layout)).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    /// Frees for a thread that has no heap yet.
+    #[cold]
+    #[inline(never)]
+    unsafe fn dealloc_unbound(&self, ptr: NonNull<u8>, layout: Layout) {
+        let Some(region) = self.existing() else { return };
+        if let Some(data) = self.bind(region) {
+            // SAFETY: binding claimed the heap for this thread, and the caller vouches for the
+            // block.
+            unsafe { data.dealloc(ptr, layout) };
+        } else {
+            // SAFETY: as above.
+            unsafe { region.dealloc(ptr, layout) };
+        }
+    }
+
+    /// Resizes for a thread that has no heap yet.
+    #[cold]
+    #[inline(never)]
+    unsafe fn realloc_unbound(&self, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> *mut u8 {
+        let Some(region) = self.existing() else { return ptr::null_mut() };
+        if let Some(data) = self.bind(region) {
+            // SAFETY: binding claimed the heap for this thread, and the caller vouches for the
+            // block and the size.
+            return unsafe { data.realloc(ptr, layout, new_size) };
+        }
+        let resize = |heap: &Heap<'_>| {
+            // SAFETY: the caller vouches for the block and the size.
+            unsafe { heap.realloc(ptr, layout, new_size) }
+        };
+        region.heap().and_then(|heap| resize(&heap)).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
 }
 
 // SAFETY: every method forwards to a heap or region of the allocator, which return blocks that
@@ -189,37 +249,39 @@ fn with_heap<R>(
 unsafe impl GlobalAlloc for Cwmalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let Some(region) = self.region() else { return ptr::null_mut() };
-        let block = with_heap(region, |heap| heap.alloc(layout))
-            .unwrap_or_else(|| region.heap().and_then(|heap| heap.alloc(layout)));
-        block.map_or(ptr::null_mut(), NonNull::as_ptr)
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
+            // SAFETY: as above.
+            return unsafe { data.alloc(layout) };
+        }
+        // SAFETY: forwarded.
+        unsafe { self.alloc_unbound(layout) }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let (Some(region), Some(ptr)) = (self.existing(), NonNull::new(ptr)) else { return };
-        let freed = with_heap(region, |heap| {
+        // SAFETY: the caller guarantees the block is live, so it is not null.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        match unsafe { self.thread_heap().as_ref() } {
             // SAFETY: the caller guarantees the block came from this allocator with this layout.
-            unsafe { heap.dealloc(ptr, layout) }
-        });
-        if freed.is_none() {
+            Some(data) => unsafe { data.dealloc(ptr, layout) },
             // SAFETY: as above.
-            unsafe { region.dealloc(ptr, layout) };
+            None => unsafe { self.dealloc_unbound(ptr, layout) },
         }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let (Some(region), Some(block)) = (self.existing(), NonNull::new(ptr)) else {
-            return ptr::null_mut();
-        };
-        let resize = |heap: &Heap<'_>| {
+        // SAFETY: the caller guarantees the block is live, so it is not null.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        // SAFETY: a thread's bound heap is claimed by that thread alone.
+        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
             // SAFETY: the caller guarantees the block is live with this layout and that the new
             // size is valid for the alignment.
-            unsafe { heap.realloc(block, layout, new_size) }
-        };
-        let resized = with_heap(region, resize)
-            .unwrap_or_else(|| region.heap().and_then(|heap| resize(&heap)));
-        resized.map_or(ptr::null_mut(), NonNull::as_ptr)
+            return unsafe { data.realloc(ptr, layout, new_size) };
+        }
+        // SAFETY: as above.
+        unsafe { self.realloc_unbound(ptr, layout, new_size) }
     }
 }

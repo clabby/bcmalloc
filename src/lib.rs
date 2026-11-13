@@ -18,6 +18,8 @@ mod sync;
 mod sys;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+#[cfg(all(feature = "std", not(loom)))]
+mod tls;
 
 pub use config::{Commit, Config};
 #[cfg(all(feature = "std", not(loom)))]
