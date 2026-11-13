@@ -53,9 +53,17 @@
 //! departed thread never needs to be handed over, and frees that arrive for it keep landing on the
 //! same slabs.
 
-use core::{alloc::Layout, cell::Cell, fmt, marker::PhantomData, ptr, ptr::NonNull};
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    cell::Cell,
+    fmt,
+    marker::PhantomData,
+    ptr,
+    ptr::NonNull,
+};
 
 use crate::{
+    allocator::{Backend, allocator},
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::Region,
@@ -244,7 +252,7 @@ impl HeapData {
         unsafe { self.alloc_general(layout) }
     }
 
-    /// Allocates anything that the fast path in [`alloc`] does not take.
+    /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
     ///
     /// # Safety
     ///
@@ -341,7 +349,7 @@ impl HeapData {
                     );
                     let in_slab = |block: *mut Block| {
                         let offset = block.addr().wrapping_sub(state.start.addr());
-                        offset % size == 0 && offset / size < state.bumped as usize
+                        offset.is_multiple_of(size) && offset / size < state.bumped as usize
                     };
                     let mut walk = |mut block: *mut Block, expected: Option<u32>, what: &str| {
                         let mut count = 0;
@@ -393,7 +401,7 @@ impl HeapData {
                 for position in 0..held.count {
                     let offset = block.addr().wrapping_sub(start.addr());
                     assert!(
-                        offset % size == 0 && offset / size < class.blocks_per_slab(),
+                        offset.is_multiple_of(size) && offset / size < class.blocks_per_slab(),
                         "batched block outside its slab"
                     );
                     claim(block, "a remote batch");
@@ -415,7 +423,7 @@ impl HeapData {
                 while !hot.is_null() {
                     let offset = hot.addr().wrapping_sub(state.start.addr());
                     assert!(
-                        offset % size == 0 && offset / size < state.bumped as usize,
+                        offset.is_multiple_of(size) && offset / size < state.bumped as usize,
                         "hot block outside the front active slab"
                     );
                     claim(hot, "a hot list");
@@ -489,7 +497,7 @@ impl HeapData {
     ///
     /// The caller must hold the claim.
     #[inline(always)]
-    unsafe fn region(&self) -> &Region<'_> {
+    const unsafe fn region(&self) -> &Region<'_> {
         // SAFETY: the claim was made on this region, which outlives every claim on its slots.
         unsafe { &*self.private.region.get() }
     }
@@ -953,7 +961,7 @@ impl<'r> Heap<'r> {
         NonNull::new(unsafe { self.data.realloc(ptr, old, new_size) })
     }
 
-    /// Checks the heap's structural invariants. See [`HeapData`::validate].
+    /// Checks the heap's structural invariants. See `HeapData::validate`.
     #[cfg(any(test, feature = "testing"))]
     pub fn validate(&self) {
         // SAFETY: this handle holds the claim. Tests do not free remotely while it runs.
@@ -976,6 +984,24 @@ impl<'r> Heap<'r> {
         unsafe { self.data.flush(self.region) };
     }
 }
+
+impl Backend for Heap<'_> {
+    unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8 {
+        self.alloc(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded.
+        unsafe { self.dealloc(ptr, layout) };
+    }
+
+    unsafe fn resize_raw(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { self.realloc(ptr, old, new_size) }.map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+}
+
+allocator!(Allocator for Heap<'_>);
 
 impl Drop for Heap<'_> {
     fn drop(&mut self) {

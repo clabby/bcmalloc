@@ -5,6 +5,7 @@
 #[macro_use]
 extern crate std;
 
+mod allocator;
 mod cache;
 mod chunks;
 mod config;

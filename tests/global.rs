@@ -138,3 +138,19 @@ fn trimming_reports_consistent_statistics() {
     let after = GLOBAL.stats().unwrap();
     assert!(after.free <= after.capacity);
 }
+
+#[test]
+fn the_allocator_api_can_be_used_next_to_the_global_allocator() {
+    let mut text = String::new();
+    let mut numbers = Vec::new_in(&GLOBAL);
+    for i in 0..10_000_u32 {
+        numbers.push(i);
+        if i % 1000 == 0 {
+            text.push_str(&i.to_string());
+        }
+    }
+    assert_eq!(numbers.iter().map(|&n| u64::from(n)).sum::<u64>(), 49_995_000);
+    assert_eq!(text, "0100020003000400050006000700080009000");
+    let boxed = Box::new_in([1_u16; 1000], &GLOBAL);
+    assert_eq!(boxed.iter().map(|&n| u32::from(n)).sum::<u32>(), 1000);
+}

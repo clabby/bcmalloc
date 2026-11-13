@@ -94,7 +94,7 @@ impl<'a> Chunks<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `words` is shorter than [`storage_words`] for `len`.
+    /// Panics if `words` is shorter than [`Chunks::storage_words`] for `len`.
     pub(crate) fn new(words: &'a [AtomicU64], len: usize) -> Self {
         let each = Self::words_for(len);
         assert!(words.len() >= 4 * each, "bitmap too short for {len} chunks");
@@ -160,7 +160,7 @@ impl<'a> Chunks<'a> {
         }
     }
 
-    /// Returns `n` chunks starting at `first` as [`free_at`] does, with the clock at zero.
+    /// Returns `n` chunks starting at `first` as [`Chunks::free_at`] does, with the clock at zero.
     #[cfg(test)]
     pub(crate) fn free(&self, first: usize, n: usize) {
         self.free_at(first, n, 0);

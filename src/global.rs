@@ -29,11 +29,12 @@
 //! or when more threads are running than the configuration has heaps for.
 
 use core::{
-    alloc::{GlobalAlloc, Layout},
+    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
     ptr::{self, NonNull},
 };
 
 use crate::{
+    allocator::{Backend, allocator},
     config::Config,
     heap::{Heap, HeapData},
     region::{Error, Mapping, Region, Stats},
@@ -76,6 +77,27 @@ const NO_KEY: usize = usize::MAX;
 /// assert_eq!(GLOBAL.stats().unwrap().heaps_in_use, 1);
 /// # drop(text);
 /// ```
+///
+/// # As an `Allocator`
+///
+/// A `Bcmalloc` can also serve a single collection through the standard library's
+/// [`Allocator`] trait, whether or not it is the global allocator.
+///
+/// ```
+/// use bcmalloc::Bcmalloc;
+///
+/// static ALLOCATOR: Bcmalloc = Bcmalloc::new();
+///
+/// let mut numbers = Vec::new_in(&ALLOCATOR);
+/// numbers.extend(0..1000_u32);
+/// assert_eq!(numbers.iter().sum::<u32>(), 499_500);
+///
+/// let boxed = Box::new_in([7_u8; 100], &ALLOCATOR);
+/// assert_eq!(boxed[99], 7);
+/// ```
+///
+/// A zero-sized request never reaches the allocator. A block is exactly as long as it was asked to
+/// be, zeroed requests clear all of it, and a resize that changes the alignment moves the block.
 #[derive(Debug)]
 pub struct Bcmalloc {
     config: Config,
@@ -154,6 +176,25 @@ impl Bcmalloc {
         }
     }
 }
+
+impl Backend for Bcmalloc {
+    unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::alloc(self, layout) }
+    }
+
+    unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) };
+    }
+
+    unsafe fn resize_raw(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::realloc(self, ptr.as_ptr(), old, new_size) }
+    }
+}
+
+allocator!(Allocator for Bcmalloc);
 
 impl Default for Bcmalloc {
     fn default() -> Self {
@@ -296,7 +337,7 @@ unsafe impl GlobalAlloc for Bcmalloc {
 #[cfg(all(test, not(loom), not(miri)))]
 mod test {
     use core::alloc::Layout;
-    use std::boxed::Box;
+    use std::{boxed::Box, vec::Vec};
 
     use super::*;
     use crate::config::Commit;
@@ -305,6 +346,38 @@ mod test {
     fn instance() -> &'static Bcmalloc {
         let config = Config::new().capacity(1 << 28).max_heaps(4).commit(Commit::Lazy);
         Box::leak(Box::new(Bcmalloc::with_config(config)))
+    }
+
+    #[test]
+    fn collections_can_take_the_allocator_as_a_parameter() {
+        let allocator = instance();
+        // Joining a spawned thread waits for the operating system thread and so for the
+        // destructor that releases its heap, which a scoped thread does not.
+        let threads: Vec<_> = (0..4_u64)
+            .map(|seed| {
+                std::thread::spawn(move || {
+                    let mut numbers = Vec::new_in(allocator);
+                    numbers.extend((0..100_000).map(|i| i * seed));
+                    assert_eq!(numbers[99_999], 99_999 * seed);
+                    let boxed = Box::new_in([seed as u8; 64], allocator);
+                    assert_eq!(boxed[63], seed as u8);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(allocator.stats().unwrap().heaps_in_use, 0);
+    }
+
+    #[test]
+    fn a_zero_sized_request_does_not_create_the_region() {
+        let allocator = instance();
+        let empty = allocator.allocate(Layout::from_size_align(0, 32).unwrap()).unwrap();
+        assert_eq!(empty.len(), 0);
+        // SAFETY: the block came from this allocator with this layout.
+        unsafe { allocator.deallocate(empty.cast(), Layout::from_size_align(0, 32).unwrap()) };
+        assert!(allocator.stats().is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 name = "bcmalloc"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 repository = "https://github.com/clabby/bcmalloc"
 description = "A scalable global allocator that reserves its memory up front, for long-lived, highly concurrent programs."
 license = "Apache-2.0"

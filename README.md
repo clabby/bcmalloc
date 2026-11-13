@@ -1,6 +1,6 @@
 # bcmalloc
 
-<img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
+<img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.100%2B-orange.svg" alt="Rust 1.100+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
 
 A global allocator for long-lived, highly concurrent Rust programs. It reserves one region of address space up front and serves small blocks from thread-local heaps without atomic operations. A free from another thread costs one compare-and-swap. Memory freed by one size class is reused by every other, and the capacity you configure is a hard limit.
 
@@ -45,6 +45,18 @@ let block = heap.alloc(layout).expect("memory");
 // SAFETY: the block came from this region with this layout and is not used again.
 unsafe { heap.dealloc(block, layout) };
 # Ok::<(), bcmalloc::Error>(())
+```
+
+The allocator also implements the standard library's `Allocator` trait, which has been stable since Rust 1.100. A collection can then take it as a parameter without it being the global allocator. A heap implements the trait too, for code that wants one thread's heap.
+
+```rust
+use bcmalloc::Bcmalloc;
+
+static ALLOCATOR: Bcmalloc = Bcmalloc::new();
+
+let mut numbers = Vec::new_in(&ALLOCATOR);
+numbers.extend(0..1000_u32);
+assert_eq!(numbers.iter().sum::<u32>(), 499_500);
 ```
 
 ## Configuration

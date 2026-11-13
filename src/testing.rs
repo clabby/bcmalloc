@@ -190,7 +190,7 @@ impl<'r> Harness<'r> {
     }
 
     /// The number of live blocks.
-    pub fn live(&self) -> usize {
+    pub const fn live(&self) -> usize {
         self.live.len()
     }
 
@@ -456,7 +456,7 @@ impl ChunkModel {
 
     /// How many runs are live.
     #[cfg(all(test, not(loom)))]
-    pub(crate) fn live(&self) -> usize {
+    pub(crate) const fn live(&self) -> usize {
         self.live.len()
     }
 

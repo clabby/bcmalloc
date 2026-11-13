@@ -250,8 +250,8 @@ impl Slab {
 
     /// Pushes this slab onto its owner's stack of slabs to revisit.
     ///
-    /// Call this once after [`push_remote`](Self::push_remote) returned true. The slab cannot be
-    /// recycled before the owner pops it, so the pointer stays valid.
+    /// Call this once after [`push_remote_chain`](Self::push_remote_chain) returned true. The slab
+    /// cannot be recycled before the owner pops it, so the pointer stays valid.
     pub(crate) fn enqueue(&self, stack: &AtomicPtr<Self>) {
         let this = ptr::from_ref(self).cast_mut();
         let mut head = stack.load(Ordering::Relaxed);
@@ -365,18 +365,18 @@ impl<'a> Owned<'a> {
     }
 
     /// The first block of the slab, which is also the slab's start address.
-    pub(crate) fn start(self) -> *mut u8 {
+    pub(crate) const fn start(self) -> *mut u8 {
         self.local().start.get()
     }
 
     /// How many blocks are handed out, held on a heap's hot list or waiting on the remote list.
-    pub(crate) fn used(self) -> u32 {
+    pub(crate) const fn used(self) -> u32 {
         let local = self.local();
         local.bumped.get() - local.free_len.get() - local.local_count.get()
     }
 
     /// The list this slab is on.
-    pub(crate) fn list(self) -> List {
+    pub(crate) const fn list(self) -> List {
         self.local().list.get()
     }
 
@@ -386,7 +386,7 @@ impl<'a> Owned<'a> {
     }
 
     /// The next slab on this slab's list.
-    pub(crate) fn next(self) -> *const Slab {
+    pub(crate) const fn next(self) -> *const Slab {
         self.local().next.get()
     }
 
@@ -396,7 +396,7 @@ impl<'a> Owned<'a> {
     }
 
     /// The previous slab on this slab's list.
-    pub(crate) fn prev(self) -> *const Slab {
+    pub(crate) const fn prev(self) -> *const Slab {
         self.local().prev.get()
     }
 
