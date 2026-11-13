@@ -1,0 +1,29 @@
+[package]
+name = "cwmalloc-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cwmalloc = { path = "..", features = ["testing"] }
+
+[[bin]]
+name = "heap_ops"
+path = "fuzz_targets/heap_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_ops"
+path = "fuzz_targets/chunk_ops.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the parent crate's build.
+[workspace]
