@@ -6,6 +6,7 @@
 extern crate std;
 
 mod chunks;
+mod size_class;
 mod sync;
 mod sys;
 #[cfg(any(test, feature = "testing"))]
