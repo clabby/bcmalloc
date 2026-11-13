@@ -7,6 +7,8 @@ extern crate std;
 
 mod chunks;
 mod config;
+#[cfg(all(feature = "std", not(loom)))]
+mod global;
 mod heap;
 mod region;
 mod size_class;
@@ -17,6 +19,8 @@ mod sys;
 pub mod testing;
 
 pub use config::{Commit, Config};
+#[cfg(all(feature = "std", not(loom)))]
+pub use global::Cwmalloc;
 pub use heap::Heap;
 pub use region::{Error, Mapping, Region, Stats};
 pub use size_class::{MAX_ALIGN, MAX_SMALL};
