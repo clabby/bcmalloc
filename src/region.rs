@@ -6,11 +6,11 @@
 //! any size is instant and costs nothing until it is used.
 //!
 //! ```text
-//!   +--------+------------+-------------+-----------+---------+-----+--------------------------+
-//!   | Region | heap slots | descriptors | chunk map | bitmaps | pad | chunks (managed memory)  |
-//!   | header | max_heaps  | 128 B/chunk | 8 B/chunk | 4 bits  |     | 64 KiB each, 4 MiB align |
-//!   +--------+------------+-------------+-----------+---------+-----+--------------------------+
-//!   |<------------ metadata, about 0.2% of the region ------------>|<---- the other 99.8% --->|
+//!   +--------+-------+-----------+-------------+-----------+---------+-----+-------------------+
+//!   | Region | heap  | bin slots | descriptors | chunk map | bitmaps | pad | chunks (managed   |
+//!   | header | slots | per heap  | 640 B/chunk | 8 B/chunk | 4 bits  |     | memory), 64 KiB   |
+//!   +--------+-------+-----------+-------------+-----------+---------+-----+-------------------+
+//!   |<--------------- metadata, about 1% of the region ---------------->|<-- the other 99% ->|
 //! ```
 //!
 //! Metadata sits next to the data it describes but never inside it. The descriptor of a block is

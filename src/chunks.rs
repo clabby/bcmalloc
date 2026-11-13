@@ -150,6 +150,7 @@ impl<'a> Chunks<'a> {
     /// The run starts at a multiple of `align`, which must be a power of two and at most 64.
     /// `hint` is the bitmap word at which single-chunk searches begin. Returns `None` if no run
     /// is free.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn alloc(&self, n: usize, align: usize, hint: usize) -> Option<usize> {
         self.alloc_near(n, align, hint, 0..Self::words_for(self.len))
     }
