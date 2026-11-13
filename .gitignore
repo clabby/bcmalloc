@@ -7,3 +7,5 @@
 
 # macOS
 .DS_Store
+/bench-apps/target
+/cabi/target
