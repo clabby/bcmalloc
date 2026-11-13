@@ -20,7 +20,9 @@
 //! 1. Pop the free list of the front active slab. This is the whole fast path.
 //! 2. If it is empty, fold in the local and remote free lists of the slab, or thread a few more
 //!    never-used blocks onto it.
-//! 3. If the slab has nothing left, park it on the full list and try the next one.
+//! 3. If the slab has nothing left, park it on the full list and try the next one. A slab that gets
+//!    a block back joins the active list at the back, so that allocation keeps draining the front
+//!    slab and a returning slab has collected many blocks by the time it is reached.
 //! 4. If the class has no active slab, adopt slabs that other threads have freed into, or take a
 //!    fresh one from the chunk allocator.
 //!
@@ -60,9 +62,10 @@ use crate::{
     sync::{AtomicBool, AtomicPtr, Ordering},
 };
 
-/// The heads of a size class's two slab lists.
+/// The slab lists of a size class. The active list is tracked from both ends.
 struct Lists {
     active: Cell<*const Slab>,
+    active_last: Cell<*const Slab>,
     full: Cell<*const Slab>,
 }
 
@@ -102,8 +105,13 @@ impl HeapData {
             id: Cell::new(0),
             cursor: Cell::new(0),
             unfull: AtomicPtr::new(ptr::null_mut()),
-            classes: [const { Lists { active: Cell::new(ptr::null()), full: Cell::new(ptr::null()) } };
-                CLASSES],
+            classes: [const {
+                Lists {
+                    active: Cell::new(ptr::null()),
+                    active_last: Cell::new(ptr::null()),
+                    full: Cell::new(ptr::null()),
+                }
+            }; CLASSES],
         }
     }
 
@@ -345,9 +353,18 @@ impl HeapData {
         region.chunks().alloc(chunks, 1, 0).map_or(ptr::null_mut(), |first| region.chunk_ptr(first))
     }
 
+    /// Moves a slab to the full list, or to the back of the active list.
+    ///
+    /// A slab that becomes active again usually has a single free block. Allocation keeps using
+    /// the slab at the front until it runs dry, and by the time the returning slab gets its turn
+    /// it has collected many more blocks. At the front it would be drained and parked again after
+    /// nearly every free.
     fn move_to(&self, slab: Owned<'_>, list: List) {
         self.unlink(slab);
-        self.push_front(slab, list);
+        match list {
+            List::Active => self.push_back(slab),
+            List::Full | List::None => self.push_front(slab, list),
+        }
     }
 
     fn push_front(&self, slab: Owned<'_>, list: List) {
@@ -361,7 +378,25 @@ impl HeapData {
             unsafe { old.owned() }.set_prev(slab.slab());
         }
         head.set(slab.slab());
+        if list == List::Active && old.is_null() {
+            self.lists(slab.class()).active_last.set(slab.slab());
+        }
         slab.set_list(list);
+    }
+
+    fn push_back(&self, slab: Owned<'_>) {
+        let lists = self.lists(slab.class());
+        let last = lists.active_last.get();
+        // SAFETY: slabs on our lists are ours.
+        let Some(last) = (unsafe { last.as_ref() }) else {
+            return self.push_front(slab, List::Active);
+        };
+        slab.set_prev(ptr::from_ref(last));
+        slab.set_next(ptr::null());
+        // SAFETY: as above.
+        unsafe { last.owned() }.set_next(slab.slab());
+        lists.active_last.set(slab.slab());
+        slab.set_list(List::Active);
     }
 
     fn unlink(&self, slab: Owned<'_>) {
@@ -380,6 +415,8 @@ impl HeapData {
         if let Some(next) = unsafe { next.as_ref() } {
             // SAFETY: as above.
             unsafe { next.owned() }.set_prev(prev);
+        } else if list == List::Active {
+            self.lists(slab.class()).active_last.set(prev);
         }
         slab.set_prev(ptr::null());
         slab.set_next(ptr::null());
@@ -660,6 +697,24 @@ mod test {
         // Both slabs are full now, so the owner has to learn about the notification.
         assert_eq!(owner.alloc(layout), Some(first[3]));
         assert_eq!(used(&region), 2 * CHUNK_SIZE, "no third slab should be needed");
+    }
+
+    #[test]
+    fn a_slab_with_a_returned_block_waits_behind_the_one_being_filled() {
+        let test = TestRegion::new(128, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        // 8 KiB blocks, so a slab holds exactly eight. Two slabs are full and a third has one block
+        // out.
+        let layout = layout(8192, 8);
+        let blocks = alloc_many(&heap, layout, 17);
+        // SAFETY: allocated by this heap with this layout and freed once.
+        unsafe { heap.dealloc(blocks[0], layout) };
+
+        let third = region.chunk_index(blocks[16].as_ptr());
+        let rest = alloc_many(&heap, layout, 7);
+        assert!(rest.iter().all(|block| region.chunk_index(block.as_ptr()) == third));
+        assert_eq!(heap.alloc(layout), Some(blocks[0]));
     }
 
     #[test]
