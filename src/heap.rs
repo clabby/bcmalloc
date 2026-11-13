@@ -117,6 +117,13 @@ const MAINTENANCE_INTERVAL: u32 = 64;
 /// How many bytes of bin capacity a heap may add to the initial capacities of its bins.
 const GROWTH_BUDGET: usize = 2 << 20;
 
+/// How many freed huge blocks a heap keeps for reuse.
+const HUGE_CACHE: usize = 4;
+
+/// The largest huge block a heap keeps, and the most it keeps in all.
+const HUGE_CACHE_BLOCK: usize = 8 << 20;
+const HUGE_CACHE_BYTES: usize = 16 << 20;
+
 /// The last miss of a bin was a refill of an empty bin.
 const UNDERFLOW: u8 = 0b01;
 
@@ -166,6 +173,20 @@ struct Outbox {
     bytes: Cell<u32>,
 }
 
+/// A huge block that this heap freed and keeps, still claimed in the chunk bitmap, for the next
+/// request of the same size. An empty entry has no chunks.
+#[derive(Clone, Copy)]
+struct Kept {
+    first: usize,
+    chunks: usize,
+    /// Whether it was reused since the last maintenance step.
+    reused: bool,
+}
+
+impl Kept {
+    const NONE: Self = Self { first: 0, chunks: 0, reused: false };
+}
+
 /// The slab lists of a size class. The active list is tracked from both ends.
 struct Lists {
     active: Cell<*const Slab>,
@@ -204,6 +225,7 @@ struct Private {
     /// This heap's bin slots in the region, set at every claim.
     slots: Cell<*mut *mut Block>,
     outboxes: [Outbox; OUTBOXES],
+    kept: [Cell<Kept>; HUGE_CACHE],
     classes: [Lists; CLASSES],
 }
 
@@ -269,6 +291,7 @@ impl HeapData {
                         bytes: Cell::new(0),
                     }
                 }; OUTBOXES],
+                kept: [const { Cell::new(Kept::NONE) }; HUGE_CACHE],
                 classes: [const {
                     Lists {
                         active: Cell::new(ptr::null()),
@@ -599,6 +622,16 @@ impl HeapData {
                 // SAFETY: forwarded.
                 unsafe { self.post_outbox(region, outbox) };
             }
+            // Huge blocks that nobody asked for since the last step go back to the region.
+            for kept in &self.private.kept {
+                let block = kept.get();
+                if block.chunks != 0 && !block.reused {
+                    kept.set(Kept::NONE);
+                    region.free_chunks(block.first, block.chunks);
+                } else {
+                    kept.set(Kept { reused: false, ..block });
+                }
+            }
             for (index, bin) in self.private.bins.iter().enumerate() {
                 let class = Class::from_index(index);
                 let capacity = usize::from(bin.capacity.get());
@@ -743,9 +776,44 @@ impl HeapData {
             // SAFETY: forwarded.
             unsafe { self.free_small(ptr.as_ptr().cast()) };
         } else {
-            // SAFETY: the claim keeps the region alive, and the caller vouches for the block.
-            unsafe { self.region().dealloc(ptr, layout) };
+            // SAFETY: forwarded.
+            unsafe { self.free_huge(ptr, layout) };
         }
+    }
+
+    /// Frees a huge block. A block of up to [`HUGE_CACHE_BLOCK`] is kept for the next request of
+    /// its size if there is room, so a program that frees and allocates big buffers in a loop does
+    /// not pay for the bitmap and the purge clock each time, as jemalloc and mimalloc keep large
+    /// extents and segments around for a while.
+    ///
+    /// # Safety
+    ///
+    /// As for [`dealloc`](Self::dealloc), and the layout must be a huge one.
+    #[inline(never)]
+    unsafe fn free_huge(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        let Some(Request::Huge { chunks }) = classify(layout) else {
+            // SAFETY: forwarded.
+            return unsafe { region.dealloc(ptr, layout) };
+        };
+        let bytes = chunks << CHUNK_SHIFT;
+        if bytes <= HUGE_CACHE_BLOCK {
+            let held: usize =
+                self.private.kept.iter().map(|kept| kept.get().chunks << CHUNK_SHIFT).sum();
+            let empty = self.private.kept.iter().find(|kept| kept.get().chunks == 0);
+            if let Some(empty) = empty &&
+                held + bytes <= HUGE_CACHE_BYTES
+            {
+                let first = region.chunk_index(ptr.as_ptr());
+                // A block kept now survives the next maintenance step, and goes at the one after
+                // unless it is asked for in between.
+                empty.set(Kept { first, chunks, reused: true });
+                return;
+            }
+        }
+        // SAFETY: forwarded.
+        unsafe { region.dealloc(ptr, layout) };
     }
 
     /// Frees a block of a slab. Its class and its owner both come from one load of the chunk map,
@@ -1055,6 +1123,12 @@ impl HeapData {
     unsafe fn empty_caches(&self, region: &Region<'_>) {
         // SAFETY: forwarded.
         unsafe { self.drain_inbox(region) };
+        for kept in &self.private.kept {
+            let block = kept.replace(Kept::NONE);
+            if block.chunks != 0 {
+                region.free_chunks(block.first, block.chunks);
+            }
+        }
         for outbox in &self.private.outboxes {
             // SAFETY: forwarded.
             unsafe { self.post_outbox(region, outbox) };
@@ -1130,11 +1204,30 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
+        for kept in &self.private.kept {
+            let block = kept.get();
+            if block.chunks == chunks {
+                kept.set(Kept::NONE);
+                // The next kept block of this size has been asked for, so it stays a while.
+                self.mark_kept_reused(chunks);
+                return region.chunk_ptr(block.first);
+            }
+        }
         let Some(first) = region.alloc_chunks(chunks, 1, 0, self.private.node.get()) else {
             return ptr::null_mut();
         };
         region.set_huge(first, chunks);
         region.chunk_ptr(first)
+    }
+
+    /// Marks the kept huge blocks of `chunks` chunks as wanted.
+    fn mark_kept_reused(&self, chunks: usize) {
+        for kept in &self.private.kept {
+            let block = kept.get();
+            if block.chunks == chunks {
+                kept.set(Kept { reused: true, ..block });
+            }
+        }
     }
 
     /// Moves a slab to the full list, or to the back of the active list.
@@ -1839,6 +1932,33 @@ mod test {
     }
 
     #[test]
+    fn a_freed_huge_block_is_kept_for_the_next_request_of_its_size() {
+        let test = TestRegion::new(320, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let big = layout(1 << 20, 8);
+        let block = heap.alloc(big).unwrap();
+        // SAFETY: allocated just above with this layout.
+        unsafe { heap.dealloc(block, big) };
+        assert_eq!(used(&region), 16 * CHUNK_SIZE, "the block is kept, still claimed");
+        assert_eq!(heap.alloc(big), Some(block), "and handed out again");
+        // SAFETY: as above.
+        unsafe { heap.dealloc(block, big) };
+        let other = layout(2 << 20, 8);
+        let second = heap.alloc(other).unwrap();
+        assert_ne!(second, block, "a request of another size does not take it");
+        // SAFETY: as above.
+        unsafe { heap.dealloc(second, other) };
+        let giant = layout(12 << 20, 8);
+        let third = heap.alloc(giant).unwrap();
+        // SAFETY: as above.
+        unsafe { heap.dealloc(third, giant) };
+        assert_eq!(used(&region), 48 * CHUNK_SIZE, "a block over 8 MiB is not kept");
+        heap.flush();
+        assert_eq!(used(&region), 0, "a flush gives kept blocks back");
+    }
+
+    #[test]
     fn huge_blocks_shrink_in_place_and_grow_into_free_chunks() {
         let test = TestRegion::new(64, 1);
         let region = test.region();
@@ -1855,6 +1975,7 @@ mod test {
         assert_eq!(used(&region), 18 * CHUNK_SIZE);
         // SAFETY: as above, now with eighteen chunks.
         unsafe { heap.dealloc(block, layout(18 * CHUNK_SIZE, 8)) };
+        heap.flush();
         assert_eq!(used(&region), 0);
     }
 
