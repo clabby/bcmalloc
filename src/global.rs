@@ -171,12 +171,12 @@ impl Cwmalloc {
 
     /// The key under which threads bind their heap, created on first use.
     fn key(&self) -> Option<usize> {
-        let key = self.key.load(Ordering::Relaxed);
+        let key = self.key.load(Ordering::Acquire);
         if key != NO_KEY {
             return Some(key);
         }
         let created = tls::create_key()?;
-        match self.key.compare_exchange(NO_KEY, created, Ordering::Relaxed, Ordering::Relaxed) {
+        match self.key.compare_exchange(NO_KEY, created, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Some(created),
             // Another thread created the key first. Ours has no users.
             Err(existing) => {
@@ -194,9 +194,16 @@ impl Cwmalloc {
             return None;
         }
         let key = self.key()?;
-        let data = region.heap()?.leak();
-        tls::bind(key, data);
-        Some(data)
+        let heap = region.heap()?;
+        // The heap releases its claim if the system refuses to remember it.
+        let data = heap.leak();
+        if tls::bind(key, data) {
+            Some(data)
+        } else {
+            // SAFETY: the claim was taken just above and nothing else uses the heap.
+            unsafe { data.give_up() };
+            None
+        }
     }
 
     /// Allocates for a thread that has no heap yet.
@@ -283,5 +290,38 @@ unsafe impl GlobalAlloc for Cwmalloc {
         }
         // SAFETY: as above.
         unsafe { self.realloc_unbound(ptr, layout, new_size) }
+    }
+}
+
+#[cfg(all(test, not(loom), not(miri)))]
+mod test {
+    use core::alloc::Layout;
+    use std::boxed::Box;
+
+    use super::*;
+    use crate::config::Commit;
+
+    /// An allocator over a small region, leaked so that it can be used as a static would be.
+    fn instance() -> &'static Cwmalloc {
+        let config = Config::new().capacity(1 << 28).max_heaps(4).commit(Commit::Lazy);
+        Box::leak(Box::new(Cwmalloc::with_config(config)))
+    }
+
+    #[test]
+    fn a_thread_that_alternates_between_allocators_keeps_one_heap_in_each() {
+        let (first, second) = (instance(), instance());
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        for _ in 0..20 {
+            for allocator in [first, second] {
+                // SAFETY: the layout is not zero sized, and the block is freed once.
+                unsafe {
+                    let block = allocator.alloc(layout);
+                    assert!(!block.is_null());
+                    allocator.dealloc(block, layout);
+                }
+            }
+        }
+        assert_eq!(first.stats().unwrap().heaps_in_use, 1);
+        assert_eq!(second.stats().unwrap().heaps_in_use, 1);
     }
 }

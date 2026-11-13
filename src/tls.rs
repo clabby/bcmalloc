@@ -76,11 +76,15 @@ pub(crate) fn get(key: Key) -> *const HeapData {
     slot::get(key)
 }
 
-/// Binds the heap as this thread's under the key. It is released when the thread exits.
-pub(crate) fn bind(key: Key, data: &'static HeapData) {
+/// Binds the heap as this thread's under the key, so that the key destructor releases it when the
+/// thread exits. Returns false, and binds nothing, if the system refuses the value.
+pub(crate) fn bind(key: Key, data: &'static HeapData) -> bool {
     // SAFETY: the key is valid, and the value is a heap that stays alive for the destructor.
-    unsafe { libc::pthread_setspecific(key as _, ptr::from_ref(data).cast()) };
+    if unsafe { libc::pthread_setspecific(key as _, ptr::from_ref(data).cast()) } != 0 {
+        return false;
+    }
     slot::set(key, data);
+    true
 }
 
 /// The key destructor. pthread has already cleared the thread's slot when it calls this.
@@ -159,14 +163,26 @@ mod slot {
     use crate::heap::HeapData;
 
     thread_local! {
-        /// The key and heap this thread last bound. A thread serves one allocator at a time here.
+        /// The key and heap this thread used last. A thread that serves several allocators keeps
+        /// only the latest here, and pthread remembers the others.
         static CURRENT: Cell<(Key, *const HeapData)> = const { Cell::new((0, ptr::null())) };
     }
 
     #[inline(always)]
     pub(super) fn get(key: Key) -> *const HeapData {
         let (bound, data) = CURRENT.with(Cell::get);
-        if bound == key { data } else { ptr::null() }
+        if bound == key { data } else { switch(key) }
+    }
+
+    /// Looks the heap up through pthread and makes it the latest.
+    #[cold]
+    fn switch(key: Key) -> *const HeapData {
+        // SAFETY: the key was created by create_key.
+        let data = unsafe { libc::pthread_getspecific(key as _) }.cast::<HeapData>().cast_const();
+        if !data.is_null() {
+            CURRENT.with(|current| current.set((key, data)));
+        }
+        data
     }
 
     pub(super) fn set(key: Key, data: &HeapData) {
@@ -198,7 +214,7 @@ mod test {
 
         let data = region.heap().expect("a free heap").leak();
         // SAFETY: the test keeps the region alive for as long as the heap is bound.
-        bind(key, unsafe { &*ptr::from_ref(data) });
+        assert!(bind(key, unsafe { &*ptr::from_ref(data) }));
         assert_eq!(get(key), ptr::from_ref(data));
         thread::scope(|scope| {
             scope.spawn(|| assert!(get(key).is_null()));
@@ -229,7 +245,7 @@ mod test {
             let handoff = handoff;
             assert!(!exiting());
             // SAFETY: the test keeps the region alive until the thread has been joined.
-            bind(key, unsafe { &*handoff.0 });
+            assert!(bind(key, unsafe { &*handoff.0 }));
             assert_eq!(get(key), handoff.0);
         })
         .join()
