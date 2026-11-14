@@ -655,9 +655,11 @@ impl<'a> Region<'a> {
 pub(crate) struct Entry(pub(crate) u64);
 
 impl Entry {
-    /// The entry for a slab of `class` owned by heap `owner`.
+    /// The entry for a slab of `class` owned by heap `owner`. Next to the class it keeps the byte
+    /// offset of the class's bin in a heap, so that a free finds the bin without arithmetic.
     pub(crate) const fn new(owner: u32, class: Class) -> Self {
-        Self(owner as u64 | (class.index() as u64) << 32)
+        let offset = (class.index() * crate::heap::BIN_SIZE) as u64;
+        Self(owner as u64 | (class.index() as u64) << 32 | offset << 40)
     }
 
     /// The bit that marks the entry of the first chunk of a huge block.
@@ -681,6 +683,11 @@ impl Entry {
     /// The id of the heap that owns the slab.
     pub(crate) const fn owner(self) -> u32 {
         self.0 as u32
+    }
+
+    /// The byte offset of the bin of the slab's class in a heap.
+    pub(crate) const fn bin_offset(self) -> usize {
+        (self.0 >> 40) as usize
     }
 
     /// The size class of the slab.

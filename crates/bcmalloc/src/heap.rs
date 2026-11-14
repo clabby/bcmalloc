@@ -85,7 +85,7 @@ use crate::{
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::{Entry, HUGE_PAGE_CHUNKS, Region},
-    size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
+    size_class::{CLASSES, Class, MAX_SMALL, MIN_ALIGN, Request, TABLE_MAX, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
@@ -142,6 +142,22 @@ const ZERO_CHECK_MIN: usize = 1024;
 const fn reusable_anywhere(class: Class) -> bool {
     class.reusable_anywhere() || class.index() == MESSAGE_CLASS.index()
 }
+
+/// The size of a bin, which [`Entry`] uses to keep the offset of a class's bin.
+pub(crate) const BIN_SIZE: usize = size_of::<Bin>();
+
+/// For every size that the class table covers, in steps of [`MIN_ALIGN`], the byte offset of the
+/// bin of its class in a heap's array of bins. The allocation fast path finds its bin with one load
+/// where looking the class up and then the bin would take a load and a multiplication.
+const BIN_OFFSETS: [u16; TABLE_MAX / MIN_ALIGN + 1] = {
+    let mut offsets = [0; TABLE_MAX / MIN_ALIGN + 1];
+    let mut step = 0;
+    while step < offsets.len() {
+        offsets[step] = (Class::from_table(step * MIN_ALIGN).index() * size_of::<Bin>()) as u16;
+        step += 1;
+    }
+    offsets
+};
 
 /// How many chunks of filled slabs a heap holds before its chunks come from the zone of
 /// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
@@ -593,7 +609,12 @@ impl HeapData {
     /// Pops a block off the bin of `class`.
     #[inline(always)]
     fn pop(&self, class: Class) -> Option<*mut Block> {
-        let bin = self.bin(class);
+        Self::pop_from(self.bin(class))
+    }
+
+    /// Pops a block off `bin`.
+    #[inline(always)]
+    fn pop_from(bin: &Bin) -> Option<*mut Block> {
         let top = bin.top.get();
         if top.addr() as u16 == bin.empty.get() {
             return None;
@@ -601,14 +622,24 @@ impl HeapData {
         bin.top.set(top.wrapping_add(1));
         #[cfg(feature = "metrics")]
         bin.allocs.add(1);
-        // SAFETY: slots between the top and the end of a bin hold blocks.
-        Some(unsafe { *top })
+        // SAFETY: slots between the top and the end of a bin hold blocks, which are never null.
+        // Saying so lets callers that turn the block into a nullable pointer skip a check.
+        unsafe {
+            let block = *top;
+            core::hint::assert_unchecked(!block.is_null());
+            Some(block)
+        }
     }
 
     /// Pushes a block onto the bin of `class`, or returns false if the bin is full.
     #[inline(always)]
     fn push(&self, class: Class, block: *mut Block) -> bool {
-        let bin = self.bin(class);
+        Self::push_to(self.bin(class), block)
+    }
+
+    /// Pushes a block onto `bin`, or returns false if the bin is full.
+    #[inline(always)]
+    fn push_to(bin: &Bin, block: *mut Block) -> bool {
         let top = bin.top.get();
         if top.addr() as u16 == bin.full.get() {
             return false;
@@ -635,12 +666,8 @@ impl HeapData {
     #[inline(always)]
     pub(crate) unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if Class::is_table_request(layout) {
-            let class = Class::from_table(layout.size());
-            if let Some(block) = self.pop(class) {
-                return block.cast();
-            }
-            // SAFETY: forwarded.
-            return unsafe { self.refill(class) }.cast();
+            // SAFETY: forwarded, and the table covers the size.
+            return unsafe { self.alloc_table(layout.size()) };
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_general(layout) }
@@ -651,16 +678,20 @@ impl HeapData {
     ///
     /// The caller must hold the claim on this slot, and `size` must be at most
     /// [`TABLE_MAX`](crate::size_class::TABLE_MAX).
-    #[cfg(all(feature = "std", not(loom)))]
     #[inline(always)]
     pub(crate) unsafe fn alloc_table(&self, size: usize) -> *mut u8 {
-        debug_assert!(size <= crate::size_class::TABLE_MAX);
-        let class = Class::from_table(size);
-        if let Some(block) = self.pop(class) {
+        debug_assert!(size <= TABLE_MAX);
+        // SAFETY: the size is at most `TABLE_MAX`, so its step is in the table, and every offset
+        // in it is that of a bin in the array.
+        let bin = unsafe {
+            let offset = *BIN_OFFSETS.get_unchecked(size.div_ceil(MIN_ALIGN));
+            &*self.private.bins.as_ptr().byte_add(usize::from(offset))
+        };
+        if let Some(block) = Self::pop_from(bin) {
             return block.cast();
         }
         // SAFETY: forwarded.
-        unsafe { self.refill(class) }.cast()
+        unsafe { self.refill(Class::from_table(size)) }.cast()
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
@@ -1111,19 +1142,20 @@ impl HeapData {
     /// As for [`dealloc`](Self::dealloc), and `entry` must be the entry of the block's chunk.
     #[inline(always)]
     unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
-        let class = entry.class();
+        // SAFETY: entries hold the offset of a bin in the array.
+        let bin = unsafe { &*self.private.bins.as_ptr().byte_add(entry.bin_offset()) };
         #[cfg(feature = "metrics")]
-        self.bin(class).frees.add(1);
+        bin.frees.add(1);
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
         // the program's requests.
-        if entry.owner() != self.private.id.get() && !self.bin(class).anywhere.get() {
+        if entry.owner() != self.private.id.get() && !bin.anywhere.get() {
             // SAFETY: forwarded.
-            return unsafe { self.send(block, class, entry.owner()) };
+            return unsafe { self.send(block, entry.class(), entry.owner()) };
         }
-        if !self.push(class, block) {
+        if !Self::push_to(bin, block) {
             // SAFETY: forwarded.
-            unsafe { self.free_full(block, class) };
+            unsafe { self.free_full(block, entry.class()) };
         }
     }
 

@@ -156,10 +156,10 @@ impl Bcmalloc {
     #[inline]
     pub fn malloc(&self, size: usize) -> *mut u8 {
         if size <= TABLE_MAX &&
-            // SAFETY: a thread's bound heap is claimed by that thread alone.
-            let Some(data) = unsafe { self.thread_heap().as_ref() }
+            let Some(data) = self.thread_heap()
         {
-            // SAFETY: as above, and the size is one the table classifies.
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the size is one
+            // the table classifies.
             return unsafe { data.alloc_table(size) };
         }
         self.malloc_general(size)
@@ -183,11 +183,11 @@ impl Bcmalloc {
     /// block must not be used again.
     #[inline]
     pub unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        match unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: the heap's region is this allocator's, and the caller vouches for the block.
+        match self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, its region is this
+            // allocator's, and the caller vouches for the block.
             Some(data) => unsafe { data.free_unsized(ptr) },
-            // SAFETY: as above.
+            // SAFETY: the caller vouches for the block.
             None => unsafe { self.free_unsized_unbound(ptr) },
         }
     }
@@ -209,10 +209,8 @@ impl Bcmalloc {
     /// held while it sleeps, as jemalloc offers with its thread cache flush. Heaps of exited
     /// threads are handed back on their own, and [`trim`](Self::trim) covers heaps nobody holds.
     pub fn flush_thread(&self) {
-        // SAFETY: a thread's bound heap is claimed by that thread alone, and so is its region.
-        if let (Some(data), Some(region)) = (unsafe { self.bound_heap().as_ref() }, self.existing())
-        {
-            // SAFETY: as above.
+        if let (Some(data), Some(region)) = (self.bound_heap(), self.existing()) {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and so is its region.
             unsafe { data.flush(region) };
         }
     }
@@ -290,15 +288,15 @@ impl Default for Bcmalloc {
 }
 
 impl Bcmalloc {
-    /// This thread's heap, or null if it has not bound one or the fast lookup cannot tell.
+    /// This thread's heap, or `None` if it has not bound one or the fast lookup cannot tell.
     #[inline(always)]
-    fn thread_heap(&self) -> *const HeapData {
+    fn thread_heap(&self) -> Option<&'static HeapData> {
         tls::get(self.key.load(Ordering::Relaxed))
     }
 
-    /// This thread's heap, or null if it has not bound one. This is the slow lookup that settles
+    /// This thread's heap, or `None` if it has not bound one. This is the slow lookup that settles
     /// what [`thread_heap`](Self::thread_heap) could not.
-    fn bound_heap(&self) -> *const HeapData {
+    fn bound_heap(&self) -> Option<&'static HeapData> {
         tls::lookup(self.key.load(Ordering::Relaxed))
     }
 
@@ -351,9 +349,8 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn alloc_unbound(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
             return unsafe { data.alloc(layout) };
         }
         let Some(region) = self.region() else { return ptr::null_mut() };
@@ -368,9 +365,9 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn dealloc_unbound(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above, and the caller vouches for the block.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller vouches
+            // for the block.
             return unsafe { data.dealloc(ptr, layout) };
         }
         let Some(region) = self.existing() else { return };
@@ -388,9 +385,9 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn realloc_unbound(&self, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above, and the caller vouches for the block and the size.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller vouches
+            // for the block and the size.
             return unsafe { data.realloc(ptr, layout, new_size) };
         }
         let Some(region) = self.existing() else { return ptr::null_mut() };
@@ -412,9 +409,8 @@ impl Bcmalloc {
 unsafe impl GlobalAlloc for Bcmalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: as above.
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
             return unsafe { data.alloc(layout) };
         }
         // SAFETY: forwarded.
@@ -423,9 +419,8 @@ unsafe impl GlobalAlloc for Bcmalloc {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: as above.
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
             return unsafe { data.alloc_zeroed(layout) };
         }
         // SAFETY: forwarded.
@@ -441,9 +436,9 @@ unsafe impl GlobalAlloc for Bcmalloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller guarantees the block is live, so it is not null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        match unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: the caller guarantees the block came from this allocator with this layout.
+        match self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller
+            // guarantees the block came from this allocator with this layout.
             Some(data) => unsafe { data.dealloc(ptr, layout) },
             // SAFETY: as above.
             None => unsafe { self.dealloc_unbound(ptr, layout) },
@@ -454,10 +449,10 @@ unsafe impl GlobalAlloc for Bcmalloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: the caller guarantees the block is live, so it is not null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: the caller guarantees the block is live with this layout and that the new
-            // size is valid for the alignment.
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller
+            // guarantees the block is live with this layout and that the new size is valid for
+            // the alignment.
             return unsafe { data.realloc(ptr, layout, new_size) };
         }
         // SAFETY: as above.

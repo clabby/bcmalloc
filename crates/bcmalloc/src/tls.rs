@@ -86,15 +86,15 @@ pub(crate) fn delete_key(key: Key) {
     unsafe { libc::pthread_key_delete(key as _) };
 }
 
-/// The heap that this thread bound under the key, or null.
+/// The heap that this thread bound under the key.
 #[inline(always)]
-pub(crate) fn get(key: Key) -> *const HeapData {
+pub(crate) fn get(key: Key) -> Option<&'static HeapData> {
     slot::get(key)
 }
 
 /// As [`get`], but where the fast lookup cannot tell, it asks pthread. The fast paths call [`get`]
 /// and come here only when that returns null, so they make no call of their own.
-pub(crate) fn lookup(key: Key) -> *const HeapData {
+pub(crate) fn lookup(key: Key) -> Option<&'static HeapData> {
     slot::lookup(key)
 }
 
@@ -148,8 +148,9 @@ mod slot {
         ptr::with_exposed_provenance(register & !7)
     }
 
+    /// The value in the key's slot of the table, which may be null.
     #[inline(always)]
-    pub(super) fn get(key: Key) -> *const HeapData {
+    fn read(key: Key) -> *const HeapData {
         if key == super::NO_KEY {
             return ptr::null();
         }
@@ -158,7 +159,14 @@ mod slot {
         unsafe { *table().add(key) }
     }
 
-    pub(super) fn lookup(key: Key) -> *const HeapData {
+    #[inline(always)]
+    pub(super) fn get(key: Key) -> Option<&'static HeapData> {
+        // SAFETY: only bind stores values under a key, and they are heap slots of regions that
+        // live for the rest of the program.
+        unsafe { read(key).as_ref() }
+    }
+
+    pub(super) fn lookup(key: Key) -> Option<&'static HeapData> {
         get(key)
     }
 
@@ -172,7 +180,7 @@ mod slot {
         let marker: *const u8 = &raw const MARKER;
         // SAFETY: the key is fresh, so nothing else uses its slot on this thread.
         unsafe { libc::pthread_setspecific(key as _, marker.cast()) };
-        let found = get(key).cast::<u8>() == marker;
+        let found = read(key).cast::<u8>() == marker;
         // SAFETY: as above. Clearing the slot keeps the destructor from running on the marker.
         unsafe { libc::pthread_setspecific(key as _, ptr::null()) };
         found
@@ -203,29 +211,24 @@ mod slot {
     }
 
     #[inline(always)]
-    pub(super) fn get(key: Key) -> *const HeapData {
+    pub(super) fn get(key: Key) -> Option<&'static HeapData> {
         let (bound, data) = CURRENT.with(Cell::get);
-        if bound == key {
-            // SAFETY: only `set` stores a key that an allocator has, and it stores a heap with it.
-            // Knowing that lets the caller's null check fold into the key check.
-            unsafe { core::hint::assert_unchecked(!data.is_null()) };
-            data
-        } else {
-            ptr::null()
-        }
+        // SAFETY: only `set` stores a key that an allocator has, and it stores a heap slot of a
+        // region that lives for the rest of the program with it. A matching key thus needs no null
+        // check of its own.
+        (bound == key).then(|| unsafe { &*data })
     }
 
     /// Looks the heap up through pthread and makes it the latest.
-    pub(super) fn lookup(key: Key) -> *const HeapData {
+    pub(super) fn lookup(key: Key) -> Option<&'static HeapData> {
         if key == super::NO_KEY {
-            return ptr::null();
+            return None;
         }
-        // SAFETY: the key was created by create_key.
-        let data = unsafe { libc::pthread_getspecific(key as _) }.cast::<HeapData>().cast_const();
-        if !data.is_null() {
-            CURRENT.with(|current| current.set((key, data)));
-        }
-        data
+        // SAFETY: the key was created by create_key, and only bind stores values under it, which
+        // are heap slots of regions that live for the rest of the program.
+        let data = unsafe { libc::pthread_getspecific(key as _).cast::<HeapData>().as_ref() }?;
+        CURRENT.with(|current| current.set((key, ptr::from_ref(data))));
+        Some(data)
     }
 
     pub(super) fn set(key: Key, data: &HeapData) {
@@ -253,14 +256,14 @@ mod test {
         let test = TestRegion::new(8, 2);
         let region = test.region();
         let key = create_key().expect("a key");
-        assert!(get(key).is_null());
+        assert!(get(key).is_none());
 
         let data = region.heap().expect("a free heap").leak();
         // SAFETY: the test keeps the region alive for as long as the heap is bound.
         assert!(bind(key, unsafe { &*ptr::from_ref(data) }));
-        assert_eq!(get(key), ptr::from_ref(data));
+        assert_eq!(get(key).map(ptr::from_ref), Some(ptr::from_ref(data)));
         thread::scope(|scope| {
-            scope.spawn(|| assert!(get(key).is_null()));
+            scope.spawn(|| assert!(get(key).is_none()));
         });
 
         // Unbind without running the destructor on this long-lived thread.
@@ -289,7 +292,7 @@ mod test {
             assert!(!exiting());
             // SAFETY: the test keeps the region alive until the thread has been joined.
             assert!(bind(key, unsafe { &*handoff.0 }));
-            assert_eq!(get(key), handoff.0);
+            assert_eq!(get(key).map(ptr::from_ref), Some(handoff.0));
         })
         .join()
         .unwrap();
