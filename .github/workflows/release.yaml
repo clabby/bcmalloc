@@ -1,0 +1,46 @@
+name: Release
+# Pushing a tag such as v0.2.0 publishes that version of the bcmalloc crate to crates.io and a
+# GitHub release for the tag, with notes generated from the pull requests merged since the last
+# release. Only bcmalloc is published; every other crate in the workspace has publish = false.
+# The CARGO_REGISTRY_TOKEN secret must hold a crates.io token that may publish bcmalloc.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Validate the release
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "bcmalloc") | .version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match the crate version $version."
+            exit 1
+          fi
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A 'bcmalloc release workflow (github.com/clabby/bcmalloc)' \
+            "https://crates.io/api/v1/crates/bcmalloc/$version")
+          case "$status" in
+            404) echo "bcmalloc $version is not on crates.io yet." ;;
+            200) echo "::error::bcmalloc $version is already published."; exit 1 ;;
+            *) echo "::error::crates.io answered $status when asked for bcmalloc $version."; exit 1 ;;
+          esac
+      - name: Publish to crates.io
+        run: cargo publish -p bcmalloc --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Create the GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
