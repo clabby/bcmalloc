@@ -779,26 +779,42 @@ impl HeapData {
     #[inline(never)]
     unsafe fn alloc_general(&self, layout: Layout) -> *mut u8 {
         match classify(layout) {
-            Some(Request::Small(class)) => self
-                .pop(class)
-                // SAFETY: forwarded.
-                .unwrap_or_else(|| unsafe { self.refill(class) })
-                .cast(),
-            Some(Request::Huge { chunks }) => {
+            Some(Request::Small(class)) => {
+                // Bins serve most of a quiet program's requests, and then nothing runs the purge
+                // clock, which keeps memory that a burst left behind. Bigger blocks come through
+                // here, which costs a load of a flag, and runs the clock when chunks are waiting.
                 // SAFETY: the claim keeps the region alive.
-                let region = unsafe { self.region() };
-                let block = self.alloc_huge(region, chunks);
-                if !block.is_null() {
-                    return block;
-                }
-                // The region looks full, but this heap may be sitting on empty slabs. Give them
-                // back and retry.
-                // SAFETY: the caller holds the claim.
-                unsafe { self.flush(region) };
-                self.alloc_huge(region, chunks)
+                unsafe { self.region() }.purge_if_due();
+                self.pop(class)
+                    // SAFETY: forwarded.
+                    .unwrap_or_else(|| unsafe { self.refill(class) })
+                    .cast()
             }
+            // SAFETY: forwarded.
+            Some(Request::Huge { chunks }) => unsafe { self.alloc_whole(chunks) },
             None => ptr::null_mut(),
         }
+    }
+
+    /// Allocates a block of whole chunks, out of line so that the saves of registers that it needs
+    /// stay off the path of small blocks in [`alloc_general`](Self::alloc_general).
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    #[inline(never)]
+    unsafe fn alloc_whole(&self, chunks: usize) -> *mut u8 {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        let block = self.alloc_huge(region, chunks);
+        if !block.is_null() {
+            return block;
+        }
+        // The region looks full, but this heap may be sitting on empty slabs. Give them back and
+        // retry.
+        // SAFETY: the caller holds the claim.
+        unsafe { self.flush(region) };
+        self.alloc_huge(region, chunks)
     }
 
     /// Fills the empty bin of `class` and pops a block, or returns null if the region is out of
