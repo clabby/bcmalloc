@@ -174,6 +174,38 @@ impl Bcmalloc {
         })
     }
 
+    /// How many bytes the block that `ptr` points to holds, as C's `malloc_usable_size` tells, or
+    /// `None` if `ptr` is not in this allocator's region. The answer is only meaningful when `ptr`
+    /// is the start of a live block from this allocator.
+    #[inline]
+    pub fn usable_size(&self, ptr: NonNull<u8>) -> Option<usize> {
+        self.thread_heap().map_or_else(
+            || self.block_layout(ptr).map(|layout| layout.size()),
+            |data| data.usable_size(ptr),
+        )
+    }
+
+    /// Resizes the block that `ptr` points to without its layout, as C's `realloc` does, keeping
+    /// an alignment of 16. Returns null, and leaves the block as it was, if there is no room or
+    /// the size is too large, or if `ptr` is not in this allocator's region.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the start of a live block from this allocator, and `new_size` must not be
+    /// zero.
+    pub unsafe fn realloc_unsized(&self, ptr: NonNull<u8>, new_size: usize) -> *mut u8 {
+        let Some(size) = self.usable_size(ptr) else { return ptr::null_mut() };
+        if Layout::from_size_align(new_size, MIN_ALIGN).is_err() {
+            return ptr::null_mut();
+        }
+        // SAFETY: the block holds `size` bytes at an alignment of at least 16, which is a layout it
+        // can be freed and resized with, and the new size is valid for that alignment.
+        unsafe {
+            let old = Layout::from_size_align_unchecked(size, MIN_ALIGN);
+            GlobalAlloc::realloc(self, ptr.as_ptr(), old, new_size)
+        }
+    }
+
     /// Frees the block that `ptr` points to without its layout, as C's `free` does, and ignores
     /// a pointer outside the region.
     ///
@@ -584,6 +616,29 @@ mod test {
             // SAFETY: each block is live and freed once.
             unsafe { allocator.free_unsized(NonNull::new(block).unwrap()) };
         }
+    }
+    #[test]
+    fn c_style_resizing_and_sizes_need_no_layout() {
+        let allocator = instance();
+        let block = NonNull::new(allocator.malloc(100)).unwrap();
+        assert_eq!(allocator.usable_size(block), Some(112));
+        // SAFETY: the block holds 100 bytes.
+        unsafe { block.as_ptr().write_bytes(7, 100) };
+        // SAFETY: the block is live and the sizes are not zero.
+        let same = unsafe { allocator.realloc_unsized(block, 60) };
+        assert_eq!(same, block.as_ptr(), "a block that still fits stays");
+        // SAFETY: as above.
+        let grown = NonNull::new(unsafe { allocator.realloc_unsized(block, 300_000) }).unwrap();
+        assert_ne!(grown, block);
+        // SAFETY: the grown block holds the first 60 bytes of the old one.
+        assert!(unsafe { core::slice::from_raw_parts(grown.as_ptr(), 60) }.iter().all(|&b| b == 7));
+        assert_eq!(allocator.usable_size(grown), Some(5 * (64 << 10)));
+        // SAFETY: as above.
+        assert!(unsafe { allocator.realloc_unsized(grown, usize::MAX) }.is_null());
+        let mut outside = 0_u8;
+        assert_eq!(allocator.usable_size(NonNull::from(&mut outside)), None);
+        // SAFETY: the block is live and freed once.
+        unsafe { allocator.free_unsized(grown) };
     }
 
     #[test]

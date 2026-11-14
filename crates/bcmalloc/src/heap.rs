@@ -1120,11 +1120,7 @@ impl HeapData {
     /// start of a live block that is not used again.
     #[inline(always)]
     pub(crate) unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
-        let offset = ptr.as_ptr().addr().wrapping_sub(self.private.base.get().addr());
-        if offset >= self.private.span.get() {
-            return;
-        }
-        let entry = self.entry_of(ptr.as_ptr());
+        let Some(entry) = self.entry_in_region(ptr.as_ptr()) else { return };
         if let Some(chunks) = entry.huge_chunks() {
             // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
             return unsafe {
@@ -1133,6 +1129,22 @@ impl HeapData {
         }
         // SAFETY: the caller gives up a block of a slab.
         unsafe { self.free_entry(ptr.as_ptr().cast(), entry) };
+    }
+
+    /// The chunk map entry of the chunk that holds `ptr`, or `None` if `ptr` is not in the region.
+    #[inline(always)]
+    fn entry_in_region(&self, ptr: *const u8) -> Option<Entry> {
+        let offset = ptr.addr().wrapping_sub(self.private.base.get().addr());
+        (offset < self.private.span.get()).then(|| self.entry_of(ptr))
+    }
+
+    /// How many bytes the block at `ptr` holds, or `None` if `ptr` is not in the region. The
+    /// answer is only meaningful for the start of a live block.
+    #[cfg(all(feature = "std", not(loom)))]
+    #[inline(always)]
+    pub(crate) fn usable_size(&self, ptr: NonNull<u8>) -> Option<usize> {
+        let entry = self.entry_in_region(ptr.as_ptr())?;
+        Some(entry.huge_chunks().map_or_else(|| entry.class().block_size(), |n| n << CHUNK_SHIFT))
     }
 
     /// Frees a block of a slab whose chunk map entry is `entry`.

@@ -143,17 +143,8 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         unsafe { free(ptr) };
         return ptr::null_mut();
     }
-    let Some(old) = ALLOCATOR.block_layout(block) else {
-        set_errno(libc::ENOMEM);
-        return ptr::null_mut();
-    };
-    if layout(size, MIN_ALIGN).is_none() {
-        set_errno(libc::ENOMEM);
-        return ptr::null_mut();
-    }
-    // SAFETY: the block is live with the layout the allocator holds, and the size is non-zero and
-    // valid for the alignment.
-    let moved = unsafe { ALLOCATOR.realloc(block.as_ptr(), old, size) };
+    // SAFETY: the caller passes a live block, and the size is not zero.
+    let moved = unsafe { ALLOCATOR.realloc_unsized(block, size) };
     if moved.is_null() {
         set_errno(libc::ENOMEM);
     }
@@ -240,9 +231,7 @@ pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
 /// `ptr` must be null or a live block from this library's allocation functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
-    NonNull::new(ptr.cast::<u8>())
-        .and_then(|block| ALLOCATOR.block_layout(block))
-        .map_or(0, |layout| layout.size())
+    NonNull::new(ptr.cast::<u8>()).and_then(|block| ALLOCATOR.usable_size(block)).unwrap_or(0)
 }
 
 /// Writes the allocator's metrics to standard error. Built with the `metrics` feature.
