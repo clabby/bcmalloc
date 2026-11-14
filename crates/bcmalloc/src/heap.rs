@@ -267,6 +267,8 @@ struct Private {
     /// How many chunks the blocks of whole chunks that this heap handed out and did not free take
     /// up. It counts towards the size of the heap as `held` does.
     runs: Cell<usize>,
+    /// Whether the heap counted as big the last time it was asked. See [`HeapData::is_big`].
+    big: Cell<bool>,
     bins: [Bin; CLASSES],
     /// This heap's bin slots in the region, set at every claim.
     slots: Cell<*mut *mut Block>,
@@ -325,6 +327,7 @@ impl HeapData {
                 cursor: Cell::new(0),
                 held: Cell::new(0),
                 runs: Cell::new(0),
+                big: Cell::new(false),
                 bins: [const {
                     Bin {
                         top: Cell::new(ptr::null_mut()),
@@ -409,9 +412,15 @@ impl HeapData {
     }
 
     /// Whether the heap holds enough memory that its chunks come from the zone of transparent huge
-    /// pages. See [`HUGE_ZONE_CHUNKS`].
-    const fn is_big(&self) -> bool {
-        self.private.held.get() + self.private.runs.get() >= HUGE_ZONE_CHUNKS
+    /// pages. See [`HUGE_ZONE_CHUNKS`]. A heap that became big stays big until it holds less than
+    /// a quarter of that, so that a heap whose size swings around the threshold does not leave
+    /// its new slabs on small pages half of the time.
+    fn is_big(&self) -> bool {
+        let size = self.private.held.get() + self.private.runs.get();
+        let low = if self.private.big.get() { HUGE_ZONE_CHUNKS / 4 } else { HUGE_ZONE_CHUNKS };
+        let big = size >= low;
+        self.private.big.set(big);
+        big
     }
 
     /// The part of the region the next slab of `class` comes from. See [`Region::part`].
@@ -420,7 +429,7 @@ impl HeapData {
     /// single-chunk slab fills quickly and packs next to others. A slab of several chunks holds
     /// few blocks and may stay mostly untouched, where a huge page fault would back all of it, so
     /// it goes there only once the heap holds a slab of its class that it has filled.
-    const fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
+    fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
         let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
         let huge = dense && self.is_big();
         region.part(self.private.node.get(), huge)
@@ -2504,9 +2513,14 @@ mod test {
             // SAFETY: allocated above with this layout.
             unsafe { big.dealloc(block, blocks) };
         }
+        // SAFETY: as above.
+        unsafe {
+            big.dealloc(sparse, layout(20 << 10, 8));
+            big.dealloc(run, layout(9 * CHUNK_SIZE, 8));
+        }
         big.flush();
         let again = big.alloc(blocks).unwrap();
-        assert!(chunk(again) < 128, "a heap that shrank goes back to small pages");
+        assert!(chunk(again) < 128, "a heap that shrank to a quarter goes back to small pages");
         big.validate();
         small.validate();
     }
