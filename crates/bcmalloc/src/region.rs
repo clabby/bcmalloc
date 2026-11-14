@@ -118,6 +118,7 @@ pub struct Region<'a> {
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
     clock: Clock,
+    occupancy: Occupancy,
     #[cfg(feature = "metrics")]
     counters: crate::metrics::RegionCounters,
 }
@@ -138,6 +139,20 @@ struct Clock {
     /// How many purge passes and trims have finished.
     purges_done: AtomicUsize,
 }
+
+/// How many chunks slabs and blocks of whole chunks hold, which tells a big process from a small
+/// one. Every claim and free of chunks writes it, so it keeps a line of its own, away from `aging`,
+/// which the slow paths of allocation read.
+#[derive(Debug)]
+struct Occupancy {
+    _line: [CacheLine; 0],
+    chunks: AtomicUsize,
+}
+
+/// A region with this many chunks in use, 64 MiB, belongs to a process big enough that the
+/// slabs of its classes that fill slabs go to the zone of transparent huge pages whatever the size
+/// of their heap. See [`Region::is_big`].
+const BIG_REGION_CHUNKS: usize = 1024;
 
 // SAFETY: the raw pointer is an address into memory the region owns, and every shared structure
 // behind the references is either atomic or handed out under an exclusive claim.
@@ -208,6 +223,7 @@ impl<'a> Region<'a> {
                 purges_active: AtomicUsize::new(0),
                 purges_done: AtomicUsize::new(0),
             },
+            occupancy: Occupancy { _line: [], chunks: AtomicUsize::new(0) },
             #[cfg(feature = "metrics")]
             counters: crate::metrics::RegionCounters::new(),
         }
@@ -396,6 +412,7 @@ impl<'a> Region<'a> {
             Some(first) => first,
             None => self.alloc_chunks_after_purge(n, align, hint, home)?,
         };
+        self.occupancy.chunks.fetch_add(n, Ordering::Relaxed);
         let zeroed = self.chunks.is_clean(first, n, sys::DISCARD_ZEROES);
         self.chunks.take_purged(first, n, |run| {
             #[cfg(feature = "metrics")]
@@ -409,6 +426,18 @@ impl<'a> Region<'a> {
             }
         });
         Some((first, zeroed))
+    }
+
+    /// Whether so much of the region is in use that the process counts as big. Huge pages cost a
+    /// small process memory it barely uses, since a thread's slabs of each class then back whole
+    /// 2 MiB pages, and spare a big one most of its page faults, which many threads that fault
+    /// at once pay for in time.
+    ///
+    /// The count only steers placement, so it may be approximate. A block handed to another thread
+    /// through a relaxed store can be freed there before its claim's addition reaches the counter,
+    /// which then wraps below zero for a moment; read as signed, that counts as small.
+    pub(crate) fn is_big(&self) -> bool {
+        self.occupancy.chunks.load(Ordering::Relaxed) as isize >= BIG_REGION_CHUNKS as isize
     }
 
     /// The part of the region that the chunks of NUMA node `node` come from, in its zone for
@@ -464,6 +493,7 @@ impl<'a> Region<'a> {
             }
             core::hint::spin_loop();
         }
+        self.occupancy.chunks.fetch_add(more, Ordering::Relaxed);
         self.chunks.take_purged(start, more, |run| {
             #[cfg(feature = "metrics")]
             self.counters.chunks_reused.add(run.len() as u64);
@@ -511,6 +541,7 @@ impl<'a> Region<'a> {
 
     /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge.
     pub(crate) fn free_chunks(&self, first: usize, n: usize) {
+        self.occupancy.chunks.fetch_sub(n, Ordering::Relaxed);
         self.chunks.free_at(first, n, sys::monotonic_ms());
         // A read-modify-write, so that the pass that consumes the flag also sees the bits above no
         // matter which free it read the flag from.

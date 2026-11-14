@@ -502,10 +502,15 @@ impl HeapData {
     /// Slabs of a big heap go to the zone of transparent huge pages when they will be dense. A
     /// single-chunk slab fills quickly and packs next to others. A slab of several chunks holds
     /// few blocks and may stay mostly untouched, where a huge page fault would back all of it, so
-    /// it goes there only once the heap holds a slab of its class that it has filled.
+    /// it goes there only once the heap holds a slab of its class that it has filled. In a big
+    /// process, see [`Region::is_big`], the slabs of a class that the heap fills go there too.
     fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
-        let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
-        let huge = dense && self.is_big();
+        let filled = self.lists(class).filled.get() > 0;
+        let dense = class.slab_chunks() == 1 || filled;
+        // In a big process, a class whose slabs this heap fills is dense whatever the heap's size,
+        // so its next slabs take huge pages too. Many threads that each fill slabs of a few classes
+        // would otherwise fault every page of those slabs in one by one.
+        let huge = dense && (self.is_big() || (filled && region.is_big()));
         region.part(self.private.node.get(), huge)
     }
 
