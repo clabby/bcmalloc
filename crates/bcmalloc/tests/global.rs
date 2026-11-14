@@ -3,13 +3,12 @@
 
 #![cfg(not(miri))]
 
+use bcmalloc::{Bcmalloc, Commit, Config};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::mpsc,
     thread,
 };
-
-use bcmalloc::{Bcmalloc, Commit, Config};
 
 #[global_allocator]
 static GLOBAL: Bcmalloc =

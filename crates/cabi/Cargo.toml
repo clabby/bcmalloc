@@ -11,6 +11,10 @@ description = "The C allocation interface of bcmalloc, as a library to preload."
 name = "bcmalloc_c"
 crate-type = ["cdylib"]
 
+[features]
+# Counts allocations and slow-path events, and prints them at exit when BCMALLOC_SHOW_METRICS is set.
+metrics = [ "bcmalloc/metrics" ]
+
 [dependencies]
 bcmalloc = { workspace = true, features = ["std"] }
 libc = { workspace = true, features = ["std"] }

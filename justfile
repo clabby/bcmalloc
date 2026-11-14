@@ -34,7 +34,7 @@ test-docs:
 
 # Run the unit tests, the integration tests and the doctests.
 test *args:
-    cargo nextest run -p bcmalloc --all-features "$@"
+    cargo nextest run -p bcmalloc -p bcmalloc-cabi --all-features "$@"
     cargo test -p bcmalloc --doc --all-features
 
 # Check the library under every feature combination. The tests and benchmarks need `std`.
@@ -44,6 +44,11 @@ hack *args:
 # Run the tests under Miri with strict provenance.
 miri *args:
     MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri nextest run -p bcmalloc --all-features --lib "$@"
+
+# Measure the line coverage of the library's tests, with every feature, into lcov.info. Needs
+# cargo-llvm-cov and the llvm-tools-preview component.
+coverage *args:
+    cargo llvm-cov nextest -p bcmalloc -p bcmalloc-cabi --all-features --lcov --output-path lcov.info "$@"
 
 # Model check the lock-free code with loom.
 loom *args:
@@ -60,8 +65,9 @@ bench-build:
 # Run every workload under every allocator and print the comparison with medians and bootstrap
 # intervals. Options are --quick, --runs N (default 10), --filter TEXT, --only A,B, --baseline
 # ALLOCATOR, --cpus LIST (taskset, Linux), --manifest PATH (the benches of another crate), --save
-# PATH and --perf, which counts hardware events with perf stat on Linux. Every sample goes to
-# target/bench.tsv.
+# PATH, --load PATH (report a saved file instead of running) and --perf, which counts hardware
+# events with perf stat on Linux. Every sample goes to target/bench.tsv, and a complete run is
+# recorded in benchmarks.json, which renders BENCHMARKS.md, README.md and the figure again.
 bench *args:
     cargo bench -p bcmalloc-bench --bench report -- "$@"
 
@@ -87,3 +93,13 @@ cabi:
 mimalloc-bench dir args: cabi
     echo "bc $PWD/target/cabi/release/libbcmalloc_c.$(if [ "$(uname)" = Darwin ]; then echo dylib; else echo so; fi)" > target/bcmalloc-external.txt
     cd "$1/out/bench" && ../../bench.sh --external="$OLDPWD/target/bcmalloc-external.txt" $2
+    cargo run -q -p bcmalloc-bench-data -- import-mimalloc-bench "$1/out/bench/benchres.csv"
+
+# Render the tables of BENCHMARKS.md and README.md and assets/benchmarks.svg from benchmarks.json.
+# The benchmark recipes do this after they record their results.
+bench-render:
+    cargo run -q -p bcmalloc-bench-data -- render
+
+# Fail if the rendered tables or figure differ from what benchmarks.json gives.
+bench-check:
+    cargo run -q -p bcmalloc-bench-data -- check

@@ -1,9 +1,9 @@
 //! The application workloads shared by every allocator benchmark.
 //!
-//! These are real programs, not allocation loops: a JSON pipeline, a regex engine, a Rust parser,
-//! an HTTP server with its clients and a graph of async tasks. They exist as a held-out set. The
-//! allocator is never tuned against them, so a result here shows whether a gain on the synthetic
-//! workloads of the main crate carries over to code that was written for another purpose.
+//! The workloads are programs written for their own purpose: a JSON pipeline, a regex engine, a
+//! Rust parser, an HTTP server with its clients and a graph of async tasks. The allocator is never
+//! tuned against them, so a result here shows whether a gain on the synthetic workloads of the main
+//! crate carries over to ordinary code.
 //!
 //! A program has exactly one global allocator, so each allocator gets its own benchmark binary
 //! that installs it and calls [`run`]. A binary runs one workload per invocation, which keeps the

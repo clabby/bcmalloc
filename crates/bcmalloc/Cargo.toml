@@ -16,6 +16,9 @@ default = [ "std" ]
 std = [ "libc/std" ]
 # Exposes the model-checking helpers in `bcmalloc::testing` (used by the fuzz targets).
 testing = [ "std" ]
+# Counts allocations, frees, slabs and slow-path events per heap, for `Region::metrics` and
+# `Bcmalloc::metrics`. The fast paths pay one add each on a cache line they already touch.
+metrics = []
 
 [dependencies]
 libc.workspace = true

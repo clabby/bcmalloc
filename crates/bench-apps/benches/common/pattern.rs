@@ -5,15 +5,13 @@
 //! with captures or replacement, and collects owned strings from the matches the way a log tool
 //! does.
 
-use std::{collections::HashMap, fmt::Write, time::Instant};
-
-use regex::{Regex, RegexSet};
-
 use super::{
     Pass, Scale,
     text::{Rng, WORDS, capitalized, push_words},
     twice,
 };
+use regex::{Regex, RegexSet};
+use std::{collections::HashMap, fmt::Write, time::Instant};
 
 const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 const MODULES: [&str; 6] =

@@ -28,18 +28,18 @@
 //! happens when the region is full, when the alignment is above [`MAX_ALIGN`](crate::MAX_ALIGN),
 //! or when more threads are running than the configuration has heaps for.
 
-use core::{
-    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
-    ptr::{self, NonNull},
-};
-
 use crate::{
     allocator::{Backend, allocator},
     config::Config,
     heap::{Heap, HeapData},
     region::{Error, Mapping, Region, Stats},
+    size_class::{MIN_ALIGN, TABLE_MAX},
     sync::{AtomicPtr, AtomicUsize, Ordering},
     tls,
+};
+use core::{
+    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
+    ptr::{self, NonNull},
 };
 
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
@@ -124,6 +124,13 @@ impl Bcmalloc {
         self.existing().map(Region::stats)
     }
 
+    /// A snapshot of the allocator's metrics, or `None` if nothing has been allocated yet. See
+    /// [`Region::metrics`].
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<crate::Metrics> {
+        self.existing().map(Region::metrics)
+    }
+
     /// Returns the memory of idle heaps and free chunks to the operating system. See
     /// [`Region::trim`] for what that costs.
     pub fn trim(&self) {
@@ -143,6 +150,89 @@ impl Bcmalloc {
         self.existing()?.block_layout(ptr.as_ptr())
     }
 
+    /// Allocates `size` bytes aligned to 16, as C's `malloc` does, or returns null if there is no
+    /// room. A size of zero gets a block of its own.
+    #[inline]
+    pub fn malloc(&self, size: usize) -> *mut u8 {
+        if size <= TABLE_MAX &&
+            let Some(data) = self.thread_heap()
+        {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the table covers
+            // the size.
+            return unsafe { data.alloc_table(size, true) };
+        }
+        self.malloc_general(size)
+    }
+
+    /// Allocates what [`malloc`](Self::malloc) does not take on its fast path.
+    #[inline(never)]
+    fn malloc_general(&self, size: usize) -> *mut u8 {
+        Layout::from_size_align(size.max(1), MIN_ALIGN).map_or(ptr::null_mut(), |layout| {
+            // SAFETY: the layout has a non-zero size.
+            unsafe { GlobalAlloc::alloc(self, layout) }
+        })
+    }
+
+    /// How many bytes the block that `ptr` points to holds, as C's `malloc_usable_size` tells, or
+    /// `None` if `ptr` is not in this allocator's region. The answer is only meaningful when `ptr`
+    /// is the start of a live block from this allocator.
+    #[inline]
+    pub fn usable_size(&self, ptr: NonNull<u8>) -> Option<usize> {
+        self.thread_heap().map_or_else(
+            || self.block_layout(ptr).map(|layout| layout.size()),
+            |data| data.usable_size(ptr),
+        )
+    }
+
+    /// Resizes the block that `ptr` points to without its layout, as C's `realloc` does, keeping
+    /// an alignment of 16. Returns null, and leaves the block as it was, if there is no room or
+    /// the size is too large, or if `ptr` is not in this allocator's region.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be the start of a live block from this allocator, and `new_size` must not be
+    /// zero.
+    pub unsafe fn realloc_unsized(&self, ptr: NonNull<u8>, new_size: usize) -> *mut u8 {
+        let Some(size) = self.usable_size(ptr) else { return ptr::null_mut() };
+        if Layout::from_size_align(new_size, MIN_ALIGN).is_err() {
+            return ptr::null_mut();
+        }
+        // SAFETY: the block holds `size` bytes at an alignment of at least 16, which is a layout it
+        // can be freed and resized with, and the new size is valid for that alignment.
+        unsafe {
+            let old = Layout::from_size_align_unchecked(size, MIN_ALIGN);
+            GlobalAlloc::realloc(self, ptr.as_ptr(), old, new_size)
+        }
+    }
+
+    /// Frees the block that `ptr` points to without its layout, as C's `free` does, and ignores
+    /// a pointer outside the region.
+    ///
+    /// # Safety
+    ///
+    /// A pointer inside the region must be the start of a live block from this allocator, and the
+    /// block must not be used again.
+    #[inline]
+    pub unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
+        match self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, its region is this
+            // allocator's, and the caller vouches for the block.
+            Some(data) => unsafe { data.free_unsized(ptr) },
+            // SAFETY: the caller vouches for the block.
+            None => unsafe { self.free_unsized_unbound(ptr) },
+        }
+    }
+
+    /// Frees without a layout for a thread that has no heap yet.
+    #[cold]
+    #[inline(never)]
+    unsafe fn free_unsized_unbound(&self, ptr: NonNull<u8>) {
+        if let Some(layout) = self.block_layout(ptr) {
+            // SAFETY: the layout is the one the allocator holds for the block.
+            unsafe { self.dealloc_unbound(ptr, layout) };
+        }
+    }
+
     /// Hands back the blocks that the calling thread's heap keeps for reuse: its bins, its
     /// outboxes and what other threads sent it, and then its empty slabs.
     ///
@@ -150,10 +240,8 @@ impl Bcmalloc {
     /// held while it sleeps, as jemalloc offers with its thread cache flush. Heaps of exited
     /// threads are handed back on their own, and [`trim`](Self::trim) covers heaps nobody holds.
     pub fn flush_thread(&self) {
-        // SAFETY: a thread's bound heap is claimed by that thread alone, and so is its region.
-        if let (Some(data), Some(region)) = (unsafe { self.bound_heap().as_ref() }, self.existing())
-        {
-            // SAFETY: as above.
+        if let (Some(data), Some(region)) = (self.bound_heap(), self.existing()) {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and so is its region.
             unsafe { data.flush(region) };
         }
     }
@@ -206,6 +294,11 @@ impl Backend for Bcmalloc {
         unsafe { GlobalAlloc::alloc(self, layout) }
     }
 
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::alloc_zeroed(self, layout) }
+    }
+
     unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: forwarded.
         unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) };
@@ -226,15 +319,15 @@ impl Default for Bcmalloc {
 }
 
 impl Bcmalloc {
-    /// This thread's heap, or null if it has not bound one or the fast lookup cannot tell.
+    /// This thread's heap, or `None` if it has not bound one or the fast lookup cannot tell.
     #[inline(always)]
-    fn thread_heap(&self) -> *const HeapData {
+    fn thread_heap(&self) -> Option<&'static HeapData> {
         tls::get(self.key.load(Ordering::Relaxed))
     }
 
-    /// This thread's heap, or null if it has not bound one. This is the slow lookup that settles
+    /// This thread's heap, or `None` if it has not bound one. This is the slow lookup that settles
     /// what [`thread_heap`](Self::thread_heap) could not.
-    fn bound_heap(&self) -> *const HeapData {
+    fn bound_heap(&self) -> Option<&'static HeapData> {
         tls::lookup(self.key.load(Ordering::Relaxed))
     }
 
@@ -287,9 +380,8 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn alloc_unbound(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
             return unsafe { data.alloc(layout) };
         }
         let Some(region) = self.region() else { return ptr::null_mut() };
@@ -304,9 +396,9 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn dealloc_unbound(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above, and the caller vouches for the block.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller vouches
+            // for the block.
             return unsafe { data.dealloc(ptr, layout) };
         }
         let Some(region) = self.existing() else { return };
@@ -324,9 +416,9 @@ impl Bcmalloc {
     #[cold]
     #[inline(never)]
     unsafe fn realloc_unbound(&self, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.bound_heap().as_ref() } {
-            // SAFETY: as above, and the caller vouches for the block and the size.
+        if let Some(data) = self.bound_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller vouches
+            // for the block and the size.
             return unsafe { data.realloc(ptr, layout, new_size) };
         }
         let Some(region) = self.existing() else { return ptr::null_mut() };
@@ -348,9 +440,8 @@ impl Bcmalloc {
 unsafe impl GlobalAlloc for Bcmalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: as above.
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
             return unsafe { data.alloc(layout) };
         }
         // SAFETY: forwarded.
@@ -358,12 +449,27 @@ unsafe impl GlobalAlloc for Bcmalloc {
     }
 
     #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone.
+            return unsafe { data.alloc_zeroed(layout) };
+        }
+        // SAFETY: forwarded.
+        let block = unsafe { self.alloc_unbound(layout) };
+        if !block.is_null() {
+            // SAFETY: the block holds the layout's size in bytes.
+            unsafe { block.write_bytes(0, layout.size()) };
+        }
+        block
+    }
+
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller guarantees the block is live, so it is not null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        match unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: the caller guarantees the block came from this allocator with this layout.
+        match self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller
+            // guarantees the block came from this allocator with this layout.
             Some(data) => unsafe { data.dealloc(ptr, layout) },
             // SAFETY: as above.
             None => unsafe { self.dealloc_unbound(ptr, layout) },
@@ -374,10 +480,10 @@ unsafe impl GlobalAlloc for Bcmalloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: the caller guarantees the block is live, so it is not null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        // SAFETY: a thread's bound heap is claimed by that thread alone.
-        if let Some(data) = unsafe { self.thread_heap().as_ref() } {
-            // SAFETY: the caller guarantees the block is live with this layout and that the new
-            // size is valid for the alignment.
+        if let Some(data) = self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller
+            // guarantees the block is live with this layout and that the new size is valid for
+            // the alignment.
             return unsafe { data.realloc(ptr, layout, new_size) };
         }
         // SAFETY: as above.
@@ -387,11 +493,10 @@ unsafe impl GlobalAlloc for Bcmalloc {
 
 #[cfg(all(test, not(loom), not(miri)))]
 mod test {
-    use core::alloc::Layout;
-    use std::{boxed::Box, vec::Vec};
-
     use super::*;
     use crate::config::Commit;
+    use core::alloc::Layout;
+    use std::{boxed::Box, vec::Vec};
 
     /// An allocator over a small region, leaked so that it can be used as a static would be.
     fn instance() -> &'static Bcmalloc {
@@ -450,6 +555,117 @@ mod test {
         }
         let outside = NonNull::from(&0_u64).cast::<u8>();
         assert_eq!(allocator.block_layout(outside), None, "a pointer outside the region");
+    }
+    #[test]
+    fn frees_without_a_layout_return_everything_from_any_thread() {
+        let allocator = instance();
+        let sizes = [1, 100, 5000, 300_000, 3 << 20];
+        let blocks: Vec<_> = sizes
+            .iter()
+            .map(|&size| {
+                let layout = Layout::from_size_align(size, 16).unwrap();
+                // SAFETY: the layout has a non-zero size.
+                NonNull::new(unsafe { allocator.alloc(layout) }).unwrap().addr().get()
+            })
+            .collect();
+        let (mine, theirs) = blocks.split_at(2);
+        let theirs = theirs.to_vec();
+        // A fresh thread has no heap, so its first free takes the path that binds one.
+        std::thread::spawn(move || {
+            for &addr in &theirs {
+                // SAFETY: each block is live and freed once.
+                unsafe { allocator.free_unsized(NonNull::new(addr as *mut u8).unwrap()) };
+            }
+        })
+        .join()
+        .unwrap();
+        let mut outside = 0_u8;
+        // SAFETY: as above, and the last pointer is not in the region.
+        unsafe {
+            for &addr in mine {
+                allocator.free_unsized(NonNull::new(addr as *mut u8).unwrap());
+            }
+            allocator.free_unsized(NonNull::from(&mut outside));
+        }
+        allocator.flush_thread();
+        allocator.trim();
+        let stats = allocator.stats().unwrap();
+        assert_eq!(stats.free, stats.capacity, "every block went back");
+    }
+
+    #[test]
+    fn malloc_serves_every_size_aligned_and_refuses_impossible_ones() {
+        let allocator = instance();
+        let sizes = [0, 1, 15, 16, 17, 8191, 8192, 8193, 100_000, 600_000, 5 << 20];
+        let blocks: Vec<_> = sizes.iter().map(|&size| (allocator.malloc(size), size)).collect();
+        for &(block, size) in &blocks {
+            assert!(!block.is_null(), "{size} bytes");
+            assert!(block.addr().is_multiple_of(16), "{size} bytes are aligned to 16");
+            let held = allocator.block_layout(NonNull::new(block).unwrap()).unwrap();
+            assert!(held.size() >= size.max(1), "{size} bytes fit in the block");
+            // SAFETY: the block holds the size in bytes.
+            unsafe { block.write_bytes(0xa5, size) };
+        }
+        let distinct: std::collections::BTreeSet<_> = blocks.iter().map(|&(b, _)| b).collect();
+        assert_eq!(distinct.len(), blocks.len(), "a zero-sized request gets a block of its own");
+        assert!(allocator.malloc(usize::MAX).is_null());
+        assert!(allocator.malloc(usize::MAX / 2).is_null());
+        for (block, _) in blocks {
+            // SAFETY: each block is live and freed once.
+            unsafe { allocator.free_unsized(NonNull::new(block).unwrap()) };
+        }
+    }
+    #[test]
+    fn c_style_resizing_and_sizes_need_no_layout() {
+        let allocator = instance();
+        let block = NonNull::new(allocator.malloc(100)).unwrap();
+        assert_eq!(allocator.usable_size(block), Some(112));
+        // SAFETY: the block holds 100 bytes.
+        unsafe { block.as_ptr().write_bytes(7, 100) };
+        // SAFETY: the block is live and the sizes are not zero.
+        let same = unsafe { allocator.realloc_unsized(block, 60) };
+        assert_eq!(same, block.as_ptr(), "a block that still fits stays");
+        // SAFETY: as above.
+        let grown = NonNull::new(unsafe { allocator.realloc_unsized(block, 300_000) }).unwrap();
+        assert_ne!(grown, block);
+        // SAFETY: the grown block holds the first 60 bytes of the old one.
+        assert!(unsafe { core::slice::from_raw_parts(grown.as_ptr(), 60) }.iter().all(|&b| b == 7));
+        assert_eq!(allocator.usable_size(grown), Some(5 * (64 << 10)));
+        // SAFETY: as above.
+        assert!(unsafe { allocator.realloc_unsized(grown, usize::MAX) }.is_null());
+        let mut outside = 0_u8;
+        assert_eq!(allocator.usable_size(NonNull::from(&mut outside)), None);
+        // SAFETY: the block is live and freed once.
+        unsafe { allocator.free_unsized(grown) };
+    }
+    #[test]
+    fn a_thread_whose_first_call_resizes_or_zeroes_binds_a_heap() {
+        let allocator = instance();
+        let layout = Layout::from_size_align(100, 8).unwrap();
+        // SAFETY: the layout is not zero sized.
+        let block = unsafe { allocator.alloc(layout) }.addr();
+        std::thread::spawn(move || {
+            let block = ptr::with_exposed_provenance_mut::<u8>(block);
+            // SAFETY: the block is live with this layout, and the new size is valid.
+            let grown = unsafe { allocator.realloc(block, layout, 5000) };
+            assert!(!grown.is_null());
+            // SAFETY: the grown block is live with the new layout.
+            unsafe { allocator.dealloc(grown, Layout::from_size_align(5000, 8).unwrap()) };
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            let zeroed = Layout::from_size_align(3000, 16).unwrap();
+            // SAFETY: the layout is not zero sized.
+            let block = unsafe { allocator.alloc_zeroed(zeroed) };
+            // SAFETY: the block holds 3000 bytes.
+            assert!(unsafe { core::slice::from_raw_parts(block, 3000) }.iter().all(|&b| b == 0));
+            // SAFETY: the block is live with this layout.
+            unsafe { allocator.dealloc(block, zeroed) };
+        })
+        .join()
+        .unwrap();
+        assert_eq!(allocator.config().heap_count(), 4);
     }
 
     #[test]

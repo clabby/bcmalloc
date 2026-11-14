@@ -1,12 +1,11 @@
 //! Workloads that report how much memory the process holds afterwards and not how fast it got
 //! there.
 
-use std::{thread, time::Duration};
-
 use super::{
     churn::{MEDIUM, MIXED, SMALL, Sizes},
     harness::{Block, Outcome, Rng, Scale, empty_slots, resident_mib},
 };
+use std::{thread, time::Duration};
 
 /// How long to wait after freeing before looking, so that allocators that return memory on a
 /// timer have had their turn.

@@ -4,7 +4,7 @@
 
 A global allocator for long-lived, highly concurrent Rust programs. It reserves one region of address space up front and serves small blocks from per-thread stacks of free pointers, without atomic operations and without touching the blocks. Blocks freed by another thread go home in batched messages, one compare-and-swap per batch. Memory freed by one size class is reused by every other, memory that stays idle goes back to the operating system, and the capacity you configure is a hard limit.
 
-Usage is one line. The region is reserved the first time anything allocates.
+Declare it as the global allocator, and the region is reserved the first time anything allocates.
 
 ```rust
 use bcmalloc::Bcmalloc;
@@ -59,6 +59,23 @@ numbers.extend(0..1000_u32);
 assert_eq!(numbers.iter().sum::<u32>(), 499_500);
 ```
 
+## Metrics
+
+With the `metrics` feature, every heap counts its allocations and frees by size class, the slabs it holds, and the slow paths it takes, and `Bcmalloc::metrics` sums the counts into a snapshot that prints as a report. Only a heap's own thread writes its counters, with plain adds on cache lines the allocator touches anyway, so the feature costs little enough to leave on in production.
+
+```rust,ignore
+use bcmalloc::Bcmalloc;
+
+#[global_allocator]
+static GLOBAL: Bcmalloc = Bcmalloc::new();
+
+if let Some(metrics) = GLOBAL.metrics() {
+    eprintln!("{metrics}");
+}
+```
+
+The C library prints the same report at exit when it is built with the feature and `BCMALLOC_SHOW_METRICS` is set.
+
 ## Configuration
 
 | Option       | Default | What it does                                                         |
@@ -66,63 +83,27 @@ assert_eq!(numbers.iter().sum::<u32>(), 499_500);
 | `capacity`   | 64 GiB  | Size of the region. It is address space until memory is touched.     |
 | `max_heaps`  | 4096    | How many threads can allocate at once.                               |
 | `commit`     | `Lazy`  | `Populate` backs every page now and `Lock` also pins them in RAM.    |
-| `huge_pages` | on      | Backs the region with transparent huge pages on Linux. macOS has none. |
-| `numa`       | on      | Splits the region between NUMA nodes on Linux machines with several.   |
+| `huge_pages` | on      | Huge pages on Linux for big heaps and big blocks. macOS has none.    |
+| `numa`       | on      | Splits the region between NUMA nodes on Linux machines with several. |
 
 If the operating system refuses the default reservation, the global allocator retries with half the capacity down to 256 MiB.
 
 ## Benchmarks
 
-There are two sets of benchmarks. The development suite has 51 synthetic workloads in eight groups, from single-thread loops to producer and consumer rings, and it is what changes are tuned against. The held-out set is never tuned against: real Rust programs built on serde_json, regex, syn, hyper and tokio, and the C programs of [mimalloc-bench](https://github.com/daanx/mimalloc-bench) run with bcmalloc preloaded. Every Rust workload runs ten times per allocator in a rotating order, each run in a fresh process, and the tables show medians relative to mimalloc, so above 1.00 is better for speed and for memory alike. `just bench`, `just bench-apps` and `just mimalloc-bench` reproduce them.
+![For every suite and every other allocator, one dot per workload showing how much faster bcmalloc is](assets/benchmarks.svg)
 
-The development suite on an Apple M4 Max with macOS 26.5 and Rust 1.100, where the system allocator is libmalloc:
+<!-- generated:overview -->
+| Compared with mimalloc             | system | bcmalloc | jemalloc | snmalloc |
+| ---------------------------------- | ------ | -------- | -------- | -------- |
+| development suite, macOS, speed    | 0.52   | 2.09     | 0.87     | 1.22     |
+| development suite, Linux, speed    | 0.63   | 1.73     | 0.88     | 1.14     |
+| Rust programs, macOS, speed        | 0.91   | 1.02     | 0.93     | 1.01     |
+| Rust programs, Linux, speed        | 0.82   | 1.09     | 1.03     | 1.04     |
+| mimalloc-bench, Linux, speed       | -      | 1.00     | 0.82     | 0.94     |
+| mimalloc-bench, Linux, peak memory | -      | 1.51     | 1.38     | 1.40     |
+<!-- /generated:overview -->
 
-| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
-| ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 0.55   | 3.95     | 1.00     | 0.54     | 1.70     |
-| speed, bulk            | 0.27   | 1.50     | 1.00     | 0.43     | 0.79     |
-| speed, churn           | 0.29   | 2.42     | 1.00     | 1.46     | 1.60     |
-| speed, sharing         | 0.55   | 3.03     | 1.00     | 2.18     | 1.60     |
-| speed, false sharing   | 0.86   | 1.00     | 1.00     | 0.77     | 1.00     |
-| speed, collections     | 0.71   | 1.24     | 1.00     | 0.67     | 1.20     |
-| speed, resizing        | 1.00   | 1.02     | 1.00     | 0.92     | 0.85     |
-| speed, large           | 0.98   | 1.06     | 1.00     | 0.14     | 0.11     |
-| speed, all workloads   | 0.52   | 2.07     | 1.00     | 0.88     | 1.22     |
-| speed, mean of groups  | 0.59   | 1.66     | 1.00     | 0.69     | 0.89     |
-| speed, cold            | 0.52   | 2.04     | 1.00     | 0.87     | 1.23     |
-| latency, p99           | 0.53   | 3.21     | 1.00     | 2.38     | 1.66     |
-| memory held afterwards | 2.29   | 3.11     | 1.00     | 0.96     | 3.90     |
-| peak resident memory   | 0.98   | 0.99     | 1.00     | 0.99     | 1.09     |
-
-On a 32-core AMD EPYC 9354P with Ubuntu 24.04, kernel 7.0 and Rust 1.100, where the system allocator is glibc 2.39:
-
-| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc |
-| ---------------------- | ------ | -------- | -------- | -------- | -------- |
-| speed, pair            | 1.05   | 3.11     | 1.00     | 0.64     | 1.73     |
-| speed, bulk            | 0.13   | 1.15     | 1.00     | 0.33     | 0.57     |
-| speed, churn           | 0.82   | 2.21     | 1.00     | 1.65     | 1.70     |
-| speed, sharing         | 0.32   | 2.27     | 1.00     | 2.16     | 1.08     |
-| speed, false sharing   | 0.89   | 1.00     | 1.00     | 1.00     | 1.00     |
-| speed, collections     | 0.61   | 1.01     | 1.00     | 0.72     | 0.94     |
-| speed, resizing        | 1.02   | 1.06     | 1.00     | 0.60     | 0.90     |
-| speed, large           | 0.44   | 1.09     | 1.00     | 0.08     | 0.23     |
-| speed, all workloads   | 0.62   | 1.76     | 1.00     | 0.88     | 1.14     |
-| speed, mean of groups  | 0.55   | 1.46     | 1.00     | 0.63     | 0.88     |
-| speed, cold            | 0.62   | 1.76     | 1.00     | 0.86     | 1.08     |
-| latency, p99           | 0.94   | 3.04     | 1.00     | 1.67     | 2.00     |
-| memory held afterwards | 11.88  | 3.12     | 1.00     | 1.06     | 1.10     |
-| peak resident memory   | 2.20   | 1.11     | 1.00     | 1.86     | 1.50     |
-
-The held-out programs:
-
-| Compared with mimalloc | system | bcmalloc | mimalloc | jemalloc | snmalloc | tcmalloc |
-| --- | --- | --- | --- | --- | --- | --- |
-| speed, Rust programs, macOS | 0.91 | 1.03 | 1.00 | 0.92 | 1.00 | - |
-| speed, Rust programs, Linux | 0.82 | 1.11 | 1.00 | 1.04 | 1.04 | - |
-| speed, mimalloc-bench, Linux | 0.74 | 0.99 | 1.00 | 0.86 | 0.96 | 0.64 |
-| memory, mimalloc-bench, Linux | 1.06 | 0.51 | 1.00 | 0.83 | 0.84 | 0.77 |
-
-On the synthetic suite bcmalloc leads by a wide margin on both machines. On the held-out programs the margin is small. It is the fastest on the Rust programs on both machines, by 3% over the next allocator on macOS and 7% on Linux, and it ties mimalloc for speed on mimalloc-bench while holding about twice its memory at peak. DESIGN.md has the per-program tables and explains the design.
+The development suite has 51 synthetic workloads and is what the allocator is tuned against. The Rust programs, built on serde_json, regex, syn, hyper and tokio, and the C programs of mimalloc-bench are never tuned against. Figures are relative to mimalloc, and above 1.00 is better, faster or less memory. [BENCHMARKS.md](https://github.com/clabby/bcmalloc/blob/main/BENCHMARKS.md) has the method, the machines, every table, and the programs where bcmalloc is not the fastest.
 
 ## Limits
 
@@ -134,7 +115,7 @@ On the synthetic suite bcmalloc leads by a wide margin on both machines. On the 
 
 ## Testing
 
-The lock-free code is checked with loom, the unsafe code with Miri under strict provenance, and the allocator and its chunk bitmap with fuzz targets. `just` has a recipe for each, and `just --list` shows them all.
+The lock-free code is checked with loom, the unsafe code with Miri under strict provenance, and the allocator and its chunk bitmap with fuzz targets that compare them against reference models. Line coverage of the unit tests is reported to Codecov. `just` has a recipe for each, and `just --list` shows them all.
 
 ## LLM Disclosure
 

@@ -15,6 +15,7 @@
 //! | --manifest PATH    | Build and drive the benches of another Cargo.toml than this crate's.  |
 //! | --save PATH        | Also copy the raw samples to PATH.                                    |
 //! | --compare OLD NEW  | Compare two saved sample files. Runs no benchmarks. Shows bcmalloc.   |
+//! | --load PATH        | Print the report of a saved sample file instead of running.           |
 //! | --self-test        | Check the statistics helpers and exit.                                |
 //!
 //! Each run is a fresh process, so no workload sees the heap that an earlier one left behind. The
@@ -43,6 +44,7 @@
 //! resident MiB. Version 1 lines have no metric and no better. They count as the metric warm,
 //! and lower is better only for the unit MiB.
 
+use bcmalloc_bench_data::{self as data, Data, Run, docs, machine, markdown, model::round};
 use std::{
     collections::BTreeMap,
     fs,
@@ -89,13 +91,6 @@ struct Workload {
     lower: bool,
     /// The metric that the tables and the summary use. Set once the samples are in.
     primary: String,
-}
-
-impl Workload {
-    /// Whether a lower value is better for this metric. Latencies always are.
-    fn lower_is_better(&self, metric: &str) -> bool {
-        LATENCY.contains(&metric) || self.lower
-    }
 }
 
 /// One result line of a benchmark binary.
@@ -177,8 +172,12 @@ fn main() {
     }
     let mut workloads = list(&binaries[&allocators[0]], filter.as_deref());
 
-    let mut results = Results::new();
-    for run in 0..runs {
+    let loaded = value_of("--load");
+    let mut results = loaded.as_deref().map_or_else(Results::new, read_tsv);
+    let saved_runs =
+        results.values().flat_map(|series| series.runs.iter()).max().map(|run| run + 1);
+    let runs = if loaded.is_some() { saved_runs.unwrap_or(0) } else { runs };
+    for run in (0..runs).filter(|_| loaded.is_none()) {
         for workload in &workloads {
             for turn in 0..allocators.len() {
                 let allocator = &allocators[(turn + run) % allocators.len()];
@@ -213,12 +212,86 @@ fn main() {
         eprintln!("cannot save to {path}: {error}");
     }
 
-    println!(
-        "Median of {runs} runs. Bold marks the best median and every median whose 95% bootstrap \
-         interval overlaps it.\n"
-    );
-    print_groups(&allocators, &workloads, &results);
-    print_summary(&allocators, &workloads, &results, &baseline);
+    let run = to_run(&workloads, &allocators, &results, runs, &baseline);
+    print!("{}", markdown::report(&run));
+
+    // A run of every workload under every allocator is the record of this machine. A partial or
+    // quick run is not.
+    let complete = filter.is_none() && only.is_none() && !driver.quick && !has("--no-record");
+    if complete {
+        let manifest = value_of("--manifest");
+        let suite = if manifest.is_some_and(|m| m.contains("bench-apps")) { "apps" } else { "dev" };
+        if let Err(error) = record(suite, run) {
+            eprintln!("cannot record the results in benchmarks.json: {error}");
+        }
+    }
+}
+
+/// Turns the samples into a run of benchmarks.json, with the median and its interval of every
+/// series.
+fn to_run(
+    workloads: &[Workload],
+    allocators: &[String],
+    results: &Results,
+    samples: usize,
+    baseline: &str,
+) -> Run {
+    let workloads = workloads
+        .iter()
+        .map(|workload| {
+            let mut metrics: BTreeMap<String, data::Metric> = BTreeMap::new();
+            for ((allocator, name, metric), series) in results {
+                if *name != workload.name || series.values.is_empty() {
+                    continue;
+                }
+                let (lo, hi) = median_interval(&series.values);
+                let stat = data::Stat {
+                    median: round(median(&series.values)),
+                    lo: round(lo),
+                    hi: round(hi),
+                    peak_mib: round(median(&series.peaks)),
+                };
+                metrics
+                    .entry(metric.clone())
+                    .or_insert_with(|| data::Metric {
+                        unit: series.unit.clone(),
+                        results: BTreeMap::new(),
+                    })
+                    .results
+                    .insert(allocator.clone(), stat);
+            }
+            data::Workload {
+                group: workload.group.clone(),
+                name: workload.name.clone(),
+                lower: workload.lower,
+                size: workload.lower && workload.primary != "p99",
+                primary: workload.primary.clone(),
+                metrics,
+            }
+        })
+        .collect();
+    Run {
+        suite: String::new(),
+        machine: machine::key().to_string(),
+        description: machine::describe(),
+        date: machine::today(),
+        samples,
+        baseline: baseline.to_string(),
+        allocators: allocators.to_vec(),
+        workloads,
+    }
+}
+
+/// Records a run in benchmarks.json and renders the documents from it again.
+fn record(suite: &str, mut run: Run) -> std::io::Result<()> {
+    run.suite = suite.to_string();
+    let path = workspace().join("benchmarks.json");
+    let mut data = Data::load(&path)?;
+    data.record(run);
+    data.save(&path)?;
+    docs::write(&workspace(), &data)?;
+    eprintln!("recorded in benchmarks.json, and rendered BENCHMARKS.md, README.md and the figure");
+    Ok(())
 }
 
 // ---- Running the benchmarks ----
@@ -528,241 +601,6 @@ fn ratio_interval(old: &[f64], new: &[f64]) -> Option<(f64, f64)> {
     central_95(&ratios)
 }
 
-/// Which of the medians are bold: the best, and every one whose interval overlaps the best's.
-/// Each entry is a median with its interval, or None when there is no sample.
-fn leaders(cells: &[Option<(f64, f64, f64)>], lower: bool) -> Vec<bool> {
-    let better = |a: f64, b: f64| if lower { a < b } else { a > b };
-    let mut best: Option<(f64, f64, f64)> = None;
-    for cell in cells.iter().flatten() {
-        if best.is_none_or(|(median, ..)| better(cell.0, median)) {
-            best = Some(*cell);
-        }
-    }
-    cells
-        .iter()
-        .map(|cell| match (cell, best) {
-            (Some((_, lo, hi)), Some((_, best_lo, best_hi))) => *lo <= best_hi && best_lo <= *hi,
-            _ => false,
-        })
-        .collect()
-}
-
-// ---- Tables ----
-
-/// The medians and intervals of the samples, if there are any.
-fn summarize(series: Option<&Series>) -> Option<(f64, f64, f64)> {
-    let values = &series?.values;
-    let (lo, hi) = median_interval(values);
-    Some((median(values), lo, hi))
-}
-
-fn fmt_value(value: f64) -> String {
-    if value.abs() >= 10.0 { format!("{value:.1}") } else { format!("{value:.2}") }
-}
-
-fn groups_of(workloads: &[Workload]) -> Vec<&str> {
-    let mut groups: Vec<&str> = Vec::new();
-    for workload in workloads {
-        if !groups.contains(&workload.group.as_str()) {
-            groups.push(&workload.group);
-        }
-    }
-    groups
-}
-
-fn header(first: &str, allocators: &[String]) -> Vec<String> {
-    std::iter::once(first.to_string()).chain(allocators.iter().cloned()).collect()
-}
-
-fn print_groups(allocators: &[String], workloads: &[Workload], results: &Results) {
-    let get = |allocator: &str, workload: &Workload, metric: &str| {
-        results.get(&(allocator.to_string(), workload.name.clone(), metric.to_string()))
-    };
-    // A table of one metric, with the leaders in bold.
-    let table = |members: &[&Workload], metric: &dyn Fn(&Workload) -> String| {
-        let mut rows = vec![header("Workload", allocators)];
-        for workload in members {
-            let metric = metric(workload);
-            let cells: Vec<_> =
-                allocators.iter().map(|a| summarize(get(a, workload, &metric))).collect();
-            let bold = leaders(&cells, workload.lower_is_better(&metric));
-            let unit = get_unit(results, workload, &metric);
-            let mut row = vec![format!("{} ({unit})", workload.name)];
-            for (cell, bold) in cells.iter().zip(bold) {
-                row.push(cell.map_or("-".to_string(), |(median, ..)| {
-                    let text = fmt_value(median);
-                    if bold { format!("**{text}**") } else { text }
-                }));
-            }
-            rows.push(row);
-        }
-        print_table(&rows);
-        println!();
-    };
-
-    for group in groups_of(workloads) {
-        let members: Vec<&Workload> = workloads.iter().filter(|w| w.group == group).collect();
-        println!("### {group}\n");
-        table(&members, &|w| w.primary.clone());
-
-        let cold: Vec<&Workload> = members
-            .iter()
-            .copied()
-            .filter(|w| allocators.iter().any(|a| get(a, w, "cold").is_some()))
-            .collect();
-        if !cold.is_empty() {
-            println!("### {group}, cold\n");
-            table(&cold, &|_| "cold".to_string());
-        }
-
-        let latency: Vec<&Workload> = members
-            .iter()
-            .copied()
-            .filter(|w| allocators.iter().any(|a| get(a, w, "p99").is_some()))
-            .collect();
-        if !latency.is_empty() {
-            println!("### {group}, latency (p50 / p99 / p999)\n");
-            let mut rows = vec![header("Workload", allocators)];
-            for workload in latency {
-                let unit = get_unit(results, workload, "p99");
-                let mut row = vec![format!("{} ({unit})", workload.name)];
-                for allocator in allocators {
-                    let cells: Vec<String> = LATENCY
-                        .iter()
-                        .map(|metric| {
-                            get(allocator, workload, metric)
-                                .map_or("-".to_string(), |s| fmt_value(median(&s.values)))
-                        })
-                        .collect();
-                    row.push(cells.join(" / "));
-                }
-                rows.push(row);
-            }
-            print_table(&rows);
-            println!();
-        }
-    }
-}
-
-/// The unit that any allocator reported for a metric of a workload.
-fn get_unit(results: &Results, workload: &Workload, metric: &str) -> String {
-    results
-        .iter()
-        .find_map(|((_, name, found), series)| {
-            (*name == workload.name && found == metric).then(|| series.unit.clone())
-        })
-        .unwrap_or_else(|| workload.unit.clone())
-}
-
-/// Which metric of a workload a summary row looks at.
-#[derive(Clone, Copy)]
-enum Which {
-    Primary,
-    Cold,
-    P99,
-}
-
-/// Prints the geometric mean, per group and overall, of how each allocator compares with the
-/// baseline, computed from the medians. A figure above 1.00 means better than the baseline for
-/// speed, latency and memory alike.
-fn print_summary(allocators: &[String], workloads: &[Workload], results: &Results, baseline: &str) {
-    // A row picks a metric of a workload, and says whether it wants the peak resident memory.
-    type Pick<'a> = &'a dyn Fn(&Workload) -> Option<(Which, bool)>;
-
-    let has = |workload: &Workload, metric: &str| {
-        results.keys().any(|(_, name, found)| *name == workload.name && found == metric)
-    };
-    let ratio = |allocator: &str, workload: &Workload, (which, peak): (Which, bool)| {
-        let metric = match which {
-            Which::Primary => workload.primary.as_str(),
-            Which::Cold => "cold",
-            Which::P99 => "p99",
-        };
-        let get = |a: &str| {
-            let series =
-                results.get(&(a.to_string(), workload.name.clone(), metric.to_string()))?;
-            Some(median(if peak { &series.peaks } else { &series.values }))
-        };
-        let (mine, base) = (get(allocator)?, get(baseline)?);
-        if mine <= 0.0 || base <= 0.0 {
-            return None;
-        }
-        // Lower is better for memory and latency, so invert to keep "above 1.00 is better".
-        Some(if peak || workload.lower_is_better(metric) { base / mine } else { mine / base })
-    };
-    let geomean = |allocator: &str, pick: Pick<'_>| {
-        let logs: Vec<f64> =
-            workloads.iter().filter_map(|w| Some(ratio(allocator, w, pick(w)?)?.ln())).collect();
-        (!logs.is_empty()).then(|| (logs.iter().sum::<f64>() / logs.len() as f64).exp())
-    };
-    let row = |label: String, pick: Pick<'_>| {
-        let mut row = vec![label];
-        row.extend(
-            allocators
-                .iter()
-                .map(|a| geomean(a, pick).map_or("-".to_string(), |g| format!("{g:.2}"))),
-        );
-        row
-    };
-    // The speed rows take the workloads whose primary metric is a rate, and the memory row those
-    // whose primary metric is a size. Latency has a row of its own.
-    let speed = |w: &Workload| (w.primary != "p99" && !w.lower).then_some((Which::Primary, false));
-    let held = |w: &Workload| (w.primary != "p99" && w.lower).then_some((Which::Primary, false));
-
-    let mut rows = vec![header(&format!("Compared with {baseline}"), allocators)];
-    let mut per_group: Vec<Vec<f64>> = vec![Vec::new(); allocators.len()];
-    for group in groups_of(workloads) {
-        if !workloads.iter().any(|w| w.group == group && speed(w).is_some()) {
-            continue;
-        }
-        let pick = |w: &Workload| if w.group == group { speed(w) } else { None };
-        rows.push(row(format!("speed, {group}"), &pick));
-        for (at, allocator) in allocators.iter().enumerate() {
-            per_group[at].extend(geomean(allocator, &pick));
-        }
-    }
-    rows.push(row("speed, all workloads".to_string(), &speed));
-    rows.push(row("memory held afterwards".to_string(), &held));
-    rows.push(row("peak resident memory".to_string(), &|w| {
-        speed(w).map(|(which, _)| (which, true))
-    }));
-    // Every group counts once, so a group with many workloads does not dominate.
-    let mut mean_row = vec!["speed, mean of groups".to_string()];
-    mean_row.extend(per_group.iter().map(|means| {
-        if means.is_empty() {
-            return "-".to_string();
-        }
-        let mean = (means.iter().map(|m| m.ln()).sum::<f64>() / means.len() as f64).exp();
-        format!("{mean:.2}")
-    }));
-    rows.push(mean_row);
-    if workloads.iter().any(|w| has(w, "cold")) {
-        rows.push(row("speed, cold".to_string(), &|w| {
-            (has(w, "cold") && !w.lower).then_some((Which::Cold, false))
-        }));
-    }
-    if workloads.iter().any(|w| has(w, "p99")) {
-        rows.push(row("latency, p99".to_string(), &|w| {
-            has(w, "p99").then_some((Which::P99, false))
-        }));
-    }
-    println!("### Summary\n");
-    print_table(&rows);
-}
-
-fn print_table(rows: &[Vec<String>]) {
-    let widths: Vec<usize> =
-        (0..rows[0].len()).map(|i| rows.iter().map(|r| r[i].len()).max().unwrap()).collect();
-    let line = |row: &Vec<String>| {
-        let cells: Vec<_> =
-            row.iter().zip(&widths).map(|(cell, width)| format!("{cell:<width$}")).collect();
-        println!("| {} |", cells.join(" | "));
-    };
-    line(&rows[0]);
-    println!("| {} |", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join(" | "));
-    rows[1..].iter().for_each(line);
-}
-
 // ---- Comparing two sample files ----
 
 /// Prints the change of the median from the old file to the new one for every allocator,
@@ -809,8 +647,8 @@ fn compare(old: &str, new: &str, only: &str, filter: Option<&str>) {
             allocator.clone(),
             workload.clone(),
             metric.clone(),
-            format!("{} ({})", fmt_value(old_median), old_series.values.len()),
-            format!("{} ({})", fmt_value(new_median), new_series.values.len()),
+            format!("{} ({})", markdown::fmt_value(old_median), old_series.values.len()),
+            format!("{} ({})", markdown::fmt_value(new_median), new_series.values.len()),
             change,
             interval,
             verdict.to_string(),
@@ -822,7 +660,7 @@ fn compare(old: &str, new: &str, only: &str, filter: Option<&str>) {
     }
     println!("Median change from the old file to the new one, with the sample count in brackets.");
     println!("A verdict means the 95% bootstrap interval of the ratio of medians excludes zero.\n");
-    print_table(&rows);
+    print!("{}", markdown::table(&rows));
 }
 
 // ---- Self-check ----
@@ -849,10 +687,10 @@ fn self_test() {
     assert!(ratio_interval(&[0.0; 4], &noisy).is_none());
 
     let cells = [Some((10.0, 9.0, 11.0)), Some((10.5, 10.0, 12.0)), Some((20.0, 19.0, 21.0)), None];
-    assert_eq!(leaders(&cells, false), [false, false, true, false]);
-    assert_eq!(leaders(&cells, true), [true, true, false, false]);
+    assert_eq!(markdown::leaders(&cells, false), [false, false, true, false]);
+    assert_eq!(markdown::leaders(&cells, true), [true, true, false, false]);
     let tied = [Some((20.0, 10.5, 21.0)), Some((20.5, 19.0, 21.0)), Some((9.0, 8.0, 10.0))];
-    assert_eq!(leaders(&tied, false), [true, true, false]);
+    assert_eq!(markdown::leaders(&tied, false), [true, true, false]);
 
     let (v1, v2) = (parse_result("a\tw\t1.5\tMops/s\t3.0"), parse_result("a\tw\tp99\t80\tns\t4.5"));
     assert_eq!(v1.unwrap().metric, "warm");

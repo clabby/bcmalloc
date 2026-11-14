@@ -20,8 +20,8 @@
 //!
 //! A run of up to 64 chunks fits in one word, so claiming it takes one compare-and-swap. A swap
 //! only fails because another thread's swap succeeded, which makes this path lock-free. A run may
-//! be required to start at a multiple of an alignment. That is how slabs of 8 and 64 chunks stay
-//! aligned to their own size.
+//! be required to start at a multiple of an alignment. That is how slabs of 8 chunks stay aligned
+//! to their own size.
 //!
 //! A run of more than 64 chunks spans several words, and no single atomic covers that. The
 //! allocator claims the words in order and rolls back if it loses a race. This path is
@@ -54,10 +54,12 @@
 //! caller returns the pages to the OS, and the next claim of a purged chunk learns that it must
 //! prepare them for use again.
 //!
-//! Pages are given back in granules of a fixed number of chunks. With transparent huge pages a
-//! granule is one 2 MiB page, 32 chunks, and a pass only takes a granule whose every chunk is free.
-//! Returning part of a huge page would split it into small pages, which costs the TLB reach that
-//! huge pages exist for. This is the rule Temeraire follows in TCMalloc.
+//! Pages are given back in granules of a fixed number of chunks. In memory backed by transparent
+//! huge pages a granule is one 2 MiB page, 32 chunks, and a pass only takes a granule whose every
+//! chunk is free. Returning part of a huge page would split it into small pages, which costs the
+//! TLB reach that huge pages exist for. This is the rule Temeraire follows in TCMalloc. The
+//! bitmap can be split into parts of which only every second one is purged in granules, for the
+//! zones of a region.
 //!
 //! # Placement within a word
 //!
@@ -71,9 +73,8 @@
 //! and then reused by another. The release on the free and the acquire on the next claim make the
 //! first thread's writes visible to the second.
 
-use core::ops::Range;
-
 use crate::sync::{AtomicU64, Ordering};
+use core::ops::Range;
 
 /// log2 of the chunk size.
 pub(crate) const CHUNK_SHIFT: usize = 16;
@@ -99,6 +100,14 @@ pub(crate) struct Chunks<'a> {
     len: usize,
     /// How many chunks are purged together, a power of two of at most 64.
     granule: usize,
+    /// If not zero, the words are split into this many parts as [`Region::home`] splits them,
+    /// and only the words of the odd parts are purged in granules. The others go a chunk at a
+    /// time.
+    ///
+    /// [`Region::home`]: crate::region::Region::home
+    coarse_parts: usize,
+    /// How many times the purge delay the words of the odd parts wait.
+    coarse_wait: u64,
 }
 
 impl<'a> Chunks<'a> {
@@ -126,7 +135,44 @@ impl<'a> Chunks<'a> {
         let (used, rest) = words.split_at(each);
         let (dirty, rest) = rest.split_at(each);
         let (purged, rest) = rest.split_at(each);
-        Self { used, dirty, purged, stamps: &rest[..each], len, granule }
+        Self {
+            used,
+            dirty,
+            purged,
+            stamps: &rest[..each],
+            len,
+            granule,
+            coarse_parts: 0,
+            coarse_wait: 1,
+        }
+    }
+
+    /// These chunks with only the odd ones of `parts` parts purged in granules, and only after
+    /// `wait` times the purge delay. See [`Chunks::coarse_parts`](Self#structfield.coarse_parts).
+    pub(crate) const fn coarse_in_odd_parts(self, parts: usize, wait: u64) -> Self {
+        Self { coarse_parts: parts, coarse_wait: wait, ..self }
+    }
+
+    /// Whether word `w` lies in an odd part, or there are no parts.
+    const fn is_coarse(&self, w: usize) -> bool {
+        let parts = self.coarse_parts;
+        if parts == 0 {
+            return true;
+        }
+        // The part whose words `p * words / parts..(p + 1) * words / parts` hold `w`.
+        let words = Self::words_for(self.len);
+        let part = ((w + 1) * parts).div_ceil(words) - 1;
+        part % 2 == 1
+    }
+
+    /// How many chunks of word `w` are purged together.
+    const fn granule_of(&self, w: usize) -> usize {
+        if self.is_coarse(w) { self.granule } else { 1 }
+    }
+
+    /// How long the chunks of word `w` wait before a purge, for a purge delay of `delay`.
+    const fn delay_of(&self, w: usize, delay: u64) -> u64 {
+        if self.coarse_parts != 0 && self.is_coarse(w) { delay * self.coarse_wait } else { delay }
     }
 
     /// The number of chunks tracked.
@@ -320,9 +366,11 @@ impl<'a> Chunks<'a> {
             if self.dirty[w].load(Ordering::Relaxed) & valid == 0 {
                 continue;
             }
-            if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < delay {
+            if now.saturating_sub(self.stamps[w].load(Ordering::Relaxed)) < self.delay_of(w, delay)
+            {
                 let free = !self.used[w].load(Ordering::Relaxed) & valid;
-                pending |= self.purgeable(free, self.dirty[w].load(Ordering::Relaxed), valid) != 0;
+                let dirty = self.dirty[w].load(Ordering::Relaxed);
+                pending |= self.purgeable(w, free, dirty, valid) != 0;
                 continue;
             }
             // Claim the free granules that hold a dirty chunk. A dirty chunk in use was reclaimed
@@ -330,7 +378,7 @@ impl<'a> Chunks<'a> {
             let mut seen = self.used[w].load(Ordering::Relaxed);
             let claimed = loop {
                 let want =
-                    self.purgeable(!seen & valid, self.dirty[w].load(Ordering::Relaxed), valid);
+                    self.purgeable(w, !seen & valid, self.dirty[w].load(Ordering::Relaxed), valid);
                 if want == 0 {
                     break 0;
                 }
@@ -360,22 +408,46 @@ impl<'a> Chunks<'a> {
         pending
     }
 
-    /// The chunks of a word that a purge would take: every granule that is entirely `free` and has
-    /// a `dirty` chunk. A granule that runs past the end of the region counts its valid part.
-    const fn purgeable(&self, free: u64, dirty: u64, valid: u64) -> u64 {
-        if self.granule == 1 {
+    /// The chunks of word `w` that a purge would take: every granule that is entirely `free` and
+    /// has a `dirty` chunk. A granule that runs past the end of the region counts its valid part.
+    const fn purgeable(&self, w: usize, free: u64, dirty: u64, valid: u64) -> u64 {
+        let granule = self.granule_of(w);
+        if granule == 1 {
             return dirty & free & valid;
         }
         let mut want = 0;
         let mut offset = 0;
         while offset < WORD {
-            let mask = run_mask(self.granule, offset) & valid;
+            let mask = run_mask(granule, offset) & valid;
             if mask != 0 && free & mask == mask && dirty & mask != 0 {
                 want |= mask;
             }
-            offset += self.granule;
+            offset += granule;
         }
         want
+    }
+
+    /// Whether the `n` chunks from `first`, which the caller has just claimed, read as zeros: none
+    /// was used since its pages were last given back, and, unless `purged_reads_zero`, none was
+    /// given back either. Chunks that were never used hold fresh pages, which are zero. Call this
+    /// before [`take_purged`](Self::take_purged), which forgets which chunks were purged.
+    pub(crate) fn is_clean(&self, first: usize, n: usize, purged_reads_zero: bool) -> bool {
+        let end = first + n;
+        let mut chunk = first;
+        while chunk < end {
+            let (word, offset) = (chunk / WORD, chunk % WORD);
+            let take = (WORD - offset).min(end - chunk);
+            let mask = run_mask(take, offset);
+            let mut used = self.dirty[word].load(Ordering::Relaxed);
+            if !purged_reads_zero {
+                used |= self.purged[word].load(Ordering::Relaxed);
+            }
+            if used & mask != 0 {
+                return false;
+            }
+            chunk += take;
+        }
+        true
     }
 
     /// Hands the purged runs among the `n` chunks from `first`, which the caller has just claimed,
@@ -537,10 +609,9 @@ const fn run_starts(free: u64, n: usize, align: usize) -> u64 {
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use std::{vec, vec::Vec};
-
     use super::*;
     use crate::testing::{Bitmap, ChunkModel, Rng, iterations};
+    use std::{vec, vec::Vec};
 
     #[test]
     fn single_chunks_fill_the_bitmap_from_the_bottom() {
@@ -794,6 +865,68 @@ mod test {
         chunks.purge_pass(200, 10, |run| purged.push(run));
         assert_eq!(purged.first(), Some(&(0..32)));
     }
+    #[test]
+    fn only_chunks_unused_since_their_last_purge_are_clean() {
+        let bitmap = Bitmap::new(128);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(4, 4, 0).unwrap();
+        assert!(chunks.is_clean(first, 4, false), "never used");
+        chunks.free_at(first, 4, 0);
+        let again = chunks.alloc(4, 4, 0).unwrap();
+        assert_eq!(again, first);
+        assert!(!chunks.is_clean(first, 4, true), "used since it was fresh");
+        chunks.free_at(first, 4, 0);
+        chunks.purge_pass(100, 10, |_| ());
+        assert!(chunks.claim_at(first, 4));
+        assert!(chunks.is_clean(first, 4, true), "purged pages that read as zeros");
+        assert!(!chunks.is_clean(first, 4, false), "purged pages that may keep their contents");
+        chunks.take_purged(first, 4, |_| ());
+    }
+
+    #[test]
+    fn only_the_odd_parts_are_purged_in_huge_pages() {
+        // Four words in two parts, so the huge page granule applies from chunk 128 on.
+        let bitmap = Bitmap::with_granule(256, 32);
+        let chunks = bitmap.chunks().coarse_in_odd_parts(2, 1);
+        for first in [0, 128] {
+            assert!(chunks.claim_at(first, 2));
+            chunks.free_at(first + 1, 1, 0);
+        }
+        let mut purged = Vec::new();
+        chunks.purge_pass(100, 10, |run| purged.push(run));
+        assert_eq!(purged, vec![(1..2)], "small pages go one chunk at a time, huge pages whole");
+    }
+    #[test]
+    fn huge_pages_wait_longer_before_they_are_purged() {
+        let bitmap = Bitmap::with_granule(256, 32);
+        let chunks = bitmap.chunks().coarse_in_odd_parts(2, 10);
+        for first in [0, 128] {
+            assert!(chunks.claim_at(first, 32));
+            chunks.free_at(first, 32, 0);
+        }
+        let mut purged = Vec::new();
+        assert!(chunks.purge_pass(20, 10, |run| purged.push(run)), "the huge page still waits");
+        assert_eq!(purged, vec![(0..32)]);
+        purged.clear();
+        assert!(!chunks.purge_pass(100, 10, |run| purged.push(run)));
+        assert_eq!(purged, vec![(128..160)]);
+    }
+
+    #[test]
+    fn the_granule_of_a_word_follows_the_parts_of_the_region() {
+        for words in 1..40 {
+            for parts in (2..=8).step_by(2).filter(|&parts| parts <= words) {
+                let bitmap = Bitmap::with_granule(words * WORD, 32);
+                let chunks = bitmap.chunks().coarse_in_odd_parts(parts, 1);
+                for part in 0..parts {
+                    for w in part * words / parts..(part + 1) * words / parts {
+                        let want = if part % 2 == 1 { 32 } else { 1 };
+                        assert_eq!(chunks.granule_of(w), want, "word {w} of {words} in {parts}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn single_chunks_fill_the_fuller_huge_page_of_a_word_first() {
@@ -812,9 +945,8 @@ mod test {
 
 #[cfg(all(test, loom))]
 mod loom_test {
-    use loom::{sync::Arc, thread};
-
     use crate::testing::Bitmap;
+    use loom::{sync::Arc, thread};
 
     /// Runs `claim` on two threads against one bitmap and returns what each got.
     fn race<T: Send + 'static>(

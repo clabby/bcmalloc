@@ -1,8 +1,7 @@
 //! Single-thread microbenchmarks that isolate the cost of one allocation path.
 
-use std::hint::black_box;
-
 use super::harness::{Block, Outcome, Rng, Scale, layout, raw_alloc, raw_free, timed};
+use std::hint::black_box;
 
 /// Allocates and frees one block of `SIZE` bytes over and over. This is the hot path in its purest
 /// form, with the block coming straight back from the free list it was just pushed on.

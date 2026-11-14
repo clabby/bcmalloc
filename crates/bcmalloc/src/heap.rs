@@ -35,7 +35,7 @@
 //! block's slab belongs to this heap comes from the chunk map, one load from a dense array.
 //!
 //! ```text
-//!                     +- own slab, or a class whose blocks share no cache line -> push on the bin
+//!                     +- own slab, or a small block that owns its cache lines -> push on the bin
 //!   free(ptr, layout) |
 //!                     +- another heap's slab -> append to the outbox for that heap
 //!                                                  |
@@ -44,10 +44,11 @@
 //! ```
 //!
 //! A heap may keep a block of another heap's slab in its own bin and hand it out again, as
-//! jemalloc and TCMalloc do, but only for classes whose blocks never share a cache line with other
-//! blocks. Otherwise the reusing thread would write next to a block that the owner still uses,
-//! which is the false sharing that Hoard's rule of returning blocks to their owner prevents. Blocks
-//! of the other classes always go home.
+//! jemalloc and TCMalloc do, but only for classes of at most 256 bytes whose blocks never share a
+//! cache line with other blocks, and for messages. Otherwise the reusing thread would write next to
+//! a block that the owner still uses, which is the false sharing that Hoard's rule of returning
+//! blocks to their owner prevents, or pull across many lines that the owner still holds. Blocks of
+//! the other classes always go home.
 //!
 //! A bin that fills up gives its oldest half back: blocks of this heap's slabs go to the slab, and
 //! the others go to their owners.
@@ -71,6 +72,15 @@
 //! empties its bins and outboxes and is released with all its slabs intact, and the next thread to
 //! start picks it up. Messages that arrive in between wait in its inbox.
 
+use crate::{
+    allocator::{Backend, allocator},
+    cache::CacheLine,
+    chunks::CHUNK_SHIFT,
+    region::{Entry, HUGE_PAGE_CHUNKS, Region},
+    size_class::{CLASSES, Class, MAX_SMALL, Request, STEP, TABLE_MAX, TABLE_STEPS, classify},
+    slab::{Block, List, Owned, Returns, Slab},
+    sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+};
 use core::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
@@ -78,16 +88,6 @@ use core::{
     marker::PhantomData,
     ptr,
     ptr::NonNull,
-};
-
-use crate::{
-    allocator::{Backend, allocator},
-    cache::CacheLine,
-    chunks::CHUNK_SHIFT,
-    region::{Entry, Region},
-    size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
-    slab::{Block, List, Owned, Returns, Slab},
-    sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
 /// The tag on an inbox link that marks a node as a single block and not a message.
@@ -124,6 +124,49 @@ const HUGE_CACHE: usize = 4;
 const HUGE_CACHE_BLOCK: usize = 8 << 20;
 const HUGE_CACHE_BYTES: usize = 16 << 20;
 
+/// Counts a slow-path event of the heap when metrics are compiled in.
+macro_rules! count {
+    ($heap:expr, $event:ident, $n:expr) => {
+        #[cfg(feature = "metrics")]
+        $heap.private.events.add(crate::metrics::Event::$event, $n as u64);
+    };
+}
+
+/// The smallest block for which a zeroed request asks whether the memory is fresh. Clearing a
+/// smaller block costs less than the slab lookup that would find out.
+const ZERO_CHECK_MIN: usize = 1024;
+
+/// Whether a heap may keep and reuse blocks of `class` that another heap owns. See
+/// [`Class::reusable_anywhere`]. Messages qualify too, whatever their size: the heap that reads
+/// one has its lines in its cache already, and reuses it for messages of its own.
+const fn reusable_anywhere(class: Class) -> bool {
+    class.reusable_anywhere() || class.index() == MESSAGE_CLASS.index()
+}
+
+/// How many blocks a bin that overflows gives back at a time, from a buffer on the stack.
+const FLUSH_BATCH: usize = 512;
+
+/// The size of a bin, which [`Entry`] uses to keep the offset of a class's bin.
+pub(crate) const BIN_SIZE: usize = size_of::<Bin>();
+
+/// For every size that the class table covers, in steps of [`STEP`], the byte offset of the
+/// bin of its class in a heap's array of bins. The allocation fast path finds its bin with one load
+/// where looking the class up and then the bin would take a load and a multiplication.
+const BIN_OFFSETS: [u16; TABLE_STEPS] = {
+    let mut offsets = [0; TABLE_STEPS];
+    let mut step = 0;
+    while step < offsets.len() {
+        offsets[step] = (Class::from_table(step * STEP).index() * size_of::<Bin>()) as u16;
+        step += 1;
+    }
+    offsets
+};
+
+/// How many chunks of filled slabs a heap holds before its chunks come from the zone of
+/// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
+/// little memory each, whose huge pages would be mostly empty.
+const HUGE_ZONE_CHUNKS: usize = 16;
+
 /// The last miss of a bin was a refill of an empty bin.
 const UNDERFLOW: u8 = 0b01;
 
@@ -151,7 +194,7 @@ const _: () = assert!(MESSAGE_CLASS.block_size() == MESSAGE_BYTES);
 ///
 /// The stack lives in the heap's slot array and grows down. It is empty when `top` is at the end of
 /// its range and full when it is at the start. Both ends fit in 16 bits of address, because a bin
-/// is at most 1 KiB long, so the checks compare the low bits of `top` only and the bin fits in one
+/// is at most 16 KiB long, so the checks compare the low bits of `top` only and the bin fits in one
 /// load of 16 bytes.
 struct Bin {
     top: Cell<*mut *mut Block>,
@@ -163,6 +206,11 @@ struct Bin {
     misses: Cell<u8>,
     /// Whether this bin may hold blocks of other heaps' slabs.
     anywhere: Cell<bool>,
+    /// Blocks of the class this heap has handed out and freed, on the bin's line.
+    #[cfg(feature = "metrics")]
+    allocs: crate::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    frees: crate::metrics::Counter,
 }
 
 /// Blocks of other heaps' slabs that this heap has freed and not posted yet, all for one heap.
@@ -192,6 +240,11 @@ struct Lists {
     active: Cell<*const Slab>,
     active_last: Cell<*const Slab>,
     full: Cell<*const Slab>,
+    /// How many of the class's slabs that the heap holds have been filled once.
+    filled: Cell<u32>,
+    /// How many slabs of the class the heap holds.
+    #[cfg(feature = "metrics")]
+    slabs: crate::metrics::Counter,
 }
 
 /// What other threads touch in a heap slot, kept on a line of its own.
@@ -216,6 +269,9 @@ struct Private {
     /// slot was claimed from, so that the fast paths reach them without loading the region. They
     /// are set at every claim and valid while the claim lasts.
     base: Cell<*mut u8>,
+    /// The length of the managed memory in bytes, so that a free without a layout can tell a block
+    /// of the region from any other pointer.
+    span: Cell<usize>,
     map: Cell<*const AtomicU64>,
     slabs: Cell<*const Slab>,
     region: Cell<*const Region<'static>>,
@@ -223,12 +279,23 @@ struct Private {
     /// where single-chunk searches start.
     node: Cell<usize>,
     cursor: Cell<usize>,
+    /// How many chunks this heap's slabs that have been filled once take up, which decides whether
+    /// its chunks come from the zone of transparent huge pages. A slab that was never filled may
+    /// have most of its pages untouched, so counting it would move heaps that are small in memory.
+    held: Cell<usize>,
+    /// How many chunks the blocks of whole chunks that this heap handed out and did not free take
+    /// up. It counts towards the size of the heap as `held` does.
+    runs: Cell<usize>,
+    /// Whether the heap counted as big the last time it was asked. See [`HeapData::is_big`].
+    big: Cell<bool>,
     bins: [Bin; CLASSES],
     /// This heap's bin slots in the region, set at every claim.
     slots: Cell<*mut *mut Block>,
     outboxes: [Outbox; OUTBOXES],
     kept: [Cell<Kept>; HUGE_CACHE],
     classes: [Lists; CLASSES],
+    #[cfg(feature = "metrics")]
+    events: crate::metrics::HeapEvents,
 }
 
 /// The state of one heap slot in a region.
@@ -271,11 +338,15 @@ impl HeapData {
                 draining: Cell::new(false),
                 grown: Cell::new(0),
                 base: Cell::new(ptr::null_mut()),
+                span: Cell::new(0),
                 map: Cell::new(ptr::null()),
                 slabs: Cell::new(ptr::null()),
                 region: Cell::new(ptr::null()),
                 node: Cell::new(0),
                 cursor: Cell::new(0),
+                held: Cell::new(0),
+                runs: Cell::new(0),
+                big: Cell::new(false),
                 bins: [const {
                     Bin {
                         top: Cell::new(ptr::null_mut()),
@@ -284,6 +355,10 @@ impl HeapData {
                         capacity: Cell::new(0),
                         misses: Cell::new(0),
                         anywhere: Cell::new(false),
+                        #[cfg(feature = "metrics")]
+                        allocs: crate::metrics::Counter::new(),
+                        #[cfg(feature = "metrics")]
+                        frees: crate::metrics::Counter::new(),
                     }
                 }; CLASSES],
                 slots: Cell::new(ptr::null_mut()),
@@ -300,10 +375,28 @@ impl HeapData {
                         active: Cell::new(ptr::null()),
                         active_last: Cell::new(ptr::null()),
                         full: Cell::new(ptr::null()),
+                        filled: Cell::new(0),
+                        #[cfg(feature = "metrics")]
+                        slabs: crate::metrics::Counter::new(),
                     }
                 }; CLASSES],
+                #[cfg(feature = "metrics")]
+                events: crate::metrics::HeapEvents::new(),
             },
         }
+    }
+
+    /// The allocations, frees and slabs this heap slot has counted for `class`.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn class_counts(&self, class: Class) -> (u64, u64, u64) {
+        let bin = self.bin(class);
+        (bin.allocs.get(), bin.frees.get(), self.lists(class).slabs.get())
+    }
+
+    /// The slow-path counts of this heap slot.
+    #[cfg(feature = "metrics")]
+    pub(crate) const fn events(&self) -> &crate::metrics::HeapEvents {
+        &self.private.events
     }
 
     /// Tries to claim this slot as heap number `id` of the region.
@@ -318,6 +411,7 @@ impl HeapData {
             private.id.set(id);
             private.region.set(ptr::from_ref(region).cast());
             private.base.set(region.chunk_ptr(0));
+            private.span.set(region.span());
             private.slabs.set(region.slabs_ptr());
             private.map.set(region.map_ptr());
             private.slots.set(region.bin_slots(id));
@@ -329,11 +423,35 @@ impl HeapData {
 
     /// Makes the heap take its chunks from the part of the region of NUMA node `node`.
     fn settle_on(&self, region: &Region<'_>, node: usize) {
-        let home = region.home(node);
         self.private.node.set(node);
+        let home = region.home(self.slab_part(region, Class::from_index(0)));
         if !home.contains(&self.private.cursor.get()) {
             self.private.cursor.set(home.start);
         }
+    }
+
+    /// Whether the heap holds enough memory that its chunks come from the zone of transparent huge
+    /// pages. See [`HUGE_ZONE_CHUNKS`]. A heap that became big stays big until it holds less than
+    /// a quarter of that, so that a heap whose size swings around the threshold does not leave
+    /// its new slabs on small pages half of the time.
+    fn is_big(&self) -> bool {
+        let size = self.private.held.get() + self.private.runs.get();
+        let low = if self.private.big.get() { HUGE_ZONE_CHUNKS / 4 } else { HUGE_ZONE_CHUNKS };
+        let big = size >= low;
+        self.private.big.set(big);
+        big
+    }
+
+    /// The part of the region the next slab of `class` comes from. See [`Region::part`].
+    ///
+    /// Slabs of a big heap go to the zone of transparent huge pages when they will be dense. A
+    /// single-chunk slab fills quickly and packs next to others. A slab of several chunks holds
+    /// few blocks and may stay mostly untouched, where a huge page fault would back all of it, so
+    /// it goes there only once the heap holds a slab of its class that it has filled.
+    fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
+        let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
+        let huge = dense && self.is_big();
+        region.part(self.private.node.get(), huge)
     }
 
     /// Points every bin at its range of the slot array, empty and at its initial capacity. A slot
@@ -348,7 +466,7 @@ impl HeapData {
             debug_assert_eq!(bin.top.get(), end, "a released heap left blocks in a bin");
             bin.empty.set(end.addr() as u16);
             bin.misses.set(0);
-            bin.anywhere.set(class.reusable_anywhere());
+            bin.anywhere.set(reusable_anywhere(class));
             self.set_capacity(class, class.bin_initial());
         }
         self.private.grown.set(0);
@@ -362,7 +480,8 @@ impl HeapData {
     /// Sets how many blocks the bin of `class` may hold. It must hold no more than that already.
     fn set_capacity(&self, class: Class, capacity: usize) {
         let bin = self.bin(class);
-        debug_assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
+        // A bin that held more than its capacity would let pushes run past its start.
+        assert!(self.bin_len(class) <= capacity && capacity <= class.bin_max());
         bin.capacity.set(capacity as u16);
         bin.full.set(self.bin_end(class).wrapping_sub(capacity).addr() as u16);
     }
@@ -385,6 +504,7 @@ impl HeapData {
         }
         self.private.grown.set(self.private.grown.get() + bytes);
         self.set_capacity(class, grown);
+        count!(self, BinsGrown, 1);
         true
     }
 
@@ -492,20 +612,37 @@ impl HeapData {
     /// Pops a block off the bin of `class`.
     #[inline(always)]
     fn pop(&self, class: Class) -> Option<*mut Block> {
-        let bin = self.bin(class);
+        Self::pop_from(self.bin(class))
+    }
+
+    /// Pops a block off `bin`.
+    #[inline(always)]
+    fn pop_from(bin: &Bin) -> Option<*mut Block> {
         let top = bin.top.get();
         if top.addr() as u16 == bin.empty.get() {
             return None;
         }
         bin.top.set(top.wrapping_add(1));
-        // SAFETY: slots between the top and the end of a bin hold blocks.
-        Some(unsafe { *top })
+        #[cfg(feature = "metrics")]
+        bin.allocs.add(1);
+        // SAFETY: slots between the top and the end of a bin hold blocks, which are never null.
+        // Saying so lets callers that turn the block into a nullable pointer skip a check.
+        unsafe {
+            let block = *top;
+            core::hint::assert_unchecked(!block.is_null());
+            Some(block)
+        }
     }
 
     /// Pushes a block onto the bin of `class`, or returns false if the bin is full.
     #[inline(always)]
     fn push(&self, class: Class, block: *mut Block) -> bool {
-        let bin = self.bin(class);
+        Self::push_to(self.bin(class), block)
+    }
+
+    /// Pushes a block onto `bin`, or returns false if the bin is full.
+    #[inline(always)]
+    fn push_to(bin: &Bin, block: *mut Block) -> bool {
         let top = bin.top.get();
         if top.addr() as u16 == bin.full.get() {
             return false;
@@ -532,15 +669,34 @@ impl HeapData {
     #[inline(always)]
     pub(crate) unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if Class::is_table_request(layout) {
-            let class = Class::from_table(layout.size());
-            if let Some(block) = self.pop(class) {
-                return block.cast();
-            }
-            // SAFETY: forwarded.
-            return unsafe { self.refill(class) }.cast();
+            // SAFETY: forwarded, and the table covers the size.
+            return unsafe { self.alloc_table(layout.size(), layout.align() > STEP) };
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_general(layout) }
+    }
+    /// Allocates `size` bytes for a size the class table covers, zero included, aligned to 16 if
+    /// `wide` and to 8 otherwise. A wide request rounds the size up to a multiple of 16, whose
+    /// class's blocks are 16-byte aligned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
+    #[inline(always)]
+    pub(crate) unsafe fn alloc_table(&self, size: usize, wide: bool) -> *mut u8 {
+        debug_assert!(size <= TABLE_MAX);
+        let step = if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) };
+        // SAFETY: the size is at most `TABLE_MAX`, a multiple of 16, so its step is in the table,
+        // and every offset in it is that of a bin in the array.
+        let bin = unsafe {
+            let offset = *BIN_OFFSETS.get_unchecked(step);
+            &*self.private.bins.as_ptr().byte_add(usize::from(offset))
+        };
+        if let Some(block) = Self::pop_from(bin) {
+            return block.cast();
+        }
+        // SAFETY: forwarded.
+        unsafe { self.refill(Class::from_table(step * STEP)) }.cast()
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
@@ -582,6 +738,7 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn refill(&self, class: Class) -> *mut Block {
+        count!(self, Refills, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
         // SAFETY: the caller holds the claim.
@@ -640,9 +797,11 @@ impl HeapData {
                 if bin.misses.get() & MISSED == 0 && capacity > class.bin_initial() {
                     // A bin that has not missed for a while holds more than it needs.
                     let shrunk = (capacity / 2).max(class.bin_initial());
-                    // SAFETY: forwarded.
+                    // SAFETY: forwarded. The bin holds no more than the new capacity afterwards,
+                    // even when giving blocks back filed mail into it.
                     unsafe { self.flush_bin(class, shrunk) };
                     self.set_capacity(class, shrunk);
+                    count!(self, BinsShrunk, 1);
                     let bytes = (capacity - shrunk) * class.block_size();
                     self.private.grown.set(self.private.grown.get() - bytes);
                 }
@@ -680,9 +839,7 @@ impl HeapData {
                 unsafe { *slot = block.cast() };
                 slot = slot.wrapping_add(1);
             });
-            if slab.is_exhausted() {
-                self.move_to(slab, List::Full);
-            }
+            self.after_take(slab, class);
         }
         let top = end.wrapping_sub(got);
         if got < want {
@@ -697,21 +854,140 @@ impl HeapData {
     /// active list. Returns false if the region has no room.
     unsafe fn add_slab(&self, region: &Region<'_>, class: Class) -> bool {
         let chunks = class.slab_chunks();
-        let (cursor, node) = (self.private.cursor.get(), self.private.node.get());
-        let Some(first) = region.alloc_chunks(chunks, chunks, cursor, node) else {
+        let part = self.slab_part(region, class);
+        let home = region.home(part);
+        let cursor = self.private.cursor.get();
+        let cursor = if home.contains(&cursor) { cursor } else { home.start };
+        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, chunks, cursor, part) else {
             return false;
         };
+        count!(self, SlabsAdded, 1);
+        #[cfg(feature = "metrics")]
+        self.lists(class).slabs.add(1);
         region.set_owner(first, chunks, self.private.id.get(), class);
         let slab = region.slab(first);
         // SAFETY: the chunks were just allocated to us, so nobody else uses this descriptor.
         let owned = unsafe { slab.owned() };
         // SAFETY: the chunks are a slab-sized, slab-aligned run that is ours alone.
-        unsafe { owned.init(class, region.chunk_ptr(first)) };
+        unsafe { owned.init(class, region.chunk_ptr(first), zeroed) };
         self.push_front(owned, List::Active);
-        if chunks == 1 && region.home(node).contains(&(first / 64)) {
+        if chunks == 1 && home.contains(&(first / 64)) {
             self.private.cursor.set(first / 64);
         }
         true
+    }
+
+    /// Moves a slab that blocks were just taken from to the full list if it has none left.
+    fn after_take(&self, slab: Owned<'_>, class: Class) {
+        if slab.is_exhausted() {
+            self.move_to(slab, List::Full);
+            if slab.mark_filled() {
+                self.private.held.set(self.private.held.get() + class.slab_chunks());
+                let filled = &self.lists(class).filled;
+                filled.set(filled.get() + 1);
+            }
+        }
+    }
+
+    /// Allocates zeroed memory for the layout, returning null if the region is out of room or the
+    /// layout is not supported.
+    ///
+    /// Fresh memory already reads as zeros, so it is not written again, as mimalloc and jemalloc
+    /// skip zeroing pages they know are fresh. A huge block knows from the chunk bitmap. A block
+    /// of a slab is fresh if the slab was set up on zeroed memory and the block lies beyond every
+    /// block the slab has handed out. Blocks in a bin may have been used, so a request that a bin
+    /// can serve takes the block from the bin and clears it, while it is likely still in the cache.
+    /// When the bin is empty the block comes straight from a slab instead, where it may be fresh.
+    /// Small blocks are cleared without asking, which costs less than finding out.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    pub(crate) unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size();
+        match classify(layout) {
+            Some(Request::Small(class)) if class.block_size() >= ZERO_CHECK_MIN => {
+                let (block, zeroed) = self.pop(class).map_or_else(
+                    // SAFETY: forwarded.
+                    || unsafe { self.take_zeroed(class) },
+                    |block| (block.cast::<u8>(), false),
+                );
+                if !block.is_null() && !zeroed {
+                    // SAFETY: the block holds at least `size` bytes and is ours.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+            Some(Request::Huge { chunks }) => {
+                // SAFETY: the claim keeps the region alive.
+                let region = unsafe { self.region() };
+                let (mut block, mut zeroed) = self.alloc_huge_zeroed(region, chunks);
+                if block.is_null() {
+                    // SAFETY: the caller holds the claim.
+                    unsafe { self.flush(region) };
+                    (block, zeroed) = self.alloc_huge_zeroed(region, chunks);
+                }
+                if !block.is_null() && !zeroed {
+                    // SAFETY: as above.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+            _ => {
+                // SAFETY: forwarded.
+                let block = unsafe { self.alloc(layout) };
+                if !block.is_null() {
+                    // SAFETY: as above.
+                    unsafe { block.write_bytes(0, size) };
+                }
+                block
+            }
+        }
+    }
+
+    /// Takes one block of `class` straight from a slab for a zeroed request whose bin is empty,
+    /// and tells whether it still holds the zeros of fresh memory. Falls back to an ordinary
+    /// refill when the inbox has blocks to take in first.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    #[cold]
+    unsafe fn take_zeroed(&self, class: Class) -> (*mut u8, bool) {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        if self.has_mail() {
+            // SAFETY: the caller holds the claim.
+            return (unsafe { self.refill(class) }.cast(), false);
+        }
+        // SAFETY: as above.
+        unsafe { self.maintain(region) };
+        if let Some(block) = self.pop(class) {
+            return (block.cast(), false);
+        }
+        loop {
+            // SAFETY: slabs on our lists are ours.
+            if let Some(slab) = unsafe { self.lists(class).active.get().as_ref() } {
+                // SAFETY: as above.
+                let slab = unsafe { slab.owned() };
+                if let Some((block, zeroed)) = slab.take_one() {
+                    self.after_take(slab, class);
+                    #[cfg(feature = "metrics")]
+                    {
+                        self.bin(class).allocs.add(1);
+                        if zeroed {
+                            count!(self, ZeroedFresh, 1);
+                        }
+                    }
+                    return (block, zeroed);
+                }
+            }
+            // SAFETY: as above.
+            if !unsafe { self.add_slab(region, class) } {
+                // SAFETY: as above.
+                return (unsafe { self.refill(class) }.cast(), false);
+            }
+        }
     }
 
     /// Resizes a block, returning null and leaving the block untouched if there is no room.
@@ -740,6 +1016,7 @@ impl HeapData {
                 let first = region.chunk_index(ptr.as_ptr());
                 if wants <= had {
                     if wants < had {
+                        count!(self, HugeBytesFreed, (had - wants) << CHUNK_SHIFT);
                         region.set_huge(first, wants);
                         region.free_chunks(first + wants, had - wants);
                         region.purge_if_due();
@@ -747,6 +1024,7 @@ impl HeapData {
                     return ptr.as_ptr();
                 }
                 if region.grow_in_place(first, had, wants) {
+                    count!(self, HugeBytesAllocated, (wants - had) << CHUNK_SHIFT);
                     region.set_huge(first, wants);
                     return ptr.as_ptr();
                 }
@@ -800,6 +1078,9 @@ impl HeapData {
             return unsafe { region.dealloc(ptr, layout) };
         };
         let bytes = chunks << CHUNK_SHIFT;
+        self.private.runs.set(self.private.runs.get().saturating_sub(chunks));
+        count!(self, HugeFrees, 1);
+        count!(self, HugeBytesFreed, bytes);
         if bytes <= HUGE_CACHE_BLOCK {
             let held: usize =
                 self.private.kept.iter().map(|kept| kept.get().chunks << CHUNK_SHIFT).sum();
@@ -814,8 +1095,8 @@ impl HeapData {
                 return;
             }
         }
-        // SAFETY: forwarded.
-        unsafe { region.dealloc(ptr, layout) };
+        region.free_chunks(region.chunk_index(ptr.as_ptr()), chunks);
+        region.purge_if_due();
     }
 
     /// Frees a block of a slab. Its class and its owner both come from one load of the chunk map,
@@ -827,18 +1108,68 @@ impl HeapData {
     /// As for [`dealloc`](Self::dealloc).
     #[inline(always)]
     unsafe fn free_small(&self, block: *mut Block) {
-        let entry = self.entry_of(block.cast());
-        let class = entry.class();
+        // SAFETY: forwarded.
+        unsafe { self.free_entry(block, self.entry_of(block.cast())) };
+    }
+
+    /// Frees a block without its layout, as C's `free` does, and ignores a pointer outside the
+    /// region. The chunk map tells a slab's block from a huge one, so this takes one load of the
+    /// map where looking the layout up first and then freeing would take two.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, and a pointer inside the region must be the
+    /// start of a live block that is not used again.
+    #[inline(always)]
+    pub(crate) unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
+        let Some(entry) = self.entry_in_region(ptr.as_ptr()) else { return };
+        if let Some(chunks) = entry.huge_chunks() {
+            // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
+            return unsafe {
+                self.free_huge(ptr, Layout::from_size_align_unchecked(chunks << CHUNK_SHIFT, 16))
+            };
+        }
+        // SAFETY: the caller gives up a block of a slab.
+        unsafe { self.free_entry(ptr.as_ptr().cast(), entry) };
+    }
+
+    /// The chunk map entry of the chunk that holds `ptr`, or `None` if `ptr` is not in the region.
+    #[inline(always)]
+    fn entry_in_region(&self, ptr: *const u8) -> Option<Entry> {
+        let offset = ptr.addr().wrapping_sub(self.private.base.get().addr());
+        (offset < self.private.span.get()).then(|| self.entry_of(ptr))
+    }
+
+    /// How many bytes the block at `ptr` holds, or `None` if `ptr` is not in the region. The
+    /// answer is only meaningful for the start of a live block.
+    #[cfg(all(feature = "std", not(loom)))]
+    #[inline(always)]
+    pub(crate) fn usable_size(&self, ptr: NonNull<u8>) -> Option<usize> {
+        let entry = self.entry_in_region(ptr.as_ptr())?;
+        Some(entry.huge_chunks().map_or_else(|| entry.class().block_size(), |n| n << CHUNK_SHIFT))
+    }
+
+    /// Frees a block of a slab whose chunk map entry is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`dealloc`](Self::dealloc), and `entry` must be the entry of the block's chunk.
+    #[inline(always)]
+    unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
+        // SAFETY: entries hold the offset of a bin in the array.
+        let bin = unsafe { &*self.private.bins.as_ptr().byte_add(entry.bin_offset()) };
+        #[cfg(feature = "metrics")]
+        bin.frees.add(1);
         // Testing the owner first keeps the common case, a block of this heap, on one branch that
         // predicts well. Whether the class allows reuse depends on the size, which is as random as
         // the program's requests.
-        if entry.owner() != self.private.id.get() && !self.bin(class).anywhere.get() {
+        if entry.owner() != self.private.id.get() && !bin.anywhere.get() {
             // SAFETY: forwarded.
-            return unsafe { self.send(block, class, entry.owner()) };
+            return unsafe { self.send(block, entry.class(), entry.owner()) };
         }
-        if !self.push(class, block) {
+        if !Self::push_to(bin, block) {
             // SAFETY: forwarded.
-            unsafe { self.free_full(block, class) };
+            unsafe { self.free_full(block, entry.class()) };
         }
     }
 
@@ -881,19 +1212,25 @@ impl HeapData {
         if len <= keep {
             return;
         }
-        let gone = len - keep;
         // The oldest blocks are at the end of the bin. Move them out first and the rest down, so
-        // that the bin is consistent if giving the blocks back allocates or frees again.
-        let mut out = [ptr::null_mut::<Block>(); 512];
-        let top = bin.top.get();
-        // SAFETY: the bin holds `len` blocks from `top`, and `out` holds a bin's capacity.
-        unsafe {
-            ptr::copy_nonoverlapping(top.add(keep), out.as_mut_ptr(), gone);
-            ptr::copy(top, top.add(gone), keep);
+        // that the bin is consistent if giving the blocks back allocates or frees again. A bin
+        // can be longer than the buffer, so this goes a buffer at a time.
+        let mut out = [ptr::null_mut::<Block>(); FLUSH_BATCH];
+        let mut len = len;
+        while len > keep {
+            let gone = (len - keep).min(FLUSH_BATCH);
+            let top = bin.top.get();
+            // SAFETY: the bin holds `len` blocks from `top`, and `out` holds `gone` of them.
+            unsafe {
+                ptr::copy_nonoverlapping(top.add(len - gone), out.as_mut_ptr(), gone);
+                ptr::copy(top, top.add(gone), len - gone);
+            }
+            bin.top.set(top.wrapping_add(gone));
+            // SAFETY: the blocks were in the bin, so they are in use and ours to give back.
+            unsafe { self.give_back(region, class, &out[..gone], false) };
+            // Giving back may have filed blocks from the inbox into this bin.
+            len = self.bin_len(class);
         }
-        bin.top.set(top.wrapping_add(gone));
-        // SAFETY: the blocks were in the bin, so they are in use and ours to give back.
-        unsafe { self.give_back(region, class, &out[..gone], false) };
     }
 
     /// Gives blocks of `class` that this heap holds back: blocks of its own slabs to the slab, and
@@ -986,6 +1323,7 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn send(&self, block: *mut Block, class: Class, owner: u32) {
+        count!(self, BlocksSent, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
         let size = class.block_size();
@@ -1058,6 +1396,7 @@ impl HeapData {
                 }
             }
             _ => {
+                count!(self, MessagesPosted, 1);
                 outbox.message.set(ptr::null_mut());
                 // SAFETY: the message is a block of ours, given up here.
                 unsafe { dest.post(message.cast(), message.cast()) };
@@ -1103,6 +1442,9 @@ impl HeapData {
     /// The caller must hold the claim.
     unsafe fn drain_inbox(&self, region: &Region<'_>) {
         let mut node = self.shared.inbox.swap(ptr::null_mut(), Ordering::Acquire);
+        if !node.is_null() {
+            count!(self, MailReads, 1);
+        }
         while !node.is_null() {
             let raw = node.map_addr(|addr| addr & !SINGLE);
             // SAFETY: inbox nodes are blocks given to us, linked through their first words, and the
@@ -1132,6 +1474,7 @@ impl HeapData {
     /// The caller must hold the claim, and the block must be an in-use block of one of this heap's
     /// slabs, which is given up.
     unsafe fn file(&self, region: &Region<'_>, block: *mut Block) {
+        count!(self, BlocksFiled, 1);
         let entry = self.entry_of(block.cast());
         debug_assert_eq!(
             entry.owner(),
@@ -1197,12 +1540,21 @@ impl HeapData {
     /// Returns an empty slab's chunks to the chunk allocator.
     fn release(&self, region: &Region<'_>, slab: Owned<'_>) {
         self.unlink(slab);
+        count!(self, SlabsReleased, 1);
+        #[cfg(feature = "metrics")]
+        self.lists(slab.class()).slabs.sub(1);
         let first = region.chunk_index(slab.start());
-        region.free_chunks(first, slab.class().slab_chunks());
+        let chunks = slab.class().slab_chunks();
+        if slab.was_filled() {
+            self.private.held.set(self.private.held.get().saturating_sub(chunks));
+            let filled = &self.lists(slab.class()).filled;
+            filled.set(filled.get().saturating_sub(1));
+        }
+        region.free_chunks(first, chunks);
         region.purge_if_due();
         // Prefer the lowest free word of the home part next time, so slabs stay packed towards the
         // bottom of it.
-        if region.home(self.private.node.get()).contains(&(first / 64)) {
+        if region.home(self.slab_part(region, Class::from_index(0))).contains(&(first / 64)) {
             self.private.cursor.set(self.private.cursor.get().min(first / 64));
         }
     }
@@ -1234,20 +1586,44 @@ impl HeapData {
 
     /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
     pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
+        self.alloc_huge_zeroed(region, chunks).0
+    }
+
+    /// As [`alloc_huge`](Self::alloc_huge), and also tells whether the block reads as zeros.
+    fn alloc_huge_zeroed(&self, region: &Region<'_>, chunks: usize) -> (*mut u8, bool) {
         for kept in &self.private.kept {
             let block = kept.get();
             if block.chunks == chunks {
                 kept.set(Kept::NONE);
                 // The next kept block of this size has been asked for, so it stays a while.
                 self.mark_kept_reused(chunks);
-                return region.chunk_ptr(block.first);
+                count!(self, HugeCacheHits, 1);
+                self.note_huge_alloc(chunks);
+                return (region.chunk_ptr(block.first), false);
             }
         }
-        let Some(first) = region.alloc_chunks(chunks, 1, 0, self.private.node.get()) else {
-            return ptr::null_mut();
+        // A block of whole chunks is a buffer or an arena that most programs touch all of, and
+        // such blocks pack next to each other, so they use huge pages once the heap is big. One of
+        // a huge page or more is worth it whatever the size of the heap.
+        let huge = chunks >= HUGE_PAGE_CHUNKS || self.is_big();
+        let part = region.part(self.private.node.get(), huge);
+        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, 1, 0, part) else {
+            return (ptr::null_mut(), false);
         };
+        self.note_huge_alloc(chunks);
         region.set_huge(first, chunks);
-        region.chunk_ptr(first)
+        #[cfg(feature = "metrics")]
+        if zeroed {
+            count!(self, ZeroedFresh, 1);
+        }
+        (region.chunk_ptr(first), zeroed)
+    }
+
+    /// Records that a huge block of `chunks` chunks was handed out.
+    fn note_huge_alloc(&self, chunks: usize) {
+        self.private.runs.set(self.private.runs.get() + chunks);
+        count!(self, HugeAllocs, 1);
+        count!(self, HugeBytesAllocated, chunks << CHUNK_SHIFT);
     }
 
     /// Marks the kept huge blocks of `chunks` chunks as wanted.
@@ -1522,10 +1898,8 @@ impl<'r> Heap<'r> {
 
     /// As [`alloc`](Self::alloc), but the memory is zeroed.
     pub fn alloc_zeroed(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let block = self.alloc(layout)?;
-        // SAFETY: the block holds at least `layout.size()` bytes and is ours.
-        unsafe { block.as_ptr().write_bytes(0, layout.size()) };
-        Some(block)
+        // SAFETY: this handle holds the claim.
+        NonNull::new(unsafe { self.data.alloc_zeroed(layout) })
     }
 
     /// Frees a block.
@@ -1541,10 +1915,23 @@ impl<'r> Heap<'r> {
         unsafe { self.data.dealloc(ptr, layout) };
     }
 
+    /// Frees a block without its layout, and ignores a pointer outside the region.
+    ///
+    /// # Safety
+    ///
+    /// A pointer inside the region must be a live block of it, and must not be used or freed
+    /// again.
+    pub unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
+        // SAFETY: this handle holds the claim, and the caller vouches for the block.
+        unsafe { self.data.free_unsized(ptr) };
+    }
+
     /// Resizes a block, returning `None` (and leaving the block untouched) if there is no room.
     ///
-    /// A block whose new size falls in the same size class, or the same number of chunks for huge
-    /// blocks, is returned as is. Otherwise the contents are copied to a new block.
+    /// A block of a slab stays where it is while the new size fits in it and fills at least half
+    /// of it. A block of whole chunks that shrinks gives back the chunks past its new end, and one
+    /// that grows takes the chunks right after it if they are free. Otherwise the contents are
+    /// copied to a new block.
     ///
     /// # Safety
     ///
@@ -1604,6 +1991,10 @@ impl Backend for Heap<'_> {
         self.alloc(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
     }
 
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        self.alloc_zeroed(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
     unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: forwarded.
         unsafe { self.dealloc(ptr, layout) };
@@ -1626,18 +2017,17 @@ impl Drop for Heap<'_> {
 
 #[cfg(all(test, not(loom)))]
 mod test {
+    use super::*;
+    use crate::{
+        chunks::CHUNK_SIZE,
+        testing::{Harness, Rng, TestRegion, iterations, random_traffic},
+    };
     use core::{
         alloc::Layout,
         mem::{MaybeUninit, align_of, offset_of, size_of},
         ptr::NonNull,
     };
     use std::vec::Vec;
-
-    use super::*;
-    use crate::{
-        chunks::CHUNK_SIZE,
-        testing::{Harness, Rng, TestRegion, iterations, random_traffic},
-    };
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).unwrap()
@@ -1676,7 +2066,7 @@ mod test {
     fn the_test_sizes_fall_on_both_sides_of_the_reuse_rule() {
         assert!(!Class::for_size(HOMEBOUND).reusable_anywhere());
         assert!(Class::for_size(ANYWHERE).reusable_anywhere());
-        assert!(MESSAGE_CLASS.reusable_anywhere(), "messages are recycled by whoever reads them");
+        assert!(reusable_anywhere(MESSAGE_CLASS), "messages are recycled by whoever reads them");
     }
 
     #[test]
@@ -1949,11 +2339,11 @@ mod test {
         unsafe { block.as_ptr().write_bytes(0xAB, 100) };
 
         // SAFETY: the block is live with the layout given.
-        let same = unsafe { heap.realloc(block, old, 110) }.unwrap();
-        assert_eq!(same, block, "100 and 110 bytes share a size class");
+        let same = unsafe { heap.realloc(block, old, 104) }.unwrap();
+        assert_eq!(same, block, "100 and 104 bytes share a size class");
 
-        // SAFETY: the block is still live, now with the 110-byte layout.
-        let grown = unsafe { heap.realloc(same, layout(110, 8), 5000) }.unwrap();
+        // SAFETY: the block is still live, now with the 104-byte layout.
+        let grown = unsafe { heap.realloc(same, layout(104, 8), 5000) }.unwrap();
         assert_ne!(grown, block);
         // SAFETY: the grown block holds at least 100 initialised bytes.
         let copied = unsafe { core::slice::from_raw_parts(grown.as_ptr(), 100) };
@@ -2048,6 +2438,157 @@ mod test {
         assert!(chunk(huge) >= 128, "huge blocks come from the node's part too");
         near.validate();
         far.validate();
+    }
+    #[test]
+    fn frees_without_a_layout_find_small_and_huge_blocks_and_skip_others() {
+        let test = TestRegion::new(256, 2);
+        let region = test.region();
+        let (heap, other) = (region.heap().unwrap(), region.heap().unwrap());
+        let small = alloc_many(&heap, layout(48, 8), 100);
+        let theirs = alloc_many(&other, layout(4000, 8), 10);
+        let huge = heap.alloc(layout(9 * CHUNK_SIZE + 1, 8)).unwrap();
+        let mut outside = 0_u64;
+        // SAFETY: each block is live and freed once, and the last pointer is not in the region.
+        unsafe {
+            for &block in small.iter().chain(&theirs) {
+                heap.free_unsized(block);
+            }
+            heap.free_unsized(huge);
+            heap.free_unsized(NonNull::from(&mut outside).cast());
+        }
+        heap.flush();
+        other.flush();
+        // The other heap frees the messages it was sent, which are this heap's blocks.
+        heap.flush();
+        heap.validate();
+        other.validate();
+        assert_eq!(used(&region), 0, "every block went back to its slab or the chunk allocator");
+    }
+    #[test]
+    fn shrinking_a_bin_that_takes_in_mail_while_it_shrinks_keeps_it_within_capacity() {
+        // Found by mimalloc-bench's mstress. Shrinking an idle bin gives its oldest blocks back.
+        // Sending another heap's block may read the inbox, and blocks filed from it land in the bin
+        // being shrunk. Setting the smaller capacity after that let pushes run past the bin.
+        let test = TestRegion::new(256, 2);
+        let region = test.region();
+        let (heap, other) = (region.heap().unwrap(), region.heap().unwrap());
+        let class = Class::for_size(ANYWHERE);
+        assert!(class.reusable_anywhere(), "the bin keeps the other heap's blocks");
+        let layout = layout(class.block_size(), 8);
+        let max = class.bin_max();
+        heap.data.set_capacity(class, max);
+        heap.data.private.grown.set((max - class.bin_initial()) * class.block_size());
+        // Blocks of this heap come back through its inbox once the other heap flushes them.
+        let mine = alloc_many(&heap, layout, max);
+        free_all(&other, layout, mine);
+        other.flush();
+        assert!(has_mail(&heap));
+        // The bin fills with the other heap's blocks, which shrinking sends home.
+        let theirs = alloc_many(&other, layout, max);
+        free_all(&heap, layout, theirs);
+        heap.data.bin(class).misses.set(0);
+        heap.data.private.refills.set(MAINTENANCE_INTERVAL - 1);
+        // SAFETY: the handle holds the claim.
+        unsafe { heap.data.maintain(&region) };
+        let capacity = usize::from(heap.data.bin(class).capacity.get());
+        assert!(capacity < max, "the idle bin shrank");
+        assert!(heap.data.bin_len(class) <= capacity);
+        heap.validate();
+        other.validate();
+        heap.flush();
+        other.flush();
+        heap.flush();
+        assert_eq!(used(&region), 0);
+    }
+    #[test]
+    fn zeroed_requests_read_as_zeros_whether_memory_is_fresh_reused_or_cached() {
+        let test = TestRegion::new(256, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let check = |block: NonNull<u8>, size: usize| {
+            // SAFETY: the block holds `size` bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(block.as_ptr(), size) };
+            assert!(bytes.iter().all(|&byte| byte == 0), "a zeroed block of {size} has data");
+        };
+        // Miri checks every byte it writes, so it takes the small sizes only.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[24, 4096]
+        } else {
+            &[24, 2000, 4096, 20 << 10, 9 * CHUNK_SIZE + 5, 3 << 20]
+        };
+        for &size in sizes {
+            let layout = layout(size, 8);
+            for _ in 0..3 {
+                let count = if size > CHUNK_SIZE { 3 } else { 40 };
+                let blocks: Vec<_> =
+                    (0..count).map(|_| heap.alloc_zeroed(layout).unwrap()).collect();
+                for &block in &blocks {
+                    check(block, size);
+                    // SAFETY: the block holds `size` bytes.
+                    unsafe { block.as_ptr().write_bytes(0xa5, size) };
+                }
+                free_all(&heap, layout, blocks);
+                // The next round takes the same memory back, from the bin, the slab or the cache
+                // of huge blocks, or after a flush from the chunk bitmap.
+                if size > 4096 {
+                    heap.flush();
+                }
+            }
+        }
+        heap.flush();
+        heap.validate();
+        assert_eq!(used(&region), 0);
+    }
+    #[test]
+    fn blocks_are_as_aligned_as_their_layouts_ask() {
+        let test = TestRegion::new(64, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        for size in [8, 24, 40, 56, 120, 136] {
+            for align in [8, 16] {
+                let blocks = alloc_many(&heap, layout(size, align), 50);
+                assert!(blocks.iter().all(|block| block.as_ptr().addr() % align == 0));
+                free_all(&heap, layout(size, align), blocks);
+            }
+        }
+    }
+
+    #[test]
+    fn big_heaps_and_big_blocks_take_chunks_from_the_huge_page_zone() {
+        // Four bitmap words: chunks 0 to 127 are the small zone and 128 up the huge one.
+        let test = TestRegion::new(256, 2).with_huge_zone();
+        let region = test.region();
+        let (big, small) = (region.heap().unwrap(), region.heap().unwrap());
+        let chunk = |block: NonNull<u8>| region.chunk_index(block.as_ptr());
+        let blocks = layout(8192, 8);
+        let first = alloc_many(&big, blocks, 8 * (HUGE_ZONE_CHUNKS - 4));
+        assert!(first.iter().all(|&block| chunk(block) < 128), "a small heap uses small pages");
+        let later = alloc_many(&big, blocks, 8 * 16);
+        assert!(chunk(*later.last().unwrap()) >= 128, "a big heap moves to the huge page zone");
+        let sparse = big.alloc(layout(20 << 10, 8)).unwrap();
+        assert!(chunk(sparse) < 128, "a slab of several chunks of a big heap uses small pages");
+        let run = big.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(run) >= 128, "a block of whole chunks of a big heap uses huge pages");
+        let medium = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(medium) < 128, "and one of a small heap does not");
+        let large = small.alloc(layout(HUGE_PAGE_CHUNKS * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(large) >= 128, "a block of a huge page or more uses huge pages");
+        let next = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(next) >= 128, "a heap is big once it holds big blocks too");
+        for block in first.into_iter().chain(later) {
+            // SAFETY: allocated above with this layout.
+            unsafe { big.dealloc(block, blocks) };
+        }
+        // SAFETY: as above.
+        unsafe {
+            big.dealloc(sparse, layout(20 << 10, 8));
+            big.dealloc(run, layout(9 * CHUNK_SIZE, 8));
+        }
+        big.flush();
+        let again = big.alloc(blocks).unwrap();
+        assert!(chunk(again) < 128, "a heap that shrank to a quarter goes back to small pages");
+        big.validate();
+        small.validate();
     }
 
     #[test]
@@ -2209,12 +2750,10 @@ mod test {
 
 #[cfg(all(test, loom))]
 mod loom_test {
-    use core::mem;
-
-    use loom::thread;
-
     use super::*;
     use crate::testing::TestRegion;
+    use core::mem;
+    use loom::thread;
 
     /// A pointer that may be moved to another thread.
     struct SendPtr(NonNull<u8>);

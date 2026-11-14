@@ -120,6 +120,9 @@ pub(crate) unsafe fn lock(ptr: NonNull<u8>, len: usize) -> bool {
     }
 }
 
+/// Whether pages that [`discard`] gave back read as zeros when next touched.
+pub(crate) const DISCARD_ZEROES: bool = cfg!(all(target_os = "linux", not(miri)));
+
 /// Tells the kernel the contents of the range are no longer needed, so it may reclaim the physical
 /// pages. The range stays mapped and usable. Reading it afterwards returns zeros on Linux and
 /// either the old contents or zeros on macOS.

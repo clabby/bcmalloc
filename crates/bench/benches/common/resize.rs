@@ -1,8 +1,7 @@
 //! Workloads that grow collections one element at a time, which is a long chain of reallocations.
 
-use std::hint::black_box;
-
 use super::harness::{Outcome, Scale, timed};
+use std::hint::black_box;
 
 /// Pushes a million numbers onto an empty vector.
 pub(crate) fn vec_growth(scale: Scale) -> Outcome {

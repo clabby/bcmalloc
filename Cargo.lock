@@ -30,6 +30,7 @@ name = "bcmalloc-bench"
 version = "0.0.0"
 dependencies = [
  "bcmalloc",
+ "bcmalloc-bench-data",
  "libc",
  "mimalloc",
  "snmalloc-rs",
@@ -55,6 +56,14 @@ dependencies = [
  "syn",
  "tikv-jemallocator",
  "tokio",
+]
+
+[[package]]
+name = "bcmalloc-bench-data"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

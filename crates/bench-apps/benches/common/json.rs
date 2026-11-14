@@ -5,16 +5,14 @@
 //! result, and then does the same through derived structs. Like a service that reshapes documents,
 //! it keeps the previous iteration's output alive while it builds the next one.
 
-use std::{fmt::Write, time::Instant};
-
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-
 use super::{
     Pass, Scale,
     text::{Rng, WORDS, capitalized, push_words},
     twice,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use std::{fmt::Write, time::Instant};
 
 #[derive(Serialize, Deserialize)]
 struct Geo {

@@ -3,14 +3,6 @@
 //! This module only exists in test builds and behind the `testing` feature, so none of it is part
 //! of the allocator.
 
-use core::{alloc::Layout, cell::Cell, ptr, ptr::NonNull};
-use std::{
-    alloc::{alloc, dealloc},
-    boxed::Box,
-    collections::BTreeMap,
-    vec::Vec,
-};
-
 use crate::{
     chunks::{CHUNK_SHIFT, Chunks},
     heap::{Heap, HeapData},
@@ -18,6 +10,13 @@ use crate::{
     size_class::BIN_SLOTS,
     slab::{Block, Slab},
     sync::AtomicU64,
+};
+use core::{alloc::Layout, cell::Cell, ptr, ptr::NonNull};
+use std::{
+    alloc::{alloc_zeroed, dealloc},
+    boxed::Box,
+    collections::BTreeMap,
+    vec::Vec,
 };
 
 /// A small, fast, deterministic random number generator (xorshift64*).
@@ -93,7 +92,7 @@ pub(crate) struct Buffer {
     layout: Layout,
 }
 
-/// The alignment of the largest slab, which is 64 chunks of 64 KiB.
+/// The alignment of the managed memory, one bitmap word of 64 chunks of 64 KiB.
 pub(crate) const SLAB_ALIGN: usize = 4 << 20;
 
 impl Buffer {
@@ -101,7 +100,7 @@ impl Buffer {
     pub(crate) fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, SLAB_ALIGN).expect("valid test layout");
         // SAFETY: the layout has a non-zero size.
-        let ptr = NonNull::new(unsafe { alloc(layout) }).expect("test allocation failed");
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).expect("test allocation failed");
         Self { ptr, layout }
     }
 
@@ -135,6 +134,7 @@ pub struct TestRegion {
     memory: Buffer,
     chunks: usize,
     nodes: usize,
+    huge_zone: bool,
 }
 
 impl TestRegion {
@@ -157,6 +157,7 @@ impl TestRegion {
                 memory: Buffer::new(chunks << CHUNK_SHIFT),
                 chunks,
                 nodes: 1,
+                huge_zone: false,
             }
         }
     }
@@ -165,6 +166,13 @@ impl TestRegion {
     /// that many would split them.
     pub fn with_nodes(chunks: usize, heaps: usize, nodes: usize) -> Self {
         Self { nodes, ..Self::new(chunks, heaps) }
+    }
+
+    /// This region with the part of every node split into a zone for small pages and one for
+    /// transparent huge pages, as on Linux.
+    #[must_use]
+    pub fn with_huge_zone(self) -> Self {
+        Self { huge_zone: true, ..self }
     }
 
     /// The region over this storage.
@@ -180,8 +188,8 @@ impl TestRegion {
                 map: &self.map,
                 heaps: &self.heaps,
                 bin_slots: self.bins.as_ptr().cast::<*mut Block>().cast_mut(),
-                purge_granule: 1,
                 nodes: self.nodes,
+                huge_zone: self.huge_zone,
             })
         }
     }
@@ -245,11 +253,29 @@ impl<'r> Harness<'r> {
 
     /// Allocates through heap number `heap` (wrapping) and returns whether it succeeded.
     pub fn alloc(&mut self, heap: usize, size: usize, align: usize) -> bool {
+        self.alloc_with(heap, size, align, false)
+    }
+
+    /// As [`alloc`](Self::alloc), but asks for zeroed memory and checks that it is.
+    pub fn alloc_zeroed(&mut self, heap: usize, size: usize, align: usize) -> bool {
+        self.alloc_with(heap, size, align, true)
+    }
+
+    fn alloc_with(&mut self, heap: usize, size: usize, align: usize, zeroed: bool) -> bool {
         let layout = Layout::from_size_align(size, align).expect("valid layout");
         let heap = heap % self.heaps.len();
-        let Some(ptr) = self.heaps[heap].alloc(layout) else { return false };
+        let heap = &self.heaps[heap];
+        let Some(ptr) = (if zeroed { heap.alloc_zeroed(layout) } else { heap.alloc(layout) })
+        else {
+            return false;
+        };
         assert_eq!(ptr.as_ptr().addr() % align, 0, "misaligned block for {layout:?}");
         assert!(self.region.contains(ptr.as_ptr()), "block outside the region");
+        if zeroed {
+            // SAFETY: the block is ours and holds `size` bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), size) };
+            assert!(bytes.iter().all(|&byte| byte == 0), "a zeroed block of {size} bytes has data");
+        }
         self.stamp = self.stamp.wrapping_add(1);
         self.track(ptr, size);
         // SAFETY: the block is ours and holds `size` bytes.
@@ -270,6 +296,19 @@ impl<'r> Harness<'r> {
         // SAFETY: the block is live, from this region, with this layout, and is dropped from the
         // live set so it cannot be freed twice.
         unsafe { self.heaps[heap % self.heaps.len()].dealloc(block.ptr, block.layout) };
+        true
+    }
+
+    /// As [`free`](Self::free), but without the layout, as C's `free` does.
+    pub fn free_unsized(&mut self, heap: usize, victim: usize) -> bool {
+        if self.live.is_empty() {
+            return false;
+        }
+        let block = self.live.swap_remove(victim % self.live.len());
+        Self::verify(&block, block.layout.size());
+        self.spans.remove(&block.ptr.as_ptr().addr());
+        // SAFETY: as in `free`.
+        unsafe { self.heaps[heap % self.heaps.len()].free_unsized(block.ptr) };
         true
     }
 
@@ -416,11 +455,15 @@ pub fn random_traffic(region: &Region<'_>, seed: u64, steps: usize) {
     let mut harness = Harness::new(region, 3);
     for step in 0..steps {
         let heap = rng.below(3);
-        match rng.below(21) {
+        match rng.below(23) {
             0..=9 => {
                 let widest = if rng.below(8) == 0 { 17 } else { 5 };
                 let align = 1 << rng.below(widest);
-                harness.alloc(heap, random_size(&mut rng), align);
+                if rng.below(4) == 0 {
+                    harness.alloc_zeroed(heap, random_size(&mut rng), align);
+                } else {
+                    harness.alloc(heap, random_size(&mut rng), align);
+                }
             }
             10..=16 => {
                 harness.free(heap, rng.below(1 << 20));
@@ -428,7 +471,10 @@ pub fn random_traffic(region: &Region<'_>, seed: u64, steps: usize) {
             17..=18 => {
                 harness.realloc(heap, rng.below(1 << 20), random_size(&mut rng));
             }
-            19 => harness.flush(heap),
+            19..=20 => {
+                harness.free_unsized(heap, rng.below(1 << 20));
+            }
+            21 => harness.flush(heap),
             _ => harness.recycle(heap),
         }
         // The check walks every list, which Miri does slowly, so it samples there.
@@ -462,10 +508,18 @@ fn interpret(harness: &mut Harness<'_>, bytes: &mut impl Iterator<Item = usize>)
             0..=7 => {
                 let limit = [256, 4 << 10, 600 << 10, 6 << 20][bytes.next()? % 4];
                 let size = (bytes.next()? | bytes.next()? << 8 | bytes.next()? << 16) % limit + 1;
-                harness.alloc(heap, size, 1 << (bytes.next()? % 18));
+                let align = 1 << (bytes.next()? % 18);
+                if op % 16 < 6 {
+                    harness.alloc(heap, size, align);
+                } else {
+                    harness.alloc_zeroed(heap, size, align);
+                }
             }
-            8..=11 => {
+            8..=10 => {
                 harness.free(heap, bytes.next()? | bytes.next()? << 8);
+            }
+            11 => {
+                harness.free_unsized(heap, bytes.next()? | bytes.next()? << 8);
             }
             12..=13 => {
                 let size =

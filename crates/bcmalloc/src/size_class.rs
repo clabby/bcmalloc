@@ -1,56 +1,75 @@
 //! Size classes and slab geometry.
 //!
-//! A request of up to 512 KiB is rounded up to one of 104 size classes. Classes are 16 bytes apart
-//! up to 128 bytes. Above that there are eight classes per doubling, so rounding wastes at most one
-//! part in eight.
+//! A request of up to 64 KiB is rounded up to one of 87 size classes. Classes are 8 bytes apart
+//! from 16 up to 128 bytes, as in TCMalloc and mimalloc, so the many Rust values of three, five or
+//! seven words fill their blocks. Above that there are eight classes per doubling, so rounding
+//! wastes at most one part in eight.
 //!
 //! ```text
-//!    16 32 48 64 80 96 112 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 512K
-//!    <---- 8 classes, +16 ---->  <------- 8 classes, +16 ------->  <--- +32 --->  ...
-//!                                <-------- one doubling -------->
+//!    16 24 32 ... 112 120 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 64K
+//!    <---- 15 classes, +8 ---->  <------- 8 classes, +16 ------->  <--- +32 --->  ...
+//!                                 <-------- one doubling -------->
 //! ```
 //!
 //! Each class is carved out of slabs. A slab is a run of chunks aligned to its own size, so the
 //! first chunk of a slab is found by masking a chunk index. Bigger blocks get bigger slabs. That
 //! keeps at least eight blocks in every slab and the unusable tail of a slab under an eighth of it.
 //!
-//! | Block size        | Slab        | Blocks per slab |
-//! | ----------------- | ----------- | --------------- |
-//! | 16 B to 8 KiB     | 64 KiB (1)  | 8 to 4096       |
-//! | 8 KiB to 64 KiB   | 512 KiB (8) | 8 to 56         |
-//! | 64 KiB to 512 KiB | 4 MiB (64)  | 8 to 56         |
+//! | Block size      | Slab        | Blocks per slab |
+//! | --------------- | ----------- | --------------- |
+//! | 16 B to 8 KiB   | 64 KiB (1)  | 8 to 4096       |
+//! | 8 KiB to 64 KiB | 512 KiB (8) | 8 to 56         |
 //!
-//! Anything larger than 512 KiB is a huge request, which gets a run of whole chunks of its own.
+//! Anything larger than 64 KiB is a huge request, which gets a run of whole chunks of its own,
+//! as jemalloc gives large requests extents of their own. A slab of bigger blocks would hold so
+//! few of them that one partly used slab per class and heap would cost more than rounding up to
+//! whole chunks does.
 //!
 //! # Alignment
 //!
-//! Every class size is a multiple of 16 and a slab starts on a multiple of its own size, so every
-//! block is 16-byte aligned for free. A request for more alignment is rounded up to a power of two
-//! that is at least as large as the alignment. A block of such a class starts at a multiple of its
-//! size, which is therefore a multiple of the alignment. Huge allocations start on a chunk
-//! boundary, so the largest supported alignment is one chunk.
-
-use core::alloc::Layout;
+//! A slab starts on a multiple of its own size and a block on a multiple of its size within the
+//! slab, so a block is aligned to the largest power of two that divides its size. Every class is a
+//! multiple of 8, so every block is 8-byte aligned. A request that asks for 16, which C's malloc
+//! always does, is rounded up to a multiple of 16 first. A request for more alignment is rounded
+//! up to a power of two that is at least as large as the alignment. Huge allocations start on a
+//! chunk boundary, so the largest supported alignment is one chunk.
 
 use crate::chunks::CHUNK_SIZE;
+use core::alloc::Layout;
 
-/// The alignment every block has regardless of its class.
+/// The alignment that C's malloc promises, which a request gets unless its layout asks for less.
 pub(crate) const MIN_ALIGN: usize = 16;
+
+/// How far apart the classes up to [`LINEAR_LIMIT`] are, which is also the alignment every block
+/// has.
+pub(crate) const STEP: usize = 8;
 
 /// The largest alignment the allocator supports, which is one chunk.
 pub const MAX_ALIGN: usize = CHUNK_SIZE;
 
 /// The largest block served from a slab. Bigger requests are huge allocations.
-pub const MAX_SMALL: usize = 512 << 10;
+pub const MAX_SMALL: usize = 64 << 10;
+
+/// The largest block that a heap may reuse when another heap owns it. See
+/// [`Class::reusable_anywhere`].
+const ANYWHERE_MAX: usize = 256;
 
 /// Requests of up to this many bytes are classified by a table lookup.
 pub(crate) const TABLE_MAX: usize = 8192;
 
-/// The number of size classes.
-pub(crate) const CLASSES: usize = 104;
+/// The number of size classes: fifteen up to 128 bytes, and eight per doubling up to
+/// [`MAX_SMALL`].
+pub(crate) const CLASSES: usize =
+    LINEAR_CLASSES + 8 * (MAX_SMALL.ilog2() - LINEAR_LIMIT.ilog2()) as usize;
 
-/// Classes up to this many bytes advance in steps of 16.
+/// Classes up to this many bytes advance in steps of [`STEP`].
 const LINEAR_LIMIT: usize = 128;
+
+/// The smallest class. A slab's bitmap has room for the blocks of a single chunk of it.
+const SMALLEST: usize = 16;
+
+/// How many classes there are up to [`LINEAR_LIMIT`].
+const LINEAR_CLASSES: usize = (LINEAR_LIMIT - SMALLEST) / STEP + 1;
 
 /// A size class, which is an index into the table of block sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,10 +86,10 @@ pub(crate) enum Request {
 
 /// The block size of class index `i`.
 const fn block_size_of(i: usize) -> usize {
-    if i < LINEAR_LIMIT / MIN_ALIGN {
-        return (i + 1) * MIN_ALIGN;
+    if i < LINEAR_CLASSES {
+        return SMALLEST + i * STEP;
     }
-    let (doubling, step) = ((i - 8) / 8, (i - 8) % 8);
+    let (doubling, step) = ((i - LINEAR_CLASSES) / 8, (i - LINEAR_CLASSES) % 8);
     let top_bit = doubling + 7;
     (1 << top_bit) + (step + 1) * (1 << (top_bit - 3))
 }
@@ -90,8 +109,8 @@ const BLOCK_SIZES: [u32; CLASSES] = {
 const LINE: usize = if cfg!(target_arch = "aarch64") { 128 } else { 64 };
 
 /// How many block pointers a heap's bin of class index `i` starts out holding at most. Small blocks
-/// get many and big blocks few, so that a full bin of a small class holds about 32 KiB and one of a
-/// class above 8 KiB about 64 KiB.
+/// get many and big blocks few, so that a full bin holds up to 32 KiB of blocks, but at least 8 and
+/// at most 128 of them, and one of a class above 8 KiB up to 64 KiB, between 1 and 8 of them.
 const fn bin_initial_of(i: usize) -> usize {
     let size = block_size_of(i);
     if size <= TABLE_MAX {
@@ -102,12 +121,12 @@ const fn bin_initial_of(i: usize) -> usize {
 }
 
 /// How many block pointers the bin of class index `i` may grow to hold. A bin grows when the
-/// program alternates between emptying it and filling it, so that bursts of a few hundred blocks
+/// program alternates between emptying it and filling it, so that bursts of a few thousand blocks
 /// stay in the bin, as TCMalloc grows its per-CPU caches.
 const fn bin_max_of(i: usize) -> usize {
     let size = block_size_of(i);
     if size <= TABLE_MAX {
-        clamp((128 << 10) / size, 8, 512)
+        clamp((128 << 10) / size, 8, 2048)
     } else {
         clamp((128 << 10) / size, 1, 16)
     }
@@ -166,22 +185,27 @@ const RECIPROCALS: [u64; CLASSES] = {
     table
 };
 
-/// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
-const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
-    let mut table = [0; TABLE_MAX / MIN_ALIGN + 1];
+/// How many entries the class table has: one for every [`STEP`] up to [`TABLE_MAX`].
+pub(crate) const TABLE_STEPS: usize = TABLE_MAX / STEP + 1;
+
+/// The class of every size up to [`TABLE_MAX`], indexed by the size in steps of [`STEP`] rounded
+/// up.
+const TABLE: [u8; TABLE_STEPS] = {
+    let mut table = [0; TABLE_STEPS];
     let mut step = 0;
     while step < table.len() {
-        table[step] = Class::for_size(step * MIN_ALIGN).0;
+        table[step] = Class::for_size(step * STEP).0;
         step += 1;
     }
     table
 };
 
 impl Class {
-    /// The class of a request that [`Class`::is_table_request] accepts.
+    /// The class of a size of at most [`TABLE_MAX`], for a request that needs no more than 8 bytes
+    /// of alignment, or for one that needs 16 once the size is rounded up to a multiple of 16.
     #[inline(always)]
     pub(crate) const fn from_table(size: usize) -> Self {
-        Self(TABLE[size.div_ceil(MIN_ALIGN)])
+        Self(TABLE[size.div_ceil(STEP)])
     }
 
     /// Whether the layout is small and aligned loosely enough to be classified by the table,
@@ -211,12 +235,12 @@ impl Class {
     pub(crate) const fn for_size(size: usize) -> Self {
         debug_assert!(size <= MAX_SMALL);
         if size <= LINEAR_LIMIT {
-            return Self(size.saturating_sub(1).div_euclid(MIN_ALIGN) as u8);
+            return Self(size.saturating_sub(SMALLEST).div_ceil(STEP) as u8);
         }
         let below = size - 1;
         let top_bit = (usize::BITS - 1 - below.leading_zeros()) as usize;
         let step = (below >> (top_bit - 3)) & 7;
-        Self((8 + (top_bit - 7) * 8 + step) as u8)
+        Self((LINEAR_CLASSES + (top_bit - 7) * 8 + step) as u8)
     }
 
     /// How many block pointers the bin of this class holds when a heap starts.
@@ -240,11 +264,13 @@ impl Class {
     /// That needs two things. A block must not share a cache line with any other block, or the
     /// thread that reuses it would write next to a block that its owner still uses, which is the
     /// false sharing that Hoard's ownership rule exists to prevent. Blocks start at multiples of
-    /// their size, so a size that is a multiple of the line width is enough. And a block must not
-    /// pin much memory while a foreign heap holds it, so only classes with one-chunk slabs qualify.
+    /// their size, so a size that is a multiple of the line width is enough. And the block must
+    /// span few lines. Its lines are likely still in the cache of the owner, which wrote them, and
+    /// a thread on another core that reuses the block pulls each line it writes across, where the
+    /// owner would find them at hand. For a few lines that costs less than sending the block home.
     pub(crate) const fn reusable_anywhere(self) -> bool {
         let size = self.block_size();
-        size.is_multiple_of(LINE) && size <= TABLE_MAX
+        size.is_multiple_of(LINE) && size <= ANYWHERE_MAX
     }
 
     /// The position of this class in per-heap tables.
@@ -263,17 +289,10 @@ impl Class {
         ((offset as u64 * RECIPROCALS[self.0 as usize]) >> 32) as usize
     }
 
-    /// How many chunks one slab of this class spans, which is 1, 8 or 64. Slabs are aligned to this
+    /// How many chunks one slab of this class spans, which is 1 or 8. Slabs are aligned to this
     /// many chunks.
     pub(crate) const fn slab_chunks(self) -> usize {
-        let size = self.block_size();
-        if size <= 8192 {
-            1
-        } else if size <= 65536 {
-            8
-        } else {
-            64
-        }
+        if self.block_size() <= TABLE_MAX { 1 } else { 8 }
     }
 
     /// How many blocks fit in one slab.
@@ -292,8 +311,10 @@ pub(crate) const fn classify(layout: Layout) -> Option<Request> {
         return Some(Request::Huge { chunks: size.div_ceil(CHUNK_SIZE) });
     }
     // Over-aligned blocks come from power-of-two classes, as the module documentation explains.
-    let size = if align <= MIN_ALIGN {
+    let size = if align <= STEP {
         size
+    } else if align == MIN_ALIGN {
+        size.next_multiple_of(MIN_ALIGN)
     } else {
         let rounded = size.next_power_of_two();
         if rounded > align { rounded } else { align }
@@ -313,14 +334,15 @@ mod test {
     fn the_table_is_strictly_increasing_and_spans_the_range() {
         let sizes: std::vec::Vec<_> =
             (0..CLASSES).map(|i| Class::from_index(i).block_size()).collect();
-        assert_eq!((sizes[0], sizes[CLASSES - 1]), (MIN_ALIGN, MAX_SMALL));
+        assert_eq!((sizes[0], sizes[CLASSES - 1]), (SMALLEST, MAX_SMALL));
         assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(sizes.iter().all(|size| size % MIN_ALIGN == 0));
+        assert!(sizes.iter().all(|size| size % STEP == 0));
+        assert!(sizes[LINEAR_CLASSES..].iter().all(|size| size % MIN_ALIGN == 0));
     }
 
     #[test]
     fn for_size_picks_the_smallest_class_that_fits() {
-        // Every size below 512 KiB is cheap to check, and Miri takes a sample.
+        // Every small size is cheap to check, and Miri takes a sample.
         let step = if cfg!(miri) { 997 } else { 1 };
         for size in (1..=MAX_SMALL).step_by(step) {
             let class = Class::for_size(size);
@@ -401,6 +423,18 @@ mod test {
             }
         }
     }
+    #[test]
+    fn requests_for_sixteen_bytes_of_alignment_get_classes_that_keep_it() {
+        for size in 1..=TABLE_MAX {
+            let Some(Request::Small(class)) = classify(layout(size, MIN_ALIGN)) else { panic!() };
+            assert_eq!(class.block_size() % MIN_ALIGN, 0, "{size}");
+            assert_eq!(Class::from_table(size.next_multiple_of(MIN_ALIGN)), class);
+            let Some(Request::Small(loose)) = classify(layout(size, STEP)) else { panic!() };
+            assert!(loose.block_size() <= class.block_size());
+            assert_eq!(Class::from_table(size), loose);
+        }
+        assert_eq!(Class::for_size(24).block_size(), 24, "three words fill their block");
+    }
 
     #[test]
     fn the_small_and_huge_boundary_is_exact() {
@@ -408,7 +442,7 @@ mod test {
             classify(layout(MAX_SMALL, 1)),
             Some(Request::Small(Class::from_index(CLASSES - 1)))
         );
-        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 9 }));
+        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 2 }));
         assert_eq!(
             classify(layout(CHUNK_SIZE, 1)),
             Some(Request::Small(Class::for_size(CHUNK_SIZE)))
