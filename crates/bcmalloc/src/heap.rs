@@ -136,6 +136,13 @@ macro_rules! count {
 /// smaller block costs less than the slab lookup that would find out.
 const ZERO_CHECK_MIN: usize = 1024;
 
+/// Whether a heap may keep and reuse blocks of `class` that another heap owns. See
+/// [`Class::reusable_anywhere`]. Messages qualify too, whatever their size: the heap that reads
+/// one has its lines in its cache already, and reuses it for messages of its own.
+const fn reusable_anywhere(class: Class) -> bool {
+    class.reusable_anywhere() || class.index() == MESSAGE_CLASS.index()
+}
+
 /// How many chunks of filled slabs a heap holds before its chunks come from the zone of
 /// transparent huge pages, 1 MiB. See [`Region::part`]. Below it are the threads that use a
 /// little memory each, whose huge pages would be mostly empty.
@@ -421,7 +428,7 @@ impl HeapData {
             debug_assert_eq!(bin.top.get(), end, "a released heap left blocks in a bin");
             bin.empty.set(end.addr() as u16);
             bin.misses.set(0);
-            bin.anywhere.set(class.reusable_anywhere());
+            bin.anywhere.set(reusable_anywhere(class));
             self.set_capacity(class, class.bin_initial());
         }
         self.private.grown.set(0);
@@ -1989,7 +1996,7 @@ mod test {
     fn the_test_sizes_fall_on_both_sides_of_the_reuse_rule() {
         assert!(!Class::for_size(HOMEBOUND).reusable_anywhere());
         assert!(Class::for_size(ANYWHERE).reusable_anywhere());
-        assert!(MESSAGE_CLASS.reusable_anywhere(), "messages are recycled by whoever reads them");
+        assert!(reusable_anywhere(MESSAGE_CLASS), "messages are recycled by whoever reads them");
     }
 
     #[test]
@@ -2395,7 +2402,7 @@ mod test {
         let test = TestRegion::new(256, 2);
         let region = test.region();
         let (heap, other) = (region.heap().unwrap(), region.heap().unwrap());
-        let class = Class::for_size(4096);
+        let class = Class::for_size(ANYWHERE);
         assert!(class.reusable_anywhere(), "the bin keeps the other heap's blocks");
         let layout = layout(class.block_size(), 8);
         let max = class.bin_max();

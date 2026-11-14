@@ -43,6 +43,10 @@ pub const MAX_ALIGN: usize = CHUNK_SIZE;
 /// The largest block served from a slab. Bigger requests are huge allocations.
 pub const MAX_SMALL: usize = 512 << 10;
 
+/// The largest block that a heap may reuse when another heap owns it. See
+/// [`Class::reusable_anywhere`].
+const ANYWHERE_MAX: usize = 256;
+
 /// Requests of up to this many bytes are classified by a table lookup.
 pub(crate) const TABLE_MAX: usize = 8192;
 
@@ -240,11 +244,13 @@ impl Class {
     /// That needs two things. A block must not share a cache line with any other block, or the
     /// thread that reuses it would write next to a block that its owner still uses, which is the
     /// false sharing that Hoard's ownership rule exists to prevent. Blocks start at multiples of
-    /// their size, so a size that is a multiple of the line width is enough. And a block must not
-    /// pin much memory while a foreign heap holds it, so only classes with one-chunk slabs qualify.
+    /// their size, so a size that is a multiple of the line width is enough. And the block must
+    /// span few lines. Its lines are likely still in the cache of the owner, which wrote them, and
+    /// a thread on another core that reuses the block pulls each line it writes across, where the
+    /// owner would find them at hand. For a few lines that costs less than sending the block home.
     pub(crate) const fn reusable_anywhere(self) -> bool {
         let size = self.block_size();
-        size.is_multiple_of(LINE) && size <= TABLE_MAX
+        size.is_multiple_of(LINE) && size <= ANYWHERE_MAX
     }
 
     /// The position of this class in per-heap tables.
