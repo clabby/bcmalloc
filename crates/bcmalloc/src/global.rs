@@ -599,10 +599,11 @@ unsafe impl GlobalAlloc for Bcmalloc {
             // SAFETY: the caller guarantees the block came from this allocator with this layout.
             return unsafe { self.dealloc_unbound(ptr, layout) };
         };
+        // A small size aligned past a chunk is a huge block, which the chunk map entry tells.
         if layout.size() <= MAX_SMALL {
             // SAFETY: a thread's bound heap is claimed by that thread alone, it published the
             // directory when it bound the heap, and the caller guarantees the block came from
-            // this allocator with this layout, so it is a block of a slab in the region.
+            // this allocator with this layout, so it is a block in the region.
             unsafe { data.free_entry(ptr.as_ptr().cast(), self.directory.entry(ptr.as_ptr())) };
         } else {
             // SAFETY: as above.

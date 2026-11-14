@@ -109,7 +109,7 @@ The development suite has 51 synthetic workloads and is what the allocator is tu
 
 - The capacity is a hard limit. Nothing grows the region after start-up, and an allocation that does not fit fails. Through the global allocator, a failed allocation aborts the program.
 - The default region is 64 GiB of address space. Under strict overcommit (`vm.overcommit_memory=2`), or with a limit on a process's data or address space, the kernel counts all of it. The global allocator then retries with half the capacity until the reservation fits, down to 256 MiB.
-- Alignments above 64 KiB are refused, and the allocation fails.
+- Alignments above 4 MiB are refused, and the allocation fails. A request aligned to more than 64 KiB takes a run of whole chunks of its own, at least 128 KiB, whatever its size.
 - A thread that finds all `max_heaps` heaps taken fails its allocations.
 - Idle memory goes back to the operating system from the allocator's slower operations, such as refilling a thread's cache, and not from a background thread. A program that goes quiet keeps what it freed until it allocates enough to reach one of them, or until it calls [`Bcmalloc::trim`](https://docs.rs/bcmalloc/latest/bcmalloc/struct.Bcmalloc.html#method.trim).
 - A region backed up front with `Commit::Populate` or `Commit::Lock` keeps every page and gives nothing back. So does any region once the kernel refuses to take pages back, as it does for memory the program has locked, for example with `mlockall`.

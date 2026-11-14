@@ -399,6 +399,6 @@ mod test {
         let test = TestRegion::new(8, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
-        assert!(heap.allocate(layout(8, 1 << 20)).is_err());
+        assert!(heap.allocate(layout(8, 2 * crate::MAX_ALIGN)).is_err());
     }
 }

@@ -154,6 +154,10 @@ const fn reusable_anywhere(class: Class) -> bool {
     class.reusable_anywhere() || class.index() == MESSAGE_CLASS.index()
 }
 
+// The fast free sends a huge block whose entry it reads as one of the smallest class to
+// `HeapData::send` only because blocks of that class go home. See `Entry::huge`.
+const _: () = assert!(!reusable_anywhere(Class::from_index(0)));
+
 /// How many blocks a bin that overflows gives back at a time, from a buffer on the stack.
 const FLUSH_BATCH: usize = 512;
 
@@ -788,7 +792,7 @@ impl HeapData {
                     .cast()
             }
             // SAFETY: forwarded.
-            Some(Request::Huge { chunks }) => unsafe { self.alloc_whole(chunks) },
+            Some(Request::Huge { chunks, align }) => unsafe { self.alloc_whole(chunks, align) },
             None => ptr::null_mut(),
         }
     }
@@ -800,10 +804,10 @@ impl HeapData {
     ///
     /// The caller must hold the claim on this slot.
     #[inline(never)]
-    unsafe fn alloc_whole(&self, chunks: usize) -> *mut u8 {
+    unsafe fn alloc_whole(&self, chunks: usize, align: usize) -> *mut u8 {
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
-        let block = self.alloc_huge(region, chunks);
+        let block = self.alloc_huge(region, chunks, align);
         if !block.is_null() {
             return block;
         }
@@ -811,7 +815,7 @@ impl HeapData {
         // retry.
         // SAFETY: the caller holds the claim.
         unsafe { self.flush(region) };
-        self.alloc_huge(region, chunks)
+        self.alloc_huge(region, chunks, align)
     }
 
     /// Fills the empty bin of `class` and pops a block, or returns null if the region is out of
@@ -1020,14 +1024,14 @@ impl HeapData {
                 }
                 block
             }
-            Some(Request::Huge { chunks }) => {
+            Some(Request::Huge { chunks, align }) => {
                 // SAFETY: the claim keeps the region alive.
                 let region = unsafe { self.region() };
-                let (mut block, mut zeroed) = self.alloc_huge_zeroed(region, chunks);
+                let (mut block, mut zeroed) = self.alloc_huge_zeroed(region, chunks, align);
                 if block.is_null() {
                     // SAFETY: the caller holds the claim.
                     unsafe { self.flush(region) };
-                    (block, zeroed) = self.alloc_huge_zeroed(region, chunks);
+                    (block, zeroed) = self.alloc_huge_zeroed(region, chunks, align);
                 }
                 if !block.is_null() && !zeroed {
                     // SAFETY: as above.
@@ -1114,7 +1118,12 @@ impl HeapData {
                     return ptr.as_ptr();
                 }
             }
-            (Some(Request::Huge { chunks: had }), Some(Request::Huge { chunks: wants })) => {
+            // A huge block grows and shrinks in place from where it starts, which keeps its
+            // alignment.
+            (
+                Some(Request::Huge { chunks: had, .. }),
+                Some(Request::Huge { chunks: wants, .. }),
+            ) => {
                 let first = region.chunk_index(ptr.as_ptr());
                 if wants <= had {
                     if wants < had {
@@ -1154,6 +1163,7 @@ impl HeapData {
     /// this region with exactly the layout and not be used again.
     #[inline(always)]
     pub(crate) unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
+        // A small size aligned past a chunk is a huge block, which the chunk map entry tells.
         if layout.size() <= MAX_SMALL {
             // SAFETY: forwarded.
             unsafe { self.free_small(ptr.as_ptr().cast()) };
@@ -1175,7 +1185,7 @@ impl HeapData {
     unsafe fn free_huge(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
-        let Some(Request::Huge { chunks }) = classify(layout) else {
+        let Some(Request::Huge { chunks, .. }) = classify(layout) else {
             // SAFETY: forwarded.
             return unsafe { region.dealloc(ptr, layout) };
         };
@@ -1201,9 +1211,10 @@ impl HeapData {
         region.purge_if_due();
     }
 
-    /// Frees a block of a slab. Its class and its owner both come from one load of the chunk map,
-    /// so the layout does not matter beyond telling slab blocks from huge ones, and a block that a
-    /// realloc kept in place is freed as what it is.
+    /// Frees a block of at most [`MAX_SMALL`] bytes, which is a block of a slab unless it was
+    /// aligned past a chunk. Its class and its owner both come from one load of the chunk map, so
+    /// the layout does not matter beyond its size, a block that a realloc kept in place is freed as
+    /// what it is, and the entry of a huge block sends it on to be freed as one.
     ///
     /// # Safety
     ///
@@ -1263,7 +1274,9 @@ impl HeapData {
         Some(entry.huge_chunks().map_or_else(|| entry.class().block_size(), |n| n << CHUNK_SHIFT))
     }
 
-    /// Frees a block of a slab whose chunk map entry is `entry`.
+    /// Frees a block of a slab whose chunk map entry is `entry`, or a huge block of a small size
+    /// aligned past a chunk, whose entry reads as a block of a heap that does not exist and so goes
+    /// to [`send`](Self::send). See [`Entry::huge`].
     ///
     /// # Safety
     ///
@@ -1485,6 +1498,21 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn send(&self, block: *mut Block, class: Class, owner: u32) {
+        if owner & Entry::HUGE_OWNER != 0 {
+            // A huge block of a small size aligned past a chunk, freed with its layout. Its entry
+            // reads as a block of the smallest class that belongs to no heap, so the fast free
+            // sent it here and counted it as a free of that class. See `Entry::huge`.
+            #[cfg(feature = "metrics")]
+            self.bin(class).frees.sub(1);
+            let chunks = (owner & !Entry::HUGE_OWNER) as usize;
+            // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
+            return unsafe {
+                self.free_huge(
+                    NonNull::new_unchecked(block.cast()),
+                    Layout::from_size_align_unchecked(chunks << CHUNK_SHIFT, 16),
+                )
+            };
+        }
         count!(self, BlocksSent, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
@@ -2014,16 +2042,23 @@ impl HeapData {
         }
     }
 
-    /// Allocates a run of `chunks` whole chunks, returning null if there is no room.
-    pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize) -> *mut u8 {
-        self.alloc_huge_zeroed(region, chunks).0
+    /// Allocates a run of `chunks` whole chunks that starts on a multiple of `align` chunks, at
+    /// most 64, returning null if there is no room.
+    pub(crate) fn alloc_huge(&self, region: &Region<'_>, chunks: usize, align: usize) -> *mut u8 {
+        self.alloc_huge_zeroed(region, chunks, align).0
     }
 
     /// As [`alloc_huge`](Self::alloc_huge), and also tells whether the block reads as zeros.
-    fn alloc_huge_zeroed(&self, region: &Region<'_>, chunks: usize) -> (*mut u8, bool) {
+    fn alloc_huge_zeroed(
+        &self,
+        region: &Region<'_>,
+        chunks: usize,
+        align: usize,
+    ) -> (*mut u8, bool) {
         for kept in &self.private.kept {
             let block = kept.get();
-            if block.chunks == chunks {
+            // The alignment is a power of two, and a mask saves a division on every reuse.
+            if block.chunks == chunks && block.first & (align - 1) == 0 {
                 kept.set(Kept::NONE);
                 // The next kept block of this size has been asked for, so it stays a while.
                 self.mark_kept_reused(chunks);
@@ -2037,7 +2072,7 @@ impl HeapData {
         // a huge page or more is worth it whatever the size of the heap.
         let huge = chunks >= HUGE_PAGE_CHUNKS || self.is_big();
         let part = region.part(self.private.node.get(), huge);
-        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, 1, 0, part) else {
+        let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, align, 0, part) else {
             return (ptr::null_mut(), false);
         };
         self.note_huge_alloc(chunks);
@@ -2459,6 +2494,7 @@ impl Drop for Heap<'_> {
 mod test {
     use super::*;
     use crate::{
+        MAX_ALIGN,
         chunks::CHUNK_SIZE,
         testing::{Harness, Rng, TestRegion, iterations, random_traffic},
     };
@@ -2466,6 +2502,7 @@ mod test {
         alloc::Layout,
         mem::{MaybeUninit, align_of, offset_of, size_of},
         ptr::NonNull,
+        slice,
     };
     use std::vec::Vec;
 
@@ -2695,6 +2732,55 @@ mod test {
         assert!(len > capacity / 2 && len <= capacity, "{len} blocks are left in the bin");
         assert_eq!(heap.alloc(layout), Some(newest), "the newest blocks stay");
         heap.validate();
+    }
+
+    #[test]
+    fn blocks_aligned_past_a_chunk_are_runs_that_start_on_their_alignment() {
+        let test = TestRegion::new(320, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        // A freed run of two chunks that is not 2 MiB aligned stays in the heap's cache, where a
+        // request of the same size that asks for 2 MiB must not take it.
+        let loose = layout(2 * CHUNK_SIZE, 8);
+        let kept = heap.alloc(loose).unwrap();
+        assert!(!kept.as_ptr().addr().is_multiple_of(2 << 20));
+        // SAFETY: the block is live with this layout.
+        unsafe { heap.dealloc(kept, loose) };
+        for align in [2 * CHUNK_SIZE, 2 << 20, MAX_ALIGN] {
+            for size in [8, CHUNK_SIZE, 2 * CHUNK_SIZE] {
+                let layout = layout(size, align);
+                let block = heap.alloc(layout).unwrap();
+                assert!(block.as_ptr().addr().is_multiple_of(align), "{size} aligned to {align}");
+                // SAFETY: the block holds `size` bytes.
+                unsafe { block.as_ptr().write_bytes(1, size) };
+                let grown_size = size + 3 * CHUNK_SIZE;
+                // SAFETY: the block is live with this layout, and the new size is valid.
+                let grown = unsafe { heap.realloc(block, layout, grown_size) }.unwrap();
+                assert!(grown.as_ptr().addr().is_multiple_of(align), "a resize kept the alignment");
+                // A few bytes stand for all of them, which Miri would read one at a time.
+                for at in [0, size / 2, size - 1] {
+                    // SAFETY: the block holds at least `size` bytes.
+                    assert_eq!(unsafe { grown.as_ptr().add(at).read() }, 1, "byte {at} moved");
+                }
+                // SAFETY: the block is live with the grown layout.
+                unsafe { heap.dealloc(grown, Layout::from_size_align(grown_size, align).unwrap()) };
+            }
+            let zeroed = heap.alloc_zeroed(layout(100, align)).unwrap();
+            assert!(zeroed.as_ptr().addr().is_multiple_of(align));
+            // SAFETY: the block holds 100 bytes.
+            assert!(unsafe { slice::from_raw_parts(zeroed.as_ptr(), 100) }.iter().all(|&b| b == 0));
+            // SAFETY: the block is live with this layout.
+            unsafe { heap.dealloc(zeroed, layout(100, align)) };
+        }
+        // A free without a layout, as C's free does, tells the block from a slab block by its size.
+        let block = heap.alloc(layout(100, 2 << 20)).unwrap();
+        assert!(heap.data.usable_size(block).unwrap() > crate::MAX_SMALL);
+        // SAFETY: the block is live and not used again.
+        unsafe { heap.free_unsized(block) };
+        assert_eq!(heap.alloc(layout(8, MAX_ALIGN * 2)), None, "the limit is one bitmap word");
+        heap.validate();
+        heap.flush();
+        assert_eq!(used(&region), 0);
     }
 
     #[test]
@@ -3260,8 +3346,8 @@ mod test {
         let test = TestRegion::new(16, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
-        assert!(heap.alloc(layout(8, 2 * CHUNK_SIZE)).is_none());
-        assert!(heap.alloc(layout(8, CHUNK_SIZE)).is_some());
+        assert!(heap.alloc(layout(8, 2 * MAX_ALIGN)).is_none());
+        assert!(heap.alloc(layout(8, MAX_ALIGN)).is_some());
     }
 
     #[test]

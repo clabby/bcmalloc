@@ -349,12 +349,20 @@ mod test {
             let mut out = ptr::dangling_mut::<c_void>();
             set_errno(7);
             assert_eq!(posix_memalign(&raw mut out, 4, 100), libc::EINVAL);
-            assert_eq!(posix_memalign(&raw mut out, 1 << 20, 100), libc::ENOMEM);
+            assert_eq!(posix_memalign(&raw mut out, 8 << 20, 100), libc::ENOMEM);
             assert_eq!(out, ptr::dangling_mut(), "a failed call leaves the output alone");
             assert_eq!(errno(), 7, "and errno too");
             assert_eq!(posix_memalign(&raw mut out, 4096, 100), 0);
             assert!(out.addr().is_multiple_of(4096));
             free(out);
+            // An alignment past a chunk takes a run of whole chunks that starts on it, which C's
+            // realloc and free handle without knowing the alignment.
+            assert_eq!(posix_memalign(&raw mut out, 2 << 20, 100), 0);
+            assert!(out.addr().is_multiple_of(2 << 20));
+            out.cast::<u8>().write_bytes(6, 100);
+            let moved = realloc(out, 300 << 10);
+            assert!(!moved.is_null() && moved.cast::<u8>().add(99).read() == 6);
+            free(moved);
             let page = page_size();
             let block = pvalloc(1);
             assert!(block.addr().is_multiple_of(page) && malloc_usable_size(block) >= page);
