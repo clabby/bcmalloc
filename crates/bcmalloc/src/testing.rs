@@ -364,7 +364,7 @@ impl<'r> Harness<'r> {
         }
         // Huge blocks are runs of chunks and not blocks of a slab.
         for block in &self.live {
-            if block.layout.size() > crate::MAX_SMALL {
+            if !crate::size_class::is_small(block.layout) {
                 seen.remove(&block.ptr.as_ptr().addr());
             }
         }
@@ -466,7 +466,8 @@ pub fn random_traffic(region: &Region<'_>, seed: u64, steps: usize) {
         let heap = rng.below(3);
         match rng.below(23) {
             0..=9 => {
-                let widest = if rng.below(8) == 0 { 17 } else { 5 };
+                let widest =
+                    if rng.below(8) == 0 { crate::MAX_ALIGN.ilog2() as usize + 2 } else { 5 };
                 let align = 1 << rng.below(widest);
                 if rng.below(4) == 0 {
                     harness.alloc_zeroed(heap, random_size(&mut rng), align);
@@ -517,7 +518,7 @@ fn interpret(harness: &mut Harness<'_>, bytes: &mut impl Iterator<Item = usize>)
             0..=7 => {
                 let limit = [256, 4 << 10, 600 << 10, 6 << 20][bytes.next()? % 4];
                 let size = (bytes.next()? | bytes.next()? << 8 | bytes.next()? << 16) % limit + 1;
-                let align = 1 << (bytes.next()? % 18);
+                let align = 1 << (bytes.next()? % 24);
                 if op % 16 < 6 {
                     harness.alloc(heap, size, align);
                 } else {

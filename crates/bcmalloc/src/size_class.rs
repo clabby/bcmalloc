@@ -32,7 +32,8 @@
 //! multiple of 8, so every block is 8-byte aligned. A request that asks for 16, which C's malloc
 //! always does, is rounded up to a multiple of 16 first. A request for more alignment is rounded
 //! up to a power of two that is at least as large as the alignment. Huge allocations start on a
-//! chunk boundary, so the largest supported alignment is one chunk.
+//! chunk boundary, and a request for more alignment than a chunk is served as a huge allocation
+//! that starts on a multiple of its alignment, up to [`MAX_ALIGN`].
 
 use crate::chunks::CHUNK_SIZE;
 use core::alloc::Layout;
@@ -44,8 +45,10 @@ pub(crate) const MIN_ALIGN: usize = 16;
 /// has.
 pub(crate) const STEP: usize = 8;
 
-/// The largest alignment the allocator supports, which is one chunk.
-pub const MAX_ALIGN: usize = CHUNK_SIZE;
+/// The largest alignment the allocator supports, 4 MiB. A block aligned to more than a chunk is a
+/// run of whole chunks, and the region aligns its memory to one bitmap word of 64 chunks, the
+/// furthest a run can be aligned.
+pub const MAX_ALIGN: usize = 64 * CHUNK_SIZE;
 
 /// The largest block served from a slab. Bigger requests are huge allocations.
 pub const MAX_SMALL: usize = 64 << 10;
@@ -80,8 +83,15 @@ pub(crate) struct Class(u8);
 pub(crate) enum Request {
     /// A block from a slab of this class.
     Small(Class),
-    /// A run of this many whole chunks.
-    Huge { chunks: usize },
+    /// A run of this many whole chunks, starting on a multiple of `align` chunks.
+    Huge { chunks: usize, align: usize },
+}
+
+/// Whether [`classify`] serves `layout` from a slab: its size and its alignment are both at most
+/// a chunk.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const fn is_small(layout: Layout) -> bool {
+    layout.size() <= MAX_SMALL && layout.align() <= CHUNK_SIZE
 }
 
 /// The block size of class index `i`.
@@ -304,11 +314,11 @@ impl Class {
 /// Decides how a layout is served, or `None` if it cannot be (alignment above [`MAX_ALIGN`]).
 pub(crate) const fn classify(layout: Layout) -> Option<Request> {
     let (size, align) = (layout.size(), layout.align());
-    if align > MAX_ALIGN {
-        return None;
+    if align > CHUNK_SIZE {
+        return classify_aligned_run(size, align);
     }
     if size > MAX_SMALL {
-        return Some(Request::Huge { chunks: size.div_ceil(CHUNK_SIZE) });
+        return Some(Request::Huge { chunks: size.div_ceil(CHUNK_SIZE), align: 1 });
     }
     // Over-aligned blocks come from power-of-two classes, as the module documentation explains.
     let size = if align <= STEP {
@@ -320,6 +330,21 @@ pub(crate) const fn classify(layout: Layout) -> Option<Request> {
         if rounded > align { rounded } else { align }
     };
     Some(Request::Small(Class::for_size(size)))
+}
+
+/// Decides how a request aligned past a chunk is served, out of line because it is rare.
+///
+/// Only runs of whole chunks are aligned more than a chunk, so a small request that asks for that
+/// takes a run of its own. It takes at least two chunks: every huge block holds more than
+/// [`MAX_SMALL`] bytes, which is how the paths that know only a block's size, such as C's realloc,
+/// tell it from a block of a slab.
+#[cold]
+const fn classify_aligned_run(size: usize, align: usize) -> Option<Request> {
+    if align > MAX_ALIGN {
+        return None;
+    }
+    let chunks = size.div_ceil(CHUNK_SIZE);
+    Some(Request::Huge { chunks: if chunks > 2 { chunks } else { 2 }, align: align / CHUNK_SIZE })
 }
 
 #[cfg(test)]
@@ -408,7 +433,7 @@ mod test {
 
     #[test]
     fn blocks_honour_the_requested_alignment() {
-        for align_shift in 0..=16 {
+        for align_shift in 0..=MAX_ALIGN.ilog2() {
             let align = 1usize << align_shift;
             for size in [1, 7, 16, 100, 4096, 5000, 70_000, MAX_SMALL, MAX_SMALL + 1, 3 << 20] {
                 match classify(layout(size, align)).unwrap() {
@@ -418,7 +443,10 @@ mod test {
                         // in, so a block size that is a multiple of the alignment is enough.
                         assert_eq!(class.block_size() % align, 0, "{size}/{align}");
                     }
-                    Request::Huge { chunks } => assert!(chunks * CHUNK_SIZE >= size),
+                    Request::Huge { chunks, align: run_align } => {
+                        assert!(chunks * CHUNK_SIZE >= size);
+                        assert!(run_align * CHUNK_SIZE >= align, "{size}/{align}");
+                    }
                 }
             }
         }
@@ -442,7 +470,7 @@ mod test {
             classify(layout(MAX_SMALL, 1)),
             Some(Request::Small(Class::from_index(CLASSES - 1)))
         );
-        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 2 }));
+        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 2, align: 1 }));
         assert_eq!(
             classify(layout(CHUNK_SIZE, 1)),
             Some(Request::Small(Class::for_size(CHUNK_SIZE)))
@@ -450,8 +478,19 @@ mod test {
     }
 
     #[test]
-    fn alignment_beyond_a_chunk_is_refused() {
+    fn alignment_beyond_a_chunk_takes_an_aligned_run_up_to_the_limit() {
+        assert_eq!(
+            classify(layout(8, 2 * CHUNK_SIZE)),
+            Some(Request::Huge { chunks: 2, align: 2 }),
+            "a small request aligned past a chunk takes a run of its own, bigger than a slab block"
+        );
+        assert_eq!(classify(layout(0, MAX_ALIGN)), Some(Request::Huge { chunks: 2, align: 64 }));
         assert_eq!(classify(layout(8, MAX_ALIGN * 2)), None);
-        assert!(classify(layout(8, MAX_ALIGN)).is_some());
+        for size in [1, MAX_SMALL, MAX_SMALL + 1] {
+            for align in [1, CHUNK_SIZE, 2 * CHUNK_SIZE, MAX_ALIGN] {
+                let small = matches!(classify(layout(size, align)), Some(Request::Small(_)));
+                assert_eq!(is_small(layout(size, align)), small, "{size}/{align}");
+            }
+        }
     }
 }

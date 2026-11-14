@@ -65,6 +65,18 @@ fn over_aligned_types_are_aligned() {
     let chunk = Box::new(Chunk([3; 100]));
     assert_eq!(std::ptr::from_ref(&*chunk).addr() % 65536, 0);
     assert_eq!(chunk.0[99], 3);
+    // Past a chunk, an alignment takes a run of whole chunks that starts on it.
+    for align in [128 << 10, 2 << 20, 4 << 20] {
+        let layout = std::alloc::Layout::from_size_align(100, align).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let block = unsafe { std::alloc::alloc(layout) };
+        assert!(!block.is_null() && block.addr() % align == 0, "aligned to {align}");
+        // SAFETY: the block holds 100 bytes, and is freed once with its layout.
+        unsafe {
+            block.write_bytes(5, 100);
+            std::alloc::dealloc(block, layout);
+        }
+    }
     assert_eq!(0u128.to_ne_bytes().len(), 16);
 }
 

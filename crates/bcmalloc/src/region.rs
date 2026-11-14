@@ -196,6 +196,10 @@ impl<'a> Region<'a> {
     pub(crate) unsafe fn from_parts(parts: Parts<'a>) -> Self {
         debug_assert_eq!(parts.slabs.len(), parts.chunk_count);
         debug_assert_eq!(parts.map.len(), parts.chunk_count);
+        // Heap ids must stay below the bit that marks huge blocks, and a huge block's length in
+        // chunks must fit in the bits below it. See `Entry::huge`.
+        debug_assert!(parts.heaps.len() <= Entry::HUGE_OWNER as usize);
+        debug_assert!(parts.chunk_count < Entry::HUGE_OWNER as usize);
         let words = Chunks::words_for(parts.chunk_count);
         // A region too small to give every node a word of its own is not split at all, because
         // the parts are numbered by physical node. Zones are given up first, since they only
@@ -268,7 +272,7 @@ impl<'a> Region<'a> {
                 // SAFETY: the caller gives the block up, and the chunk map names its owner.
                 unsafe { self.heap_slot(owner).post_block(ptr.as_ptr().cast()) };
             }
-            Some(Request::Huge { chunks }) => {
+            Some(Request::Huge { chunks, .. }) => {
                 #[cfg(feature = "metrics")]
                 {
                     self.counters.huge_frees.add(1);
@@ -732,8 +736,9 @@ impl<'a> Region<'a> {
 /// or for the first chunk of a huge block, how many chunks the block spans.
 ///
 /// The owner sits in the low 32 bits, so the free path reads it with one load and a truncation.
-/// The top bit marks a huge block. Frees through the Rust interfaces know a huge block by its
-/// layout. The entry is what lets a C `free` without a size tell the two apart.
+/// The top bit of the owner marks a huge block, and no heap has an id with that bit. Frees through
+/// the Rust interfaces know most huge blocks by their size, and C's `free` tells the two apart by
+/// the entry. See [`Entry::huge`] for the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Entry(pub(crate) u64);
 
@@ -745,22 +750,29 @@ impl Entry {
         Self(owner as u64 | (class.index() as u64) << 32 | offset << 40)
     }
 
-    /// The bit that marks the entry of the first chunk of a huge block.
-    const HUGE: u64 = 1 << 63;
+    /// The bit of the owner that marks the entry of the first chunk of a huge block. Heap ids stay
+    /// below it.
+    pub(crate) const HUGE_OWNER: u32 = 1 << 31;
 
     /// The entry for the first chunk of a huge block of `chunks` chunks.
+    ///
+    /// Read as a slab's, it is an entry of the smallest class, whose bin comes first, owned by
+    /// heap `HUGE_OWNER | chunks`, which does not exist. A Rust free of a small size aligned past
+    /// a chunk, which is a huge block, therefore needs no test of its own: the fast free takes the
+    /// block for another heap's block of a class that goes home and calls `HeapData::send`, which
+    /// tells it apart by the owner.
     pub(crate) const fn huge(chunks: usize) -> Self {
-        Self(Self::HUGE | chunks as u64)
+        Self((Self::HUGE_OWNER as usize | chunks) as u64)
     }
 
     /// The number of chunks of a huge block, or None if the entry is a slab's.
     pub(crate) const fn huge_chunks(self) -> Option<usize> {
-        if self.is_huge() { Some((self.0 & !Self::HUGE) as usize) } else { None }
+        if self.is_huge() { Some((self.owner() & !Self::HUGE_OWNER) as usize) } else { None }
     }
 
     /// Whether the entry is that of the first chunk of a huge block.
     pub(crate) const fn is_huge(self) -> bool {
-        self.0 & Self::HUGE != 0
+        self.owner() & Self::HUGE_OWNER != 0
     }
 
     /// The id of the heap that owns the slab.
@@ -1052,6 +1064,18 @@ mod test {
             let grown = unsafe { heap.realloc(block, layout(9), 12 << CHUNK_SHIFT) };
             assert_eq!(grown, Some(block), "the pass let go of the chunks after the block");
         });
+    }
+
+    #[test]
+    fn a_huge_blocks_entry_reads_as_a_block_of_no_heap_that_goes_home() {
+        for chunks in [2, 64, Entry::HUGE_OWNER as usize - 1] {
+            let entry = Entry::huge(chunks);
+            assert_eq!(entry.huge_chunks(), Some(chunks));
+            assert!(entry.owner() >= Entry::HUGE_OWNER, "no heap has the owner's id");
+            assert_eq!((entry.class().index(), entry.bin_offset()), (0, 0), "the smallest class");
+        }
+        let slab = Entry::new(Entry::HUGE_OWNER - 1, Class::for_size(crate::MAX_SMALL));
+        assert_eq!(slab.huge_chunks(), None, "the last heap's slabs are not huge");
     }
 
     #[test]

@@ -124,7 +124,7 @@ Each class is carved out of slabs, which are runs of chunks aligned to their own
 | 16 B to 8 KiB   | 64 KiB (1)  | 8 to 4096       |
 | 8 KiB to 64 KiB | 512 KiB (8) | 8 to 56         |
 
-Alignment falls out of the geometry. A slab starts on a multiple of its own size and a block on a multiple of its size within the slab, so a block is aligned to the largest power of two that divides its size, and at least to 8 bytes. A request that asks for 16 bytes of alignment, which C's malloc always does, is rounded up to a multiple of 16 first. A request for more alignment is rounded up to a power of two at least that large. The largest alignment supported is one chunk, 64 KiB.
+Alignment falls out of the geometry. A slab starts on a multiple of its own size and a block on a multiple of its size within the slab, so a block is aligned to the largest power of two that divides its size, and at least to 8 bytes. A request that asks for 16 bytes of alignment, which C's malloc always does, is rounded up to a multiple of 16 first. A request for more alignment is rounded up to a power of two at least that large. A request for more alignment than a chunk gets a run of whole chunks that starts on a multiple of its alignment. The run is at least two chunks long, so that a huge block always holds more than 64 KiB and a free that knows only the size, as C's does, tells it from a block of a slab. A run can be aligned to at most one bitmap word of 64 chunks, so the largest alignment supported is 4 MiB.
 
 Anything above 64 KiB gets a run of whole chunks to itself, as jemalloc gives large requests extents of their own[^jemalloc]. A slab of such blocks would hold so few of them that one partly used slab per class and heap would cost more than rounding up to whole chunks does.
 
@@ -260,7 +260,7 @@ These are the costs.
 
 ## 14. Limits
 
-- Alignments above 64 KiB are refused.
+- Alignments above 4 MiB are refused. A request aligned to more than 64 KiB takes a run of whole chunks of its own, at least 128 KiB, whatever its size.
 - A thread that finds every heap taken fails its allocations, which aborts the program. `max_heaps` is a design-time bound, like TigerBeetle's connection limit.
 - Allocations over 4 MiB claim several bitmap words and are obstruction-free, not lock-free.
 - The capacity is a hard limit. A purge pass or a trim makes some chunks look allocated while it holds them, so a request that needs those chunks waits for the pass to finish. It does not fail.
