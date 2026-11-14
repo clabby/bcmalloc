@@ -335,6 +335,8 @@ impl<'a> Region<'a> {
                 bins_grown: sum(Event::BinsGrown),
                 bins_shrunk: sum(Event::BinsShrunk),
                 zeroed_fresh: sum(Event::ZeroedFresh),
+                blocks_spilled: sum(Event::BlocksSpilled),
+                blocks_unspilled: sum(Event::BlocksUnspilled),
                 purge_passes: counters.purge_passes.get(),
                 chunks_purged: counters.chunks_purged.get(),
                 chunks_reused: counters.chunks_reused.get(),

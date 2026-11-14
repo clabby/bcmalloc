@@ -88,10 +88,12 @@ pub(crate) enum Event {
     BinsGrown,
     BinsShrunk,
     ZeroedFresh,
+    BlocksSpilled,
+    BlocksUnspilled,
 }
 
 /// How many kinds of [`Event`] there are.
-const EVENTS: usize = Event::ZeroedFresh as usize + 1;
+const EVENTS: usize = Event::BlocksUnspilled as usize + 1;
 
 /// The slow-path counters of one heap slot.
 #[derive(Debug)]
@@ -198,6 +200,10 @@ pub struct Events {
     pub bins_shrunk: u64,
     /// Zeroed requests served from fresh memory, which needed no clearing.
     pub zeroed_fresh: u64,
+    /// Blocks moved out of a full bin into a spilled batch.
+    pub blocks_spilled: u64,
+    /// Blocks a refill took back from a spilled batch.
+    pub blocks_unspilled: u64,
     /// Passes of the purge clock.
     pub purge_passes: u64,
     /// Chunks the purge clock gave back to the operating system.
@@ -427,6 +433,11 @@ impl fmt::Display for Metrics {
             events.messages_posted,
             events.mail_reads,
             events.blocks_filed
+        )?;
+        writeln!(
+            f,
+            "  spilled {} blocks, took back {}",
+            events.blocks_spilled, events.blocks_unspilled
         )?;
         writeln!(
             f,
