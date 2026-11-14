@@ -95,6 +95,13 @@ mimalloc-bench dir args: cabi
     cd "$1/out/bench" && ../../bench.sh --external="$OLDPWD/target/bcmalloc-external.txt" $2
     cargo run -q -p bcmalloc-bench-data -- import-mimalloc-bench "$1/out/bench/benchres.csv"
 
+# Run the programs of mimalloc-bench, built in DIR by its build-bench-env.sh, under bcmalloc and the
+# allocators named with --alloc, with wall time in nanoseconds, the allocators interleaved, short
+# programs repeated, and medians with 95% intervals. See scripts/mbrun.py for the options, for
+# example: just mbrun ~/mimalloc-bench --alloc mi --alloc sn --runs 10 --out target/mb.tsv
+mbrun dir *args: cabi
+    dir="$1"; shift; scripts/mbrun.py --dir "$dir" --alloc bc=target/cabi/release/libbcmalloc_c.so "$@"
+
 # Render the tables of BENCHMARKS.md and README.md and assets/benchmarks.svg from benchmarks.json.
 # The benchmark recipes do this after they record their results.
 bench-render:
