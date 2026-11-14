@@ -2582,9 +2582,9 @@ mod test {
     }
 
     /// The block size of the spill tests. Their bursts are multiples of the class's largest bin,
-    /// 2048 blocks of 64 bytes, which take Miri many minutes, so under Miri they use the largest
-    /// class that is still reusable anywhere, whose bin holds 512.
-    const SPILL_SIZE: usize = if cfg!(miri) { ANYWHERE } else { 64 };
+    /// 2048 blocks of 64 bytes, which take Miri many minutes, so under Miri they use 2 KiB blocks,
+    /// whose bin holds 64.
+    const SPILL_SIZE: usize = if cfg!(miri) { 2048 } else { 64 };
 
     #[test]
     fn a_burst_bigger_than_the_bin_spills_and_the_next_burst_takes_it_back() {
@@ -2648,7 +2648,11 @@ mod test {
         }
         assert!(!heap.data.lists(class).spill.get().is_null());
         // Refills of another class run maintenance steps, which return the idle class's batches.
-        for _ in 0..8 {
+        // Stopping as soon as they are back keeps the test short under Miri.
+        for _ in 0..16 {
+            if heap.data.lists(class).spill.get().is_null() {
+                break;
+            }
             let blocks = alloc_many(&heap, other, 16 * MAINTENANCE_INTERVAL as usize);
             free_all(&heap, other, blocks);
         }
@@ -2661,10 +2665,12 @@ mod test {
         let test = TestRegion::new(128, 2);
         let region = test.region();
         let (owner, freer) = (region.heap().unwrap(), region.heap().unwrap());
-        // These blocks may stay in the freeing heap's bin, but that heap never allocates them.
-        let layout = layout(SPILL_SIZE, 8);
-        for _ in 0..8 {
-            let blocks = alloc_many(&owner, layout, 4 * Class::for_size(SPILL_SIZE).bin_max());
+        // Blocks of a class that is reusable anywhere stay in the freeing heap's bin, but that heap
+        // never allocates them. Under Miri the largest such class and fewer bursts keep it short.
+        let size = if cfg!(miri) { ANYWHERE } else { 64 };
+        let layout = layout(size, 8);
+        for _ in 0..if cfg!(miri) { 2 } else { 8 } {
+            let blocks = alloc_many(&owner, layout, 4 * Class::for_size(size).bin_max());
             free_all(&freer, layout, blocks);
         }
         freer.validate();
