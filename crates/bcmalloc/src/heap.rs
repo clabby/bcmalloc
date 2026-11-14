@@ -76,7 +76,6 @@
 //! start picks it up. Messages that arrive in between wait in its inbox.
 
 use crate::{
-    allocator::{Backend, allocator},
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::{Entry, HUGE_PAGE_CHUNKS, Region},
@@ -84,14 +83,7 @@ use crate::{
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
-use core::{
-    alloc::{AllocError, Allocator, Layout},
-    cell::Cell,
-    fmt,
-    marker::PhantomData,
-    ptr,
-    ptr::NonNull,
-};
+use core::{alloc::Layout, cell::Cell, fmt, marker::PhantomData, ptr, ptr::NonNull};
 
 /// The tag on an inbox link that marks a node as a single block and not a message.
 const SINGLE: usize = 0b1;
@@ -2455,28 +2447,6 @@ impl<'r> Heap<'r> {
         unsafe { self.data.flush(self.region) };
     }
 }
-
-impl Backend for Heap<'_> {
-    unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8 {
-        self.alloc(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
-    }
-
-    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
-        self.alloc_zeroed(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
-    }
-
-    unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: forwarded.
-        unsafe { self.dealloc(ptr, layout) };
-    }
-
-    unsafe fn resize_raw(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forwarded.
-        unsafe { self.realloc(ptr, old, new_size) }.map_or(ptr::null_mut(), NonNull::as_ptr)
-    }
-}
-
-allocator!(Allocator for Heap<'_>);
 
 impl Drop for Heap<'_> {
     fn drop(&mut self) {

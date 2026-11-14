@@ -5,6 +5,7 @@
 #[macro_use]
 extern crate std;
 
+#[cfg(feature = "allocator-api")]
 mod allocator;
 mod cache;
 mod chunks;

@@ -41,6 +41,11 @@ test *args:
 hack *args:
     cargo hack -p bcmalloc --feature-powerset check --lib "$@"
 
+# Check the library under every feature combination but `allocator-api`, which needs Rust 1.100, on
+# the minimum Rust version in its manifest. cargo-hack installs that toolchain if it is missing.
+msrv *args:
+    cargo hack -p bcmalloc --feature-powerset --exclude-features allocator-api --rust-version check --lib "$@"
+
 # Run the tests under Miri with strict provenance.
 miri *args:
     MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri nextest run -p bcmalloc --all-features --lib "$@"

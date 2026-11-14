@@ -2,7 +2,8 @@
 name = "bcmalloc"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
+# The library's minimum, below the workspace's. The `allocator-api` feature needs 1.100.
+rust-version = "1.88"
 license.workspace = true
 repository.workspace = true
 description = "A scalable global allocator that reserves its memory up front, for long-lived, highly concurrent programs."
@@ -19,6 +20,10 @@ testing = [ "std" ]
 # Counts allocations, frees, slabs and slow-path events per heap, for `Region::metrics` and
 # `Bcmalloc::metrics`. The fast paths pay one add each on a cache line they already touch.
 metrics = []
+# Implements the standard library's `Allocator` trait for `Bcmalloc` and `Heap`, so that a
+# collection can allocate from one without it being the global allocator. The trait needs Rust
+# 1.100, above the crate's minimum.
+allocator-api = []
 
 [dependencies]
 libc.workspace = true

@@ -138,6 +138,7 @@ fn trimming_reports_consistent_statistics() {
     assert!(after.free <= after.capacity);
 }
 
+#[cfg(feature = "allocator-api")]
 #[test]
 fn the_allocator_api_can_be_used_next_to_the_global_allocator() {
     let mut text = String::new();

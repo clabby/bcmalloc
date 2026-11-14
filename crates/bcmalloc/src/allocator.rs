@@ -1,9 +1,9 @@
-//! The [`Allocator`](core::alloc::Allocator) trait, for collections that take an allocator as a
-//! parameter.
+//! The [`Allocator`] trait, for collections that take an allocator as a parameter. It is compiled
+//! with the `allocator-api` feature, because the trait needs Rust 1.100, above the crate's minimum.
 //!
-//! [`Bcmalloc`](crate::Bcmalloc) and [`Heap`](crate::Heap) both implement it, so a `Vec` or a
-//! `Box` can allocate from one of them without it being the program's global allocator. Their
-//! documentation has examples.
+//! [`Bcmalloc`] and [`Heap`] both implement it, so a `Vec` or a `Box` can allocate from one of
+//! them without it being the program's global allocator. The documentation of `Bcmalloc` has an
+//! example.
 //!
 //! # How the trait's rules are met
 //!
@@ -19,14 +19,21 @@
 //!   chunks can shrink or grow where it is. They always move it when the alignment changes, which
 //!   that resize does not support.
 
+#![allow(clippy::incompatible_msrv, reason = "the allocator-api feature needs Rust 1.100")]
+
+#[cfg(all(feature = "std", not(loom)))]
+use crate::Bcmalloc;
+use crate::Heap;
+#[cfg(all(feature = "std", not(loom)))]
+use core::alloc::GlobalAlloc;
 use core::{
-    alloc::{AllocError, Layout},
+    alloc::{AllocError, Allocator, Layout},
     num::NonZero,
     ptr::{self, NonNull},
 };
 
 /// The operations that the allocator trait is built from.
-pub(crate) trait Backend {
+trait Backend {
     /// Allocates a block, or returns null.
     ///
     /// # Safety
@@ -68,7 +75,7 @@ fn block(ptr: *mut u8, size: usize) -> Result<NonNull<[u8]>, AllocError> {
     NonNull::new(ptr).map(|ptr| NonNull::slice_from_raw_parts(ptr, size)).ok_or(AllocError)
 }
 
-pub(crate) fn allocate<A: Backend + ?Sized>(
+fn allocate<A: Backend + ?Sized>(
     backend: &A,
     layout: Layout,
     zeroed: bool,
@@ -83,11 +90,7 @@ pub(crate) fn allocate<A: Backend + ?Sized>(
     block(ptr, layout.size())
 }
 
-pub(crate) unsafe fn deallocate<A: Backend + ?Sized>(
-    backend: &A,
-    ptr: NonNull<u8>,
-    layout: Layout,
-) {
+unsafe fn deallocate<A: Backend + ?Sized>(backend: &A, ptr: NonNull<u8>, layout: Layout) {
     if layout.size() != 0 {
         // SAFETY: the caller vouches for the block.
         unsafe { backend.deallocate_raw(ptr, layout) };
@@ -100,7 +103,7 @@ pub(crate) unsafe fn deallocate<A: Backend + ?Sized>(
 ///
 /// The block must be live with the old layout. The new size must be at least the old size when
 /// growing and at most the old size when shrinking.
-pub(crate) unsafe fn resize<A: Backend + ?Sized>(
+unsafe fn resize<A: Backend + ?Sized>(
     backend: &A,
     ptr: NonNull<u8>,
     old: Layout,
@@ -137,7 +140,7 @@ pub(crate) unsafe fn resize<A: Backend + ?Sized>(
     block(moved, new.size())
 }
 
-/// Implements [`Allocator`](core::alloc::Allocator) for a type that implements [`Backend`].
+/// Implements [`Allocator`] for a type that implements [`Backend`].
 macro_rules! allocator {
     ($($header:tt)*) => {
         // SAFETY: the blocks come from the backend, which hands out valid, aligned, disjoint memory
@@ -145,16 +148,16 @@ macro_rules! allocator {
         // blocks are dangling and aligned, as the trait allows.
         unsafe impl $($header)* {
             fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-                $crate::allocator::allocate(self, layout, false)
+                allocate(self, layout, false)
             }
 
             fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-                $crate::allocator::allocate(self, layout, true)
+                allocate(self, layout, true)
             }
 
             unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
                 // SAFETY: forwarded.
-                unsafe { $crate::allocator::deallocate(self, ptr, layout) }
+                unsafe { deallocate(self, ptr, layout) }
             }
 
             unsafe fn grow(
@@ -164,7 +167,7 @@ macro_rules! allocator {
                 new: Layout,
             ) -> Result<NonNull<[u8]>, AllocError> {
                 // SAFETY: forwarded.
-                unsafe { $crate::allocator::resize(self, ptr, old, new, false) }
+                unsafe { resize(self, ptr, old, new, false) }
             }
 
             unsafe fn grow_zeroed(
@@ -174,7 +177,7 @@ macro_rules! allocator {
                 new: Layout,
             ) -> Result<NonNull<[u8]>, AllocError> {
                 // SAFETY: forwarded.
-                unsafe { $crate::allocator::resize(self, ptr, old, new, true) }
+                unsafe { resize(self, ptr, old, new, true) }
             }
 
             unsafe fn shrink(
@@ -184,18 +187,64 @@ macro_rules! allocator {
                 new: Layout,
             ) -> Result<NonNull<[u8]>, AllocError> {
                 // SAFETY: forwarded.
-                unsafe { $crate::allocator::resize(self, ptr, old, new, false) }
+                unsafe { resize(self, ptr, old, new, false) }
             }
         }
     };
 }
-pub(crate) use allocator;
+
+impl Backend for Heap<'_> {
+    unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8 {
+        self.alloc(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        self.alloc_zeroed(layout).map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded.
+        unsafe { self.dealloc(ptr, layout) };
+    }
+
+    unsafe fn resize_raw(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { self.realloc(ptr, old, new_size) }.map_or(ptr::null_mut(), NonNull::as_ptr)
+    }
+}
+
+allocator!(Allocator for Heap<'_>);
+
+#[cfg(all(feature = "std", not(loom)))]
+impl Backend for Bcmalloc {
+    unsafe fn allocate_raw(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::alloc(self, layout) }
+    }
+
+    unsafe fn allocate_zeroed_raw(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::alloc_zeroed(self, layout) }
+    }
+
+    unsafe fn deallocate_raw(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::dealloc(self, ptr.as_ptr(), layout) };
+    }
+
+    unsafe fn resize_raw(&self, ptr: NonNull<u8>, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded.
+        unsafe { GlobalAlloc::realloc(self, ptr.as_ptr(), old, new_size) }
+    }
+}
+
+#[cfg(all(feature = "std", not(loom)))]
+allocator!(Allocator for Bcmalloc);
 
 #[cfg(all(test, not(loom)))]
 mod test {
     use super::*;
     use crate::testing::{TestRegion, iterations};
-    use core::alloc::Allocator;
     use std::{boxed::Box, vec::Vec};
 
     fn layout(size: usize, align: usize) -> Layout {
