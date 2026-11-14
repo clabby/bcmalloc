@@ -322,27 +322,38 @@ impl<'a> Chunks<'a> {
     /// Claims every free chunk one word at a time, hands each maximal free run to `visit`, records
     /// that the runs were purged, and gives the chunks back.
     ///
-    /// The caller returns the runs' pages to the OS in `visit`, which is why they count as purged.
-    /// While `visit` runs the run belongs to the caller, so nobody can allocate and use it at the
-    /// same time. The cost is that other threads see up to 64 chunks of free memory as missing
-    /// while a word is being drained.
-    pub(crate) fn drain(&self, mut visit: impl FnMut(Range<usize>)) {
+    /// The caller returns the runs' pages to the OS in `visit` and returns whether that worked. A
+    /// run whose pages went back counts as purged, and one whose pages stayed keeps its state, so a
+    /// dirty chunk is not taken for zeros. While `visit` runs the run belongs to the caller, so
+    /// nobody can allocate and use it at the same time. The cost is that other threads see up to 64
+    /// chunks of free memory as missing while a word is being drained.
+    pub(crate) fn drain(&self, mut visit: impl FnMut(Range<usize>) -> bool) {
         for (w, word) in self.used.iter().take(Self::words_for(self.len)).enumerate() {
             let valid = self.valid_mask(w);
             let claimed = !word.fetch_or(valid, Ordering::AcqRel) & valid;
-            let mut rest = claimed;
-            while rest != 0 {
-                let start = rest.trailing_zeros() as usize;
-                let run = (rest >> start).trailing_ones() as usize;
-                visit(w * WORD + start..w * WORD + start + run);
-                rest &= !run_mask(run, start);
-            }
+            let purged = Self::visit_runs(w, claimed, &mut visit);
             if claimed != 0 {
-                self.purged[w].fetch_or(claimed, Ordering::Relaxed);
-                self.dirty[w].fetch_and(!claimed, Ordering::Relaxed);
+                self.purged[w].fetch_or(purged, Ordering::Relaxed);
+                self.dirty[w].fetch_and(!purged, Ordering::Relaxed);
                 word.fetch_and(!claimed, Ordering::Release);
             }
         }
+    }
+
+    /// Hands each maximal run of the chunks of word `w` set in `claimed` to `visit`, and returns
+    /// the chunks of the runs for which it returned true.
+    fn visit_runs(w: usize, claimed: u64, visit: &mut impl FnMut(Range<usize>) -> bool) -> u64 {
+        let (mut rest, mut done) = (claimed, 0);
+        while rest != 0 {
+            let start = rest.trailing_zeros() as usize;
+            let run = (rest >> start).trailing_ones() as usize;
+            let mask = run_mask(run, start);
+            if visit(w * WORD + start..w * WORD + start + run) {
+                done |= mask;
+            }
+            rest &= !mask;
+        }
+        done
     }
 
     /// One pass of the purge clock at time `now` in milliseconds. Free granules with a dirty chunk,
@@ -351,14 +362,14 @@ impl<'a> Chunks<'a> {
     /// recently. Dirty chunks in a granule that is partly in use wait until it is wholly free.
     ///
     /// Only chunks that this pass has claimed are visited, so `visit` may return their pages to the
-    /// OS without risk to a live allocation. The claims are release operations, so a thread that
-    /// sees a chunk missing because of this pass also sees anything the caller stored before the
-    /// pass began.
+    /// OS without risk to a live allocation. It returns whether that worked, as for
+    /// [`drain`](Self::drain). The claims are release operations, so a thread that sees a chunk
+    /// missing because of this pass also sees anything the caller stored before the pass began.
     pub(crate) fn purge_pass(
         &self,
         now: u64,
         delay: u64,
-        mut visit: impl FnMut(Range<usize>),
+        mut visit: impl FnMut(Range<usize>) -> bool,
     ) -> bool {
         let mut pending = false;
         for w in 0..Self::words_for(self.len) {
@@ -392,16 +403,10 @@ impl<'a> Chunks<'a> {
                     Err(actual) => seen = actual,
                 }
             };
-            let mut rest = claimed;
-            while rest != 0 {
-                let start = rest.trailing_zeros() as usize;
-                let run = (rest >> start).trailing_ones() as usize;
-                visit(w * WORD + start..w * WORD + start + run);
-                rest &= !run_mask(run, start);
-            }
+            let purged = Self::visit_runs(w, claimed, &mut visit);
             if claimed != 0 {
-                self.purged[w].fetch_or(claimed, Ordering::Relaxed);
-                self.dirty[w].fetch_and(!claimed, Ordering::Relaxed);
+                self.purged[w].fetch_or(purged, Ordering::Relaxed);
+                self.dirty[w].fetch_and(!purged, Ordering::Relaxed);
                 self.used[w].fetch_and(!claimed, Ordering::Release);
             }
         }
@@ -708,7 +713,10 @@ mod test {
         chunks.free_at(first, 4, 100);
         assert!(chunks.purge_pass(105, 10, |_| panic!("too early")), "the chunks are waiting");
         let mut purged = Vec::new();
-        assert!(!chunks.purge_pass(110, 10, |run| purged.push(run)));
+        assert!(!chunks.purge_pass(110, 10, |run| {
+            purged.push(run);
+            true
+        }));
         assert_eq!(purged.len(), 1);
         assert_eq!(purged[0], first..first + 4);
         assert_eq!(chunks.free_chunks(), 8, "purging gives the chunks back");
@@ -725,7 +733,10 @@ mod test {
         chunks.free_at(b, 1, 108);
         chunks.purge_pass(112, 10, |_| panic!("the word was freed into at 108"));
         let mut purged = Vec::new();
-        chunks.purge_pass(118, 10, |run| purged.push(run));
+        chunks.purge_pass(118, 10, |run| {
+            purged.push(run);
+            true
+        });
         assert_eq!(purged.len(), 1);
         assert_eq!(purged[0], a..b + 1);
     }
@@ -740,8 +751,25 @@ mod test {
         chunks.purge_pass(1000, 10, |_| panic!("the chunk is in use"));
         chunks.free_at(first, 1, 1000);
         let mut purged = Vec::new();
-        chunks.purge_pass(1010, 10, |run| purged.push(run));
+        chunks.purge_pass(1010, 10, |run| {
+            purged.push(run);
+            true
+        });
         assert_eq!(purged.len(), 1);
+    }
+
+    #[test]
+    fn a_run_whose_pages_stayed_is_not_taken_for_zeros() {
+        let bitmap = Bitmap::new(8);
+        let chunks = bitmap.chunks();
+        let first = chunks.alloc(4, 1, 0).unwrap();
+        chunks.free_at(first, 4, 100);
+        // The kernel refused to take the pages back, as it does for pages locked in memory.
+        chunks.purge_pass(1000, 10, |_| false);
+        chunks.drain(|_| false);
+        assert_eq!(chunks.alloc(4, 1, 0), Some(first), "the chunks are free again");
+        assert!(!chunks.is_clean(first, 4, true), "the chunks still hold what was written");
+        chunks.take_purged(first, 4, |_| panic!("nothing was given back"));
     }
 
     #[test]
@@ -750,7 +778,7 @@ mod test {
         let chunks = bitmap.chunks();
         let first = chunks.alloc(8, 1, 0).unwrap();
         chunks.free_at(first, 8, 0);
-        chunks.purge_pass(10, 10, |_| ());
+        chunks.purge_pass(10, 10, |_| true);
         assert_eq!(chunks.alloc(3, 1, 0), Some(5), "runs of several chunks come from the top");
         let mut reported = Vec::new();
         chunks.take_purged(5, 3, |run| reported.push(run));
@@ -793,6 +821,7 @@ mod test {
                 assert!(!visited[chunk], "chunk {chunk} visited twice");
                 visited[chunk] = true;
             }
+            true
         });
 
         let expected: Vec<_> =
@@ -857,12 +886,18 @@ mod test {
             chunks.free_at(chunk, 1, 0);
         }
         let mut purged = Vec::new();
-        assert!(!chunks.purge_pass(100, 10, |run| purged.push(run)));
+        assert!(!chunks.purge_pass(100, 10, |run| {
+            purged.push(run);
+            true
+        }));
         assert_eq!(purged.len(), 1, "only the wholly free huge page goes back");
         assert_eq!(purged[0], 32..64);
         chunks.free_at(0, 1, 100);
         purged.clear();
-        chunks.purge_pass(200, 10, |run| purged.push(run));
+        chunks.purge_pass(200, 10, |run| {
+            purged.push(run);
+            true
+        });
         assert_eq!(purged.first(), Some(&(0..32)));
     }
     #[test]
@@ -876,7 +911,7 @@ mod test {
         assert_eq!(again, first);
         assert!(!chunks.is_clean(first, 4, true), "used since it was fresh");
         chunks.free_at(first, 4, 0);
-        chunks.purge_pass(100, 10, |_| ());
+        chunks.purge_pass(100, 10, |_| true);
         assert!(chunks.claim_at(first, 4));
         assert!(chunks.is_clean(first, 4, true), "purged pages that read as zeros");
         assert!(!chunks.is_clean(first, 4, false), "purged pages that may keep their contents");
@@ -893,7 +928,10 @@ mod test {
             chunks.free_at(first + 1, 1, 0);
         }
         let mut purged = Vec::new();
-        chunks.purge_pass(100, 10, |run| purged.push(run));
+        chunks.purge_pass(100, 10, |run| {
+            purged.push(run);
+            true
+        });
         assert_eq!(purged, vec![(1..2)], "small pages go one chunk at a time, huge pages whole");
     }
     #[test]
@@ -905,10 +943,19 @@ mod test {
             chunks.free_at(first, 32, 0);
         }
         let mut purged = Vec::new();
-        assert!(chunks.purge_pass(20, 10, |run| purged.push(run)), "the huge page still waits");
+        assert!(
+            chunks.purge_pass(20, 10, |run| {
+                purged.push(run);
+                true
+            }),
+            "the huge page still waits"
+        );
         assert_eq!(purged, vec![(0..32)]);
         purged.clear();
-        assert!(!chunks.purge_pass(100, 10, |run| purged.push(run)));
+        assert!(!chunks.purge_pass(100, 10, |run| {
+            purged.push(run);
+            true
+        }));
         assert_eq!(purged, vec![(128..160)]);
     }
 
@@ -1019,6 +1066,7 @@ mod loom_test {
                         for chunk in run {
                             assert!(!held[chunk].load(Ordering::SeqCst), "purged a chunk in use");
                         }
+                        true
                     });
                 })
             };

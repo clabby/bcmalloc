@@ -125,12 +125,14 @@ pub(crate) const DISCARD_ZEROES: bool = cfg!(all(target_os = "linux", not(miri))
 
 /// Tells the kernel the contents of the range are no longer needed, so it may reclaim the physical
 /// pages. The range stays mapped and usable. Reading it afterwards returns zeros on Linux and
-/// either the old contents or zeros on macOS.
+/// either the old contents or zeros on macOS. Returns whether the kernel took the advice. It
+/// refuses for pages that are locked in memory, which then keep their contents.
 ///
 /// # Safety
 ///
 /// The range must lie within a live reservation, and no live allocation may overlap it.
-pub(crate) unsafe fn discard(ptr: NonNull<u8>, len: usize) {
+#[must_use]
+pub(crate) unsafe fn discard(ptr: NonNull<u8>, len: usize) -> bool {
     #[cfg(not(miri))]
     {
         #[cfg(target_os = "linux")]
@@ -140,10 +142,14 @@ pub(crate) unsafe fn discard(ptr: NonNull<u8>, len: usize) {
         #[cfg(target_os = "macos")]
         const ADVICE: libc::c_int = libc::MADV_FREE_REUSABLE;
         // SAFETY: forwarded from the caller.
-        unsafe { libc::madvise(ptr.as_ptr().cast(), len, ADVICE) };
+        unsafe { libc::madvise(ptr.as_ptr().cast(), len, ADVICE) == 0 }
     }
+    // Miri has no pages to give back, and does not take discarded memory for zeros.
     #[cfg(miri)]
-    let _ = (ptr, len);
+    {
+        let _ = (ptr, len);
+        true
+    }
 }
 
 /// Prepares pages that [`discard`] gave back for use again. Linux needs nothing, because the pages
@@ -376,7 +382,7 @@ mod test {
         // SAFETY: the range is a live reservation with no other users.
         unsafe {
             ptr.as_ptr().write(9);
-            discard(ptr, LEN);
+            assert!(discard(ptr, LEN));
             assert_eq!(ptr.as_ptr().read(), 0);
             release(ptr, LEN);
         }
@@ -389,7 +395,7 @@ mod test {
         // SAFETY: the range is a live reservation with no other users.
         unsafe {
             ptr.as_ptr().write(9);
-            discard(ptr, LEN);
+            assert!(discard(ptr, LEN));
             ptr.as_ptr().write(3);
             assert_eq!(ptr.as_ptr().read(), 3);
             release(ptr, LEN);
