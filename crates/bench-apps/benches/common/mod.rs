@@ -21,11 +21,15 @@
 //! A result line holds the allocator, the workload, the metric, the value, the unit and the peak
 //! resident memory of the process in MiB. Every workload here is a throughput workload, so it
 //! prints two lines. The metric `cold` is the first pass in a fresh process and `warm` is a
-//! second, measured pass. Higher is better for both.
+//! second, measured pass. Higher is better for both. `http many` also prints the p99 latency of
+//! a request in its warm pass, in microseconds, where lower is better.
 
 mod channels;
 mod http;
+mod http_many;
 mod json;
+mod kv;
+mod parallel;
 mod pattern;
 mod rss;
 mod source;
@@ -50,12 +54,13 @@ impl Scale {
 pub(crate) struct Pass {
     amount: f64,
     elapsed: Duration,
+    p99_us: Option<f64>,
 }
 
 impl Pass {
     /// A pass that did `amount` units of work since `start`.
     pub(crate) fn since(start: Instant, amount: f64) -> Self {
-        Self { amount, elapsed: start.elapsed() }
+        Self { amount, elapsed: start.elapsed(), p99_us: None }
     }
 
     fn rate(&self) -> f64 {
@@ -86,6 +91,9 @@ const WORKLOADS: &[Workload] = &[
     Workload { name: "syn", unit: "MB/s", run: source::run },
     Workload { name: "http", unit: "kreq/s", run: http::run },
     Workload { name: "tokio channels", unit: "Mmsg/s", run: channels::run },
+    Workload { name: "kv store", unit: "ops/s", run: kv::run },
+    Workload { name: "http many", unit: "req/s", run: http_many::run },
+    Workload { name: "rayon", unit: "records/s", run: parallel::run },
 ];
 
 /// Runs the workloads that the arguments select, or lists them.
@@ -109,8 +117,12 @@ pub(crate) fn run(allocator: &str) {
         let [cold, warm] = (workload.run)(scale);
         // The peak covers the whole run, so both lines carry the same figure.
         let (name, unit, peak) = (workload.name, workload.unit, rss::peak_resident_mib());
+        let p99 = warm.p99_us;
         for (metric, pass) in [("cold", cold), ("warm", warm)] {
             println!("{allocator}\t{name}\t{metric}\t{:.3}\t{unit}\t{peak:.1}", pass.rate());
+        }
+        if let Some(p99) = p99 {
+            println!("{allocator}\t{name}\tp99\t{p99:.3}\tus\t{peak:.1}");
         }
     }
 }
