@@ -684,19 +684,35 @@ impl HeapData {
     /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
     #[inline(always)]
     pub(crate) unsafe fn alloc_table(&self, size: usize, wide: bool) -> *mut u8 {
+        if let Some(block) = self.pop_table(size, wide) {
+            return block;
+        }
+        // SAFETY: forwarded.
+        unsafe { self.refill(Class::from_table(Self::table_step(size, wide) * STEP)) }.cast()
+    }
+
+    /// Pops a block of `size` bytes, as [`alloc_table`](Self::alloc_table) places it, off its bin,
+    /// or returns None if the bin is empty.
+    ///
+    /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
+    #[inline(always)]
+    pub(crate) fn pop_table(&self, size: usize, wide: bool) -> Option<*mut u8> {
         debug_assert!(size <= TABLE_MAX);
-        let step = if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) };
-        // SAFETY: the size is at most `TABLE_MAX`, a multiple of 16, so its step is in the table,
-        // and every offset in it is that of a bin in the array.
+        let step = Self::table_step(size, wide);
+        // SAFETY: the size is at most `TABLE_MAX`, so its step is in the table, and every offset in
+        // it is that of a bin in the array.
         let bin = unsafe {
             let offset = *BIN_OFFSETS.get_unchecked(step);
             &*self.private.bins.as_ptr().byte_add(usize::from(offset))
         };
-        if let Some(block) = Self::pop_from(bin) {
-            return block.cast();
-        }
-        // SAFETY: forwarded.
-        unsafe { self.refill(Class::from_table(step * STEP)) }.cast()
+        Self::pop_from(bin).map(<*mut Block>::cast)
+    }
+
+    /// The index in the class table of a request of `size` bytes. A wide request rounds the size
+    /// up to a multiple of 16, whose class's blocks are 16-byte aligned.
+    #[inline(always)]
+    const fn table_step(size: usize, wide: bool) -> usize {
+        if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) }
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
@@ -1123,6 +1139,18 @@ impl HeapData {
     #[inline(always)]
     pub(crate) unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
         let Some(entry) = self.entry_in_region(ptr.as_ptr()) else { return };
+        // SAFETY: forwarded, and the entry is the block's.
+        unsafe { self.free_with_entry(ptr, entry) };
+    }
+
+    /// Frees the block at `ptr`, of a slab or huge, whose chunk map entry is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, `entry` must be the entry of the block's chunk,
+    /// and the block must be live and not used again.
+    #[inline(always)]
+    pub(crate) unsafe fn free_with_entry(&self, ptr: NonNull<u8>, entry: Entry) {
         if let Some(chunks) = entry.huge_chunks() {
             // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
             return unsafe {
@@ -1155,7 +1183,7 @@ impl HeapData {
     ///
     /// As for [`dealloc`](Self::dealloc), and `entry` must be the entry of the block's chunk.
     #[inline(always)]
-    unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
+    pub(crate) unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
         // SAFETY: entries hold the offset of a bin in the array.
         let bin = unsafe { &*self.private.bins.as_ptr().byte_add(entry.bin_offset()) };
         #[cfg(feature = "metrics")]

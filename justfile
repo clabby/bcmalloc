@@ -83,9 +83,19 @@ bench-apps *args:
 
 # Build the C allocation interface as target/cabi/release/libbcmalloc_c.so (or .dylib), to preload
 # into C programs. The initial-exec TLS model needs nightly, and is what a preloaded library wants.
-# It builds in its own target directory, so the flag does not rebuild the rest of the workspace.
+# A panic aborts: nothing may unwind into C anyway, and without unwind paths the fast paths need
+# no stack frame and end in jumps to the slow paths. It builds in its own target directory, so the
+# flags do not rebuild the rest of the workspace.
 cabi:
-    RUSTFLAGS="-Z tls-model=initial-exec" cargo +nightly build -p bcmalloc-cabi --release --target-dir target/cabi
+    RUSTFLAGS="-Z tls-model=initial-exec -C panic=abort" cargo +nightly build -p bcmalloc-cabi --release --target-dir target/cabi
+
+# Check the C++ operators of the C library in a C++ program that preloads it (Linux, with a C++
+# compiler): a new that cannot allocate runs the new-handler and throws through the library. It
+# builds as cabi does, without the nightly TLS model, in a target directory of its own.
+cabi-cxx:
+    RUSTFLAGS="-C panic=abort" cargo build -p bcmalloc-cabi --release --target-dir target/cabi-cxx
+    c++ -std=c++17 -O2 -Wall crates/cabi/tests/operator_new.cpp -o target/cabi-cxx/operator_new -ldl
+    LD_PRELOAD=target/cabi-cxx/release/libbcmalloc_c.so target/cabi-cxx/operator_new
 
 # Run mimalloc-bench (https://github.com/daanx/mimalloc-bench, built with its build-bench-env.sh)
 # with bcmalloc added as an external allocator, for example
