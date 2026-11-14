@@ -25,6 +25,7 @@
 //! to allocate. A [`Mapping`] owns the memory behind a region and unmaps it on drop.
 
 use crate::{
+    cache::CacheLine,
     chunks::{CHUNK_SHIFT, CHUNK_SIZE, Chunks},
     config::{Commit, Config},
     heap::{Heap, HeapData},
@@ -116,6 +117,17 @@ pub struct Region<'a> {
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
+    clock: Clock,
+    #[cfg(feature = "metrics")]
+    counters: crate::metrics::RegionCounters,
+}
+
+/// The state of the purge clock, on lines of its own. Every free of chunks writes `aging`, and
+/// sharing a line with the fields above, which every claim of chunks reads, would make each free
+/// take that line away from the cores that claim.
+#[derive(Debug)]
+struct Clock {
+    _line: [CacheLine; 0],
     /// When the purge clock next ticks, in milliseconds on the monotonic clock.
     next_purge: AtomicU64,
     /// Whether any free chunk may still be waiting to be purged or to age towards it.
@@ -125,8 +137,6 @@ pub struct Region<'a> {
     purges_active: AtomicUsize,
     /// How many purge passes and trims have finished.
     purges_done: AtomicUsize,
-    #[cfg(feature = "metrics")]
-    counters: crate::metrics::RegionCounters,
 }
 
 // SAFETY: the raw pointer is an address into memory the region owns, and every shared structure
@@ -191,10 +201,13 @@ impl<'a> Region<'a> {
             zones,
             words,
             claimed_mark: AtomicUsize::new(0),
-            next_purge: AtomicU64::new(0),
-            aging: AtomicBool::new(false),
-            purges_active: AtomicUsize::new(0),
-            purges_done: AtomicUsize::new(0),
+            clock: Clock {
+                _line: [],
+                next_purge: AtomicU64::new(0),
+                aging: AtomicBool::new(false),
+                purges_active: AtomicUsize::new(0),
+                purges_done: AtomicUsize::new(0),
+            },
             #[cfg(feature = "metrics")]
             counters: crate::metrics::RegionCounters::new(),
         }
@@ -270,7 +283,7 @@ impl<'a> Region<'a> {
                 break;
             }
         }
-        self.purges_active.fetch_add(1, Ordering::Release);
+        self.clock.purges_active.fetch_add(1, Ordering::Release);
         self.chunks.drain(|run| {
             // SAFETY: the run is free and held by the drain while we advise on it.
             unsafe {
@@ -278,8 +291,8 @@ impl<'a> Region<'a> {
                 sys::discard(start, run.len() << CHUNK_SHIFT);
             }
         });
-        self.purges_done.fetch_add(1, Ordering::Release);
-        self.purges_active.fetch_sub(1, Ordering::Release);
+        self.clock.purges_done.fetch_add(1, Ordering::Release);
+        self.clock.purges_active.fetch_sub(1, Ordering::Release);
     }
 
     /// A snapshot of how full the region is.
@@ -437,15 +450,15 @@ impl<'a> Region<'a> {
         // A purge pass may hold the chunks for a moment, so a failed claim only counts when no
         // pass overlapped it, as for any other claim.
         loop {
-            let active = self.purges_active.load(Ordering::Acquire);
-            let done = self.purges_done.load(Ordering::Acquire);
+            let active = self.clock.purges_active.load(Ordering::Acquire);
+            let done = self.clock.purges_done.load(Ordering::Acquire);
             if self.chunks.claim_at(start, more) {
                 break;
             }
             fence(Ordering::Acquire);
             if active == 0 &&
-                self.purges_active.load(Ordering::Acquire) == 0 &&
-                self.purges_done.load(Ordering::Acquire) == done
+                self.clock.purges_active.load(Ordering::Acquire) == 0 &&
+                self.clock.purges_done.load(Ordering::Acquire) == done
             {
                 return false;
             }
@@ -476,8 +489,8 @@ impl<'a> Region<'a> {
         home: Range<usize>,
     ) -> Option<usize> {
         loop {
-            let active = self.purges_active.load(Ordering::Acquire);
-            let done = self.purges_done.load(Ordering::Acquire);
+            let active = self.clock.purges_active.load(Ordering::Acquire);
+            let done = self.clock.purges_done.load(Ordering::Acquire);
             // Every round looks at the bitmap, so chunks that are free for some other reason can
             // be used even while a pass that was descheduled is still holding its own.
             if let Some(first) = self.chunks.alloc_near(n, align, hint, home.clone()) {
@@ -487,8 +500,8 @@ impl<'a> Region<'a> {
             // claim synchronises with the pass, so after this fence its counters are visible.
             fence(Ordering::Acquire);
             if active == 0 &&
-                self.purges_active.load(Ordering::Acquire) == 0 &&
-                self.purges_done.load(Ordering::Acquire) == done
+                self.clock.purges_active.load(Ordering::Acquire) == 0 &&
+                self.clock.purges_done.load(Ordering::Acquire) == done
             {
                 return None;
             }
@@ -501,7 +514,7 @@ impl<'a> Region<'a> {
         self.chunks.free_at(first, n, sys::monotonic_ms());
         // A read-modify-write, so that the pass that consumes the flag also sees the bits above no
         // matter which free it read the flag from.
-        self.aging.fetch_or(true, Ordering::Release);
+        self.clock.aging.fetch_or(true, Ordering::Release);
     }
 
     /// Runs the purge clock if free chunks are ageing and an interval has passed. Chunks that stay
@@ -509,7 +522,7 @@ impl<'a> Region<'a> {
     /// slow, so that an idle program pays nothing and a busy one pays a clock read now and then.
     #[inline]
     pub(crate) fn purge_if_due(&self) {
-        if self.aging.load(Ordering::Relaxed) {
+        if self.clock.aging.load(Ordering::Relaxed) {
             self.purge_when_due();
         }
     }
@@ -517,9 +530,10 @@ impl<'a> Region<'a> {
     #[cold]
     fn purge_when_due(&self) {
         let now = sys::monotonic_ms();
-        let due = self.next_purge.load(Ordering::Relaxed);
+        let due = self.clock.next_purge.load(Ordering::Relaxed);
         let won = now >= due &&
-            self.next_purge
+            self.clock
+                .next_purge
                 .compare_exchange(
                     due,
                     now + PURGE_INTERVAL_MS,
@@ -536,8 +550,8 @@ impl<'a> Region<'a> {
     pub(crate) fn purge_pass(&self, now: u64) {
         // Take the flag first so that a free that races with the pass sets it again. Taking it
         // acquires the bits of every free that set it.
-        self.aging.swap(false, Ordering::Acquire);
-        self.purges_active.fetch_add(1, Ordering::Release);
+        self.clock.aging.swap(false, Ordering::Acquire);
+        self.clock.purges_active.fetch_add(1, Ordering::Release);
         #[cfg(feature = "metrics")]
         self.counters.purge_passes.add(1);
         let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
@@ -551,10 +565,10 @@ impl<'a> Region<'a> {
                 );
             }
         });
-        self.purges_done.fetch_add(1, Ordering::Release);
-        self.purges_active.fetch_sub(1, Ordering::Release);
+        self.clock.purges_done.fetch_add(1, Ordering::Release);
+        self.clock.purges_active.fetch_sub(1, Ordering::Release);
         if pending {
-            self.aging.fetch_or(true, Ordering::Release);
+            self.clock.aging.fetch_or(true, Ordering::Release);
         }
     }
 
@@ -960,14 +974,14 @@ mod test {
         // SAFETY: the block is live with this layout.
         let block = unsafe { heap.realloc(block, layout(20), 9 << CHUNK_SHIFT) }.unwrap();
         // What a purge pass looks like while it holds the free tail.
-        region.purges_active.fetch_add(1, Ordering::Release);
+        region.clock.purges_active.fetch_add(1, Ordering::Release);
         assert!(region.chunks.claim_at(9, 11));
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 region.chunks.free_at(9, 11, 0);
-                region.purges_done.fetch_add(1, Ordering::Release);
-                region.purges_active.fetch_sub(1, Ordering::Release);
+                region.clock.purges_done.fetch_add(1, Ordering::Release);
+                region.clock.purges_active.fetch_sub(1, Ordering::Release);
             });
             // SAFETY: the block is live with nine chunks.
             let grown = unsafe { heap.realloc(block, layout(9), 12 << CHUNK_SHIFT) };
@@ -1010,14 +1024,14 @@ mod test {
         let a = region.alloc_chunks(1, 1, 0, 0).unwrap();
         region.alloc_chunks(1, 1, 0, 0).unwrap();
         // A pass that was descheduled while holding some other chunks.
-        region.purges_active.fetch_add(1, Ordering::Release);
+        region.clock.purges_active.fetch_add(1, Ordering::Release);
         region.free_chunks(a, 1);
         let (sender, receiver) = mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| sender.send(region.alloc_chunks_after_purge(1, 1, 0, 0..1)).unwrap());
             let found = receiver.recv_timeout(Duration::from_secs(5));
             // Let the retry finish whatever happened, so that the scope can end.
-            region.purges_active.fetch_sub(1, Ordering::Release);
+            region.clock.purges_active.fetch_sub(1, Ordering::Release);
             assert_eq!(found, Ok(Some(a)), "the retry waited for the pass");
         });
     }
@@ -1130,7 +1144,7 @@ mod loom_test {
             let mut missed = 0;
             region.chunks.purge_pass(u64::MAX, 0, |run| missed += run.len());
             assert!(
-                missed == 0 || region.aging.load(Ordering::Acquire),
+                missed == 0 || region.clock.aging.load(Ordering::Acquire),
                 "a free chunk is dirty and nothing is going to purge it"
             );
         });
