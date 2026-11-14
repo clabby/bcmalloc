@@ -48,6 +48,23 @@ jobs:
       - name: Check every feature combination
         run: just hack --locked
 
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Check every feature combination but allocator-api on the minimum version
+        run: just msrv --locked
+
   lint:
     name: Clippy and rustfmt
     runs-on: ubuntu-latest

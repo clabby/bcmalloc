@@ -203,11 +203,20 @@ impl TestRegion {
 ///
 /// An all-zero bit pattern must be a valid `T` that equals what `make` returns.
 unsafe fn zeroed<T>(len: usize, make: impl Fn() -> T) -> Box<[T]> {
-    if cfg!(loom) {
+    let layout = Layout::array::<T>(len).expect("a slice that fits in memory");
+    if cfg!(loom) || layout.size() == 0 {
         return (0..len).map(|_| make()).collect();
     }
-    // SAFETY: the caller vouches for the zero bit pattern.
-    unsafe { Box::new_zeroed_slice(len).assume_init() }
+    // SAFETY: the layout is not zero sized, a non-null block from `alloc_zeroed` with it holds
+    // `len` zeroed values, which the caller vouches are valid, and `Box` frees it with the same
+    // layout through the global allocator.
+    unsafe {
+        let values = alloc_zeroed(layout).cast::<T>();
+        if values.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(ptr::slice_from_raw_parts_mut(values, len))
+    }
 }
 
 /// A block the harness is tracking, and the byte it was filled with.

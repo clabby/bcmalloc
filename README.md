@@ -1,6 +1,6 @@
 # bcmalloc
 
-<img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.100%2B-orange.svg" alt="Rust 1.100+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
+<img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"> <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust 1.88+"> <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS-lightgrey.svg" alt="Platforms">
 
 A global allocator for long-lived, highly concurrent Rust programs. It reserves one region of address space up front and serves small blocks from per-thread stacks of free pointers, without atomic operations and without touching the blocks. Blocks freed by another thread go home in batched messages, one compare-and-swap per batch. Memory freed by one size class is reused by every other, memory that stays idle goes back to the operating system, and the capacity you configure is a hard limit.
 
@@ -47,9 +47,10 @@ unsafe { heap.dealloc(block, layout) };
 # Ok::<(), bcmalloc::Error>(())
 ```
 
-The allocator also implements the standard library's `Allocator` trait, which has been stable since Rust 1.100. A collection can then take it as a parameter without it being the global allocator. A heap implements the trait too, for code that wants one thread's heap.
+With the `allocator-api` feature, the allocator also implements the standard library's `Allocator` trait, which has been stable since Rust 1.100. A collection can then take it as a parameter without it being the global allocator. A heap implements the trait too, for code that wants one thread's heap.
 
 ```rust
+# #[cfg(feature = "allocator-api")] {
 use bcmalloc::Bcmalloc;
 
 static ALLOCATOR: Bcmalloc = Bcmalloc::new();
@@ -57,6 +58,7 @@ static ALLOCATOR: Bcmalloc = Bcmalloc::new();
 let mut numbers = Vec::new_in(&ALLOCATOR);
 numbers.extend(0..1000_u32);
 assert_eq!(numbers.iter().sum::<u32>(), 499_500);
+# }
 ```
 
 ## Metrics
@@ -111,7 +113,7 @@ The development suite has 51 synthetic workloads and is what the allocator is tu
 - A thread that finds all `max_heaps` heaps taken fails its allocations, which aborts the program.
 - The capacity is a hard limit. Nothing grows the region after start-up.
 - Linux and macOS are supported. Windows is not.
-- The standard library's `Allocator` trait needs Rust 1.100 or later, which is the minimum supported version.
+- The minimum supported Rust version is 1.88. The `allocator-api` feature needs 1.100, where the standard library's `Allocator` trait became stable.
 
 ## Testing
 
