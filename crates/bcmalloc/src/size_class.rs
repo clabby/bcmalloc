@@ -202,22 +202,11 @@ const TABLE: [u8; TABLE_STEPS] = {
 };
 
 impl Class {
-    /// The class of a size of at most [`TABLE_MAX`] that [`table_size`](Self::table_size) gave.
+    /// The class of a size of at most [`TABLE_MAX`], for a request that needs no more than 8 bytes
+    /// of alignment, or for one that needs 16 once the size is rounded up to a multiple of 16.
     #[inline(always)]
     pub(crate) const fn from_table(size: usize) -> Self {
         Self(TABLE[size.div_ceil(STEP)])
-    }
-
-    /// The size to look up in the class table for a layout that
-    /// [`is_table_request`](Self::is_table_request) accepts. A layout that asks for an alignment of
-    /// 16 is rounded up to a multiple of 16, whose class's blocks are 16-byte aligned.
-    #[inline(always)]
-    pub(crate) const fn table_size(layout: Layout) -> usize {
-        if layout.align() > STEP {
-            layout.size().next_multiple_of(MIN_ALIGN)
-        } else {
-            layout.size()
-        }
     }
 
     /// Whether the layout is small and aligned loosely enough to be classified by the table,
@@ -440,10 +429,10 @@ mod test {
         for size in 1..=TABLE_MAX {
             let Some(Request::Small(class)) = classify(layout(size, MIN_ALIGN)) else { panic!() };
             assert_eq!(class.block_size() % MIN_ALIGN, 0, "{size}");
-            assert_eq!(Class::from_table(Class::table_size(layout(size, MIN_ALIGN))), class);
+            assert_eq!(Class::from_table(size.next_multiple_of(MIN_ALIGN)), class);
             let Some(Request::Small(loose)) = classify(layout(size, STEP)) else { panic!() };
             assert!(loose.block_size() <= class.block_size());
-            assert_eq!(Class::from_table(Class::table_size(layout(size, STEP))), loose);
+            assert_eq!(Class::from_table(size), loose);
         }
         assert_eq!(Class::for_size(24).block_size(), 24, "three words fill their block");
     }

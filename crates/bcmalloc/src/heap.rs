@@ -670,31 +670,33 @@ impl HeapData {
     pub(crate) unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if Class::is_table_request(layout) {
             // SAFETY: forwarded, and the table covers the size.
-            return unsafe { self.alloc_table(Class::table_size(layout)) };
+            return unsafe { self.alloc_table(layout.size(), layout.align() > STEP) };
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_general(layout) }
     }
-    /// Allocates `size` bytes aligned to 16 for a size the class table covers, zero included.
+    /// Allocates `size` bytes for a size the class table covers, zero included, aligned to 16 if
+    /// `wide` and to 8 otherwise. A wide request rounds the size up to a multiple of 16, whose
+    /// class's blocks are 16-byte aligned.
     ///
     /// # Safety
     ///
-    /// The caller must hold the claim on this slot, and `size` must be at most
-    /// [`TABLE_MAX`](crate::size_class::TABLE_MAX).
+    /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
     #[inline(always)]
-    pub(crate) unsafe fn alloc_table(&self, size: usize) -> *mut u8 {
+    pub(crate) unsafe fn alloc_table(&self, size: usize, wide: bool) -> *mut u8 {
         debug_assert!(size <= TABLE_MAX);
-        // SAFETY: the size is at most `TABLE_MAX`, so its step is in the table, and every offset
-        // in it is that of a bin in the array.
+        let step = if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) };
+        // SAFETY: the size is at most `TABLE_MAX`, a multiple of 16, so its step is in the table,
+        // and every offset in it is that of a bin in the array.
         let bin = unsafe {
-            let offset = *BIN_OFFSETS.get_unchecked(size.div_ceil(STEP));
+            let offset = *BIN_OFFSETS.get_unchecked(step);
             &*self.private.bins.as_ptr().byte_add(usize::from(offset))
         };
         if let Some(block) = Self::pop_from(bin) {
             return block.cast();
         }
         // SAFETY: forwarded.
-        unsafe { self.refill(Class::from_table(size)) }.cast()
+        unsafe { self.refill(Class::from_table(step * STEP)) }.cast()
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
