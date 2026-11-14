@@ -2611,13 +2611,18 @@ mod test {
         assert_eq!(used(&region), 0);
     }
 
+    /// The block size of the spill tests. Their bursts are multiples of the class's largest bin,
+    /// 2048 blocks of 64 bytes, which take Miri many minutes, so under Miri they use the largest
+    /// class that is still reusable anywhere, whose bin holds 512.
+    const SPILL_SIZE: usize = if cfg!(miri) { ANYWHERE } else { 64 };
+
     #[test]
     fn a_burst_bigger_than_the_bin_spills_and_the_next_burst_takes_it_back() {
         let test = TestRegion::new(128, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
-        let layout = layout(64, 8);
-        let burst = 4 * Class::for_size(64).bin_max();
+        let layout = layout(SPILL_SIZE, 8);
+        let burst = 4 * Class::for_size(SPILL_SIZE).bin_max();
         // Bursts that alternate with refills grow the bin to its largest, and only then does an
         // overflow spill.
         for _ in 0..8 {
@@ -2642,8 +2647,8 @@ mod test {
         let test = TestRegion::new(128, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
-        let layout = layout(64, 8);
-        let class = Class::for_size(64);
+        let layout = layout(SPILL_SIZE, 8);
+        let class = Class::for_size(SPILL_SIZE);
         for _ in 0..8 {
             let blocks = alloc_many(&heap, layout, 4 * class.bin_max());
             free_all(&heap, layout, blocks);
@@ -2665,15 +2670,15 @@ mod test {
         let test = TestRegion::new(128, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
-        let (layout, other) = (layout(64, 8), layout(1024, 8));
-        let class = Class::for_size(64);
+        let (layout, other) = (layout(SPILL_SIZE, 8), layout(1024, 8));
+        let class = Class::for_size(SPILL_SIZE);
         for _ in 0..8 {
             let blocks = alloc_many(&heap, layout, 4 * class.bin_max());
             free_all(&heap, layout, blocks);
         }
         assert!(!heap.data.lists(class).spill.get().is_null());
         // Refills of another class run maintenance steps, which return the idle class's batches.
-        for _ in 0..4 {
+        for _ in 0..8 {
             let blocks = alloc_many(&heap, other, 16 * MAINTENANCE_INTERVAL as usize);
             free_all(&heap, other, blocks);
         }
@@ -2686,10 +2691,10 @@ mod test {
         let test = TestRegion::new(128, 2);
         let region = test.region();
         let (owner, freer) = (region.heap().unwrap(), region.heap().unwrap());
-        // 64-byte blocks may stay in the freeing heap's bin, but that heap never allocates them.
-        let layout = layout(64, 8);
+        // These blocks may stay in the freeing heap's bin, but that heap never allocates them.
+        let layout = layout(SPILL_SIZE, 8);
         for _ in 0..8 {
-            let blocks = alloc_many(&owner, layout, 4 * Class::for_size(64).bin_max());
+            let blocks = alloc_many(&owner, layout, 4 * Class::for_size(SPILL_SIZE).bin_max());
             free_all(&freer, layout, blocks);
         }
         freer.validate();
