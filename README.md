@@ -90,7 +90,7 @@ The C library prints the same report at exit when it is built with the feature a
 
 ## Benchmarks
 
-![For every suite and every other allocator, one dot per workload showing how much faster bcmalloc is](https://raw.githubusercontent.com/clabby/bcmalloc/main/assets/benchmarks.svg)
+![For every suite and every other allocator, one dot per workload showing how much faster bcmalloc is](https://github.com/clabby/bcmalloc/raw/main/assets/benchmarks.svg)
 
 <!-- generated:overview -->
 | Compared with mimalloc             | system | bcmalloc | jemalloc | snmalloc |
