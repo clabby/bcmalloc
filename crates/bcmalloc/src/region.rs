@@ -2,8 +2,9 @@
 //! byte it hands out.
 //!
 //! Everything lives in a single mapping, laid out so that the zero-filled pages the kernel provides
-//! are a valid initial state for all of it. Nothing is written at start-up, so creating a region of
-//! any size is instant and costs nothing until it is used.
+//! are a valid initial state for all of it. Creating a region writes its header and, unless the
+//! configuration asks to populate the memory up front, nothing else, so a region of any size costs
+//! address space until it is used.
 //!
 //! ```text
 //!   +--------+-------+-----------+-------------+-----------+---------+-----+-------------------+
@@ -23,14 +24,6 @@
 //! A [`Region`] is the shared, thread-safe half of the allocator. Threads take a [`Heap`] from it
 //! to allocate. A [`Mapping`] owns the memory behind a region and unmaps it on drop.
 
-use core::{
-    alloc::Layout,
-    fmt, mem,
-    ops::Range,
-    ptr::{self, NonNull},
-    slice,
-};
-
 use crate::{
     chunks::{CHUNK_SHIFT, CHUNK_SIZE, Chunks},
     config::{Commit, Config},
@@ -40,12 +33,21 @@ use crate::{
     sync::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     sys,
 };
+use core::{
+    alloc::Layout,
+    fmt, mem,
+    ops::Range,
+    ptr::{self, NonNull},
+    slice,
+};
 
 /// How often the purge clock ticks, in milliseconds, and how long free chunks must have gone
 /// unused before they go back to the OS.
 const PURGE_INTERVAL_MS: u64 = 10;
 
-/// The alignment of the managed memory, which is the size of the largest slab.
+/// The alignment of the managed memory: one bitmap word of 64 chunks, 4 MiB. Every word then covers
+/// two whole huge pages, and every slab, which is at most 8 chunks, starts on a multiple of its
+/// size.
 const SLAB_ALIGN: usize = 64 * CHUNK_SIZE;
 
 /// How many times longer free chunks of the zone of transparent huge pages wait before they are
@@ -351,8 +353,8 @@ impl<'a> Region<'a> {
         self.chunks.len() << CHUNK_SHIFT
     }
 
-    /// Claims `n` chunks as `Chunks`::alloc does, preferring part `part` (see [`Region::part`]),
-    /// and makes the pages of any that were given back to the OS ready for use.
+    /// As [`alloc_chunks_zeroed`](Self::alloc_chunks_zeroed), without telling whether the chunks
+    /// read as zeros.
     #[cfg(test)]
     pub(crate) fn alloc_chunks(
         &self,
@@ -364,7 +366,9 @@ impl<'a> Region<'a> {
         self.alloc_chunks_zeroed(n, align, hint, part).map(|(first, _)| first)
     }
 
-    /// As [`alloc_chunks`](Self::alloc_chunks), and also tells whether the chunks read as zeros.
+    /// Claims `n` chunks as `Chunks`::alloc does, preferring part `part` (see [`Region::part`]),
+    /// makes the pages of any that were given back to the OS ready for use, and tells whether the
+    /// chunks read as zeros.
     pub(crate) fn alloc_chunks_zeroed(
         &self,
         n: usize,
@@ -996,9 +1000,8 @@ mod test {
 
     #[test]
     fn a_retry_does_not_wait_for_a_purge_pass_while_other_chunks_are_free() {
-        use std::{sync::mpsc, time::Duration};
-
         use crate::testing::TestRegion;
+        use std::{sync::mpsc, time::Duration};
 
         let test = TestRegion::new(2, 1);
         let region = test.region();
@@ -1104,10 +1107,9 @@ mod test {
 
 #[cfg(all(test, loom))]
 mod loom_test {
-    use loom::thread;
-
     use super::*;
     use crate::testing::TestRegion;
+    use loom::thread;
 
     #[test]
     fn a_free_racing_a_purge_pass_never_strands_a_dirty_chunk() {

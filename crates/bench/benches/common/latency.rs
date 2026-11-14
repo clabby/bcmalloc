@@ -5,14 +5,13 @@
 //! calls and reports the median, the 99th and the 99.9th percentile of the batches in nanoseconds.
 //! Nothing is timed while the live set is built or while blocks are handed to other threads.
 
-use std::sync::{Mutex, mpsc};
-
 use super::{
     churn::MIXED,
     harness::{
         BATCH, Block, Outcome, Rng, Scale, empty_slots, latency, parallel_collect, time_batch,
     },
 };
+use std::sync::{Mutex, mpsc};
 
 /// Replaces random blocks of a live set of 4096 and times batches of steps. A step is an
 /// allocation and the free of the block it replaces, so a batch makes two calls per step.

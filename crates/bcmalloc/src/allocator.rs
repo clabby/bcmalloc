@@ -14,9 +14,10 @@
 //!   copying rules stay simple.
 //! * Zeroed requests read as zeros in the whole block. Fresh memory is not cleared again, and
 //!   everything else is.
-//! * Growing and shrinking keep the block in place when the new size falls in the same size class.
-//!   Otherwise they move it, and they always move it when the alignment changes, which the
-//!   allocator's own resize does not support.
+//! * Growing and shrinking keep the block in place when the allocator's own resize does, which is
+//!   when the new size still fits the block and fills at least half of it, or when a block of whole
+//!   chunks can shrink or grow where it is. They always move it when the alignment changes, which
+//!   that resize does not support.
 
 use core::{
     alloc::{AllocError, Layout},
@@ -24,7 +25,7 @@ use core::{
     ptr::{self, NonNull},
 };
 
-/// The three operations that the allocator trait is built from.
+/// The operations that the allocator trait is built from.
 pub(crate) trait Backend {
     /// Allocates a block, or returns null.
     ///
@@ -192,11 +193,10 @@ pub(crate) use allocator;
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use core::alloc::Allocator;
-    use std::{boxed::Box, vec::Vec};
-
     use super::*;
     use crate::testing::{TestRegion, iterations};
+    use core::alloc::Allocator;
+    use std::{boxed::Box, vec::Vec};
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).unwrap()
@@ -210,7 +210,7 @@ mod test {
 
     #[test]
     fn collections_allocate_from_a_heap() {
-        // The biggest slabs span 64 chunks, so the region has to have room for more than one.
+        // The biggest slabs span 8 chunks, and the region has room for many of them.
         let test = TestRegion::new(160, 1);
         let region = test.region();
         let heap = region.heap().unwrap();
@@ -254,9 +254,9 @@ mod test {
             // SAFETY: the block came from this allocator with this layout and is freed once.
             unsafe { heap.deallocate(block.cast(), layout) };
         }
-        // A slab holds 327 of these blocks, so asking for that many covers every block that was
-        // dirtied.
-        let clean: Vec<_> = (0..327).map(|_| heap.allocate_zeroed(layout).unwrap()).collect();
+        // Asking for a whole slab of blocks covers every block that was dirtied.
+        let per_slab = crate::size_class::Class::for_size(200).blocks_per_slab();
+        let clean: Vec<_> = (0..per_slab).map(|_| heap.allocate_zeroed(layout).unwrap()).collect();
         assert!(clean.iter().all(|block| bytes(*block).iter().all(|&byte| byte == 0)));
         assert!(
             clean

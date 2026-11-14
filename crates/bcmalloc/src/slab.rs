@@ -32,9 +32,8 @@
 //! bins or in a message on the way back, so a slab is only released when every block has really
 //! come home.
 
-use core::{cell::Cell, ptr};
-
 use crate::{cache::CacheLine, size_class::Class};
+use core::{cell::Cell, ptr};
 
 /// A free block seen as a link, which is how a single block travels to its owner's inbox. Blocks
 /// are at least 16 bytes.
@@ -403,12 +402,10 @@ impl<'a> Returns<'a> {
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use std::vec::Vec;
-
-    use core::mem::{align_of, size_of};
-
     use super::*;
     use crate::testing::Buffer;
+    use core::mem::{align_of, size_of};
+    use std::vec::Vec;
 
     #[test]
     fn a_descriptor_fills_whole_cache_lines() {

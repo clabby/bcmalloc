@@ -34,9 +34,8 @@
 //! up to a power of two that is at least as large as the alignment. Huge allocations start on a
 //! chunk boundary, so the largest supported alignment is one chunk.
 
-use core::alloc::Layout;
-
 use crate::chunks::CHUNK_SIZE;
+use core::alloc::Layout;
 
 /// The alignment that C's malloc promises, which a request gets unless its layout asks for less.
 pub(crate) const MIN_ALIGN: usize = 16;
@@ -110,8 +109,8 @@ const BLOCK_SIZES: [u32; CLASSES] = {
 const LINE: usize = if cfg!(target_arch = "aarch64") { 128 } else { 64 };
 
 /// How many block pointers a heap's bin of class index `i` starts out holding at most. Small blocks
-/// get many and big blocks few, so that a full bin of a small class holds about 32 KiB and one of a
-/// class above 8 KiB about 64 KiB.
+/// get many and big blocks few, so that a full bin holds up to 32 KiB of blocks, but at least 8 and
+/// at most 128 of them, and one of a class above 8 KiB up to 64 KiB, between 1 and 8 of them.
 const fn bin_initial_of(i: usize) -> usize {
     let size = block_size_of(i);
     if size <= TABLE_MAX {

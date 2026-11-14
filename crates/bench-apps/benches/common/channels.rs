@@ -5,11 +5,9 @@
 //! runtime moves tasks between its worker threads, so most messages are freed on a different thread
 //! than the one that allocated them, as they are in a pipeline of async services.
 
-use std::time::Instant;
-
-use tokio::{sync::mpsc, task::JoinSet};
-
 use super::{Pass, Scale, text::Rng, twice};
+use std::time::Instant;
+use tokio::{sync::mpsc, task::JoinSet};
 
 const WORKERS: usize = 4;
 const SOURCES: usize = 4;

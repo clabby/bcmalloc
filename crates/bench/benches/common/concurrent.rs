@@ -1,6 +1,7 @@
 //! Workloads where several threads share memory, free each other's blocks or live next to each
 //! other in the address space.
 
+use super::harness::{Block, Outcome, Rng, Scale, empty_slots, parallel, raw_alloc, raw_free};
 use std::{
     hint::black_box,
     sync::{
@@ -11,8 +12,6 @@ use std::{
     thread,
     time::Instant,
 };
-
-use super::harness::{Block, Outcome, Rng, Scale, empty_slots, parallel, raw_alloc, raw_free};
 
 /// The server simulation from the Larson benchmark. Each thread owns a table of blocks,
 /// and every generation its table passes to a brand new thread, which frees blocks that another

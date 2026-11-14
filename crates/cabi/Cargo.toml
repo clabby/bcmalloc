@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [features]
 # Counts allocations and slow-path events, and prints them at exit when BCMALLOC_SHOW_METRICS is set.
-metrics = ["bcmalloc/metrics"]
+metrics = [ "bcmalloc/metrics" ]
 
 [dependencies]
 bcmalloc = { workspace = true, features = ["std"] }

@@ -11,14 +11,13 @@
 //! that belongs to another thread. A snapshot taken while threads run sums counters that each only
 //! move forward, so it is a consistent view of each counter, not an instant of the whole allocator.
 
-use core::{
-    fmt::{self, Write},
-    sync::atomic::{AtomicU64, Ordering},
-};
-
 use crate::{
     chunks::CHUNK_SHIFT,
     size_class::{CLASSES, Class},
+};
+use core::{
+    fmt::{self, Write},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// A counter that one thread writes and any thread may read.
@@ -311,10 +310,9 @@ impl Write for Text {
 
 #[cfg(all(test, not(loom)))]
 mod test {
+    use crate::{chunks::CHUNK_SIZE, size_class::Class, testing::TestRegion};
     use core::{alloc::Layout, ptr::NonNull};
     use std::{string::ToString, vec::Vec};
-
-    use crate::{chunks::CHUNK_SIZE, size_class::Class, testing::TestRegion};
 
     #[test]
     fn snapshots_count_live_blocks_slabs_and_events() {

@@ -20,8 +20,8 @@
 //!
 //! A run of up to 64 chunks fits in one word, so claiming it takes one compare-and-swap. A swap
 //! only fails because another thread's swap succeeded, which makes this path lock-free. A run may
-//! be required to start at a multiple of an alignment. That is how slabs of 8 and 64 chunks stay
-//! aligned to their own size.
+//! be required to start at a multiple of an alignment. That is how slabs of 8 chunks stay aligned
+//! to their own size.
 //!
 //! A run of more than 64 chunks spans several words, and no single atomic covers that. The
 //! allocator claims the words in order and rolls back if it loses a race. This path is
@@ -73,9 +73,8 @@
 //! and then reused by another. The release on the free and the acquire on the next claim make the
 //! first thread's writes visible to the second.
 
-use core::ops::Range;
-
 use crate::sync::{AtomicU64, Ordering};
+use core::ops::Range;
 
 /// log2 of the chunk size.
 pub(crate) const CHUNK_SHIFT: usize = 16;
@@ -610,10 +609,9 @@ const fn run_starts(free: u64, n: usize, align: usize) -> u64 {
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use std::{vec, vec::Vec};
-
     use super::*;
     use crate::testing::{Bitmap, ChunkModel, Rng, iterations};
+    use std::{vec, vec::Vec};
 
     #[test]
     fn single_chunks_fill_the_bitmap_from_the_bottom() {
@@ -947,9 +945,8 @@ mod test {
 
 #[cfg(all(test, loom))]
 mod loom_test {
-    use loom::{sync::Arc, thread};
-
     use crate::testing::Bitmap;
+    use loom::{sync::Arc, thread};
 
     /// Runs `claim` on two threads against one bitmap and returns what each got.
     fn race<T: Send + 'static>(

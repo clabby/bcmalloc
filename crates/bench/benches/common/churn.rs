@@ -1,9 +1,8 @@
 //! Workloads where blocks live for a while and die out of order, the way they do in most
 //! programs.
 
-use std::{hint::black_box, thread};
-
 use super::harness::{Block, Outcome, Rng, Scale, empty_slots, parallel, timed};
+use std::{hint::black_box, thread};
 
 /// How a churn workload picks request sizes.
 #[derive(Clone, Copy)]

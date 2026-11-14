@@ -28,11 +28,6 @@
 //! happens when the region is full, when the alignment is above [`MAX_ALIGN`](crate::MAX_ALIGN),
 //! or when more threads are running than the configuration has heaps for.
 
-use core::{
-    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
-    ptr::{self, NonNull},
-};
-
 use crate::{
     allocator::{Backend, allocator},
     config::Config,
@@ -41,6 +36,10 @@ use crate::{
     size_class::{MIN_ALIGN, TABLE_MAX},
     sync::{AtomicPtr, AtomicUsize, Ordering},
     tls,
+};
+use core::{
+    alloc::{AllocError, Allocator, GlobalAlloc, Layout},
+    ptr::{self, NonNull},
 };
 
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
@@ -494,11 +493,10 @@ unsafe impl GlobalAlloc for Bcmalloc {
 
 #[cfg(all(test, not(loom), not(miri)))]
 mod test {
-    use core::alloc::Layout;
-    use std::{boxed::Box, vec::Vec};
-
     use super::*;
     use crate::config::Commit;
+    use core::alloc::Layout;
+    use std::{boxed::Box, vec::Vec};
 
     /// An allocator over a small region, leaked so that it can be used as a static would be.
     fn instance() -> &'static Bcmalloc {
@@ -639,6 +637,35 @@ mod test {
         assert_eq!(allocator.usable_size(NonNull::from(&mut outside)), None);
         // SAFETY: the block is live and freed once.
         unsafe { allocator.free_unsized(grown) };
+    }
+    #[test]
+    fn a_thread_whose_first_call_resizes_or_zeroes_binds_a_heap() {
+        let allocator = instance();
+        let layout = Layout::from_size_align(100, 8).unwrap();
+        // SAFETY: the layout is not zero sized.
+        let block = unsafe { allocator.alloc(layout) }.addr();
+        std::thread::spawn(move || {
+            let block = ptr::with_exposed_provenance_mut::<u8>(block);
+            // SAFETY: the block is live with this layout, and the new size is valid.
+            let grown = unsafe { allocator.realloc(block, layout, 5000) };
+            assert!(!grown.is_null());
+            // SAFETY: the grown block is live with the new layout.
+            unsafe { allocator.dealloc(grown, Layout::from_size_align(5000, 8).unwrap()) };
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            let zeroed = Layout::from_size_align(3000, 16).unwrap();
+            // SAFETY: the layout is not zero sized.
+            let block = unsafe { allocator.alloc_zeroed(zeroed) };
+            // SAFETY: the block holds 3000 bytes.
+            assert!(unsafe { core::slice::from_raw_parts(block, 3000) }.iter().all(|&b| b == 0));
+            // SAFETY: the block is live with this layout.
+            unsafe { allocator.dealloc(block, zeroed) };
+        })
+        .join()
+        .unwrap();
+        assert_eq!(allocator.config().heap_count(), 4);
     }
 
     #[test]

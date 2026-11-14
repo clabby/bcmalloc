@@ -5,16 +5,14 @@
 //! walks them, and then turns each tree back into a token stream and a string, which is what a
 //! procedural macro does with its input.
 
-use std::{collections::HashMap, fmt::Write, time::Instant};
-
-use quote::ToTokens;
-use syn::{File, Ident, Lit, visit::Visit};
-
 use super::{
     Pass, Scale,
     text::{Rng, WORDS},
     twice,
 };
+use quote::ToTokens;
+use std::{collections::HashMap, fmt::Write, time::Instant};
+use syn::{File, Ident, Lit, visit::Visit};
 
 const MODULES: usize = 6;
 

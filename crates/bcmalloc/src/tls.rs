@@ -30,9 +30,8 @@
 //! free. The slot is empty by then, and binding a new heap would hand a claim to a thread that will
 //! never release it. [`exiting`] tells the slow path to use a temporary heap instead.
 
-use core::{cell::Cell, ffi::c_void, ptr};
-
 use crate::heap::HeapData;
+use core::{cell::Cell, ffi::c_void, ptr};
 
 /// A POSIX thread-specific key.
 pub(crate) type Key = usize;
@@ -127,10 +126,9 @@ unsafe extern "C" fn release_heap(value: *mut c_void) {
     not(bcmalloc_portable_tls)
 ))]
 mod slot {
-    use core::{arch::asm, ptr};
-
     use super::Key;
     use crate::heap::HeapData;
+    use core::{arch::asm, ptr};
 
     /// The table of this thread's key slots.
     #[inline(always)]
@@ -194,10 +192,9 @@ mod slot {
     not(bcmalloc_portable_tls)
 )))]
 mod slot {
-    use core::{cell::Cell, ptr};
-
     use super::Key;
     use crate::heap::HeapData;
+    use core::{cell::Cell, ptr};
 
     /// The key of an empty slot, which no allocator has. Pthread keys are small, and an allocator
     /// without one has [`NO_KEY`](super::NO_KEY).
@@ -246,10 +243,9 @@ mod slot {
 
 #[cfg(all(test, not(loom)))]
 mod test {
-    use std::thread;
-
     use super::*;
     use crate::testing::TestRegion;
+    use std::thread;
 
     #[test]
     fn a_thread_finds_the_heap_it_bound_and_others_do_not() {

@@ -6,8 +6,11 @@
 //! client parses that too. Every pass starts its own runtime and server and shuts both down, and
 //! the clock covers only the requests.
 
-use std::{convert::Infallible, net::SocketAddr, time::Instant};
-
+use super::{
+    Pass, Scale,
+    text::{Rng, WORDS},
+    twice,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response,
@@ -18,16 +21,11 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use std::{convert::Infallible, net::SocketAddr, time::Instant};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
     task::JoinSet,
-};
-
-use super::{
-    Pass, Scale,
-    text::{Rng, WORDS},
-    twice,
 };
 
 const WORKERS: usize = 4;

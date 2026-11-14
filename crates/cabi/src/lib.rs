@@ -8,8 +8,8 @@
 //! ```
 //!
 //! Every function forwards to one [`Bcmalloc`] with its default configuration. C frees carry no
-//! size, so `free` reads what the block is from the chunk map, and `realloc` asks the allocator
-//! for the layout of the block.
+//! size, so `free`, `realloc` and `malloc_usable_size` read what the block is from the chunk map
+//! through the calling thread's heap.
 //! Pointers that the allocator does not own are ignored by `free`, which can happen with memory a
 //! program got before the library was loaded.
 //!
@@ -18,13 +18,12 @@
 
 #![allow(unsafe_code)]
 
+use bcmalloc::Bcmalloc;
 use core::{
     alloc::{GlobalAlloc, Layout},
     ffi::{c_int, c_void},
     ptr::{self, NonNull},
 };
-
-use bcmalloc::Bcmalloc;
 
 /// The allocator behind every function, and behind Rust's own allocations in this library.
 #[global_allocator]
@@ -84,7 +83,7 @@ fn allocate(size: usize, align: usize) -> *mut c_void {
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     let block = ALLOCATOR.malloc(size);
     if block.is_null() {
@@ -98,7 +97,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// `ptr` must be null or a live block from this library's allocation functions.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     let Some(block) = NonNull::new(ptr.cast::<u8>()) else { return };
     // SAFETY: the caller frees a live block, and pointers from elsewhere are ignored.
@@ -110,7 +109,7 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
     let Some(bytes) = count.checked_mul(size) else {
         set_errno(libc::ENOMEM);
@@ -133,7 +132,7 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// `ptr` must be null or a live block from this library's allocation functions.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     let Some(block) = NonNull::new(ptr.cast::<u8>()) else {
         return allocate(size, MIN_ALIGN);
@@ -156,7 +155,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void {
     if !align.is_power_of_two() {
         set_errno(libc::EINVAL);
@@ -170,7 +169,7 @@ pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut c_void
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
     // SAFETY: forwarded.
     unsafe { aligned_alloc(align, size) }
@@ -181,7 +180,7 @@ pub unsafe extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// `out` must be valid for a write of a pointer.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, size: usize) -> c_int {
     if !align.is_power_of_two() || !align.is_multiple_of(size_of::<*mut c_void>()) {
         return libc::EINVAL;
@@ -204,7 +203,7 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut c_void, align: usize, siz
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
     allocate(size, page_size())
 }
@@ -214,7 +213,7 @@ pub unsafe extern "C" fn valloc(size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// Callable from C with the usual contract.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
     let page = page_size();
     let Some(rounded) = size.max(1).checked_next_multiple_of(page) else {
@@ -229,14 +228,14 @@ pub unsafe extern "C" fn pvalloc(size: usize) -> *mut c_void {
 /// # Safety
 ///
 /// `ptr` must be null or a live block from this library's allocation functions.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
     NonNull::new(ptr.cast::<u8>()).and_then(|block| ALLOCATOR.usable_size(block)).unwrap_or(0)
 }
 
 /// Writes the allocator's metrics to standard error. Built with the `metrics` feature.
 #[cfg(feature = "metrics")]
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn bcmalloc_print_metrics() {
     if let Some(metrics) = ALLOCATOR.metrics() {
         let report = std::format!("{metrics}");
@@ -259,3 +258,93 @@ extern "C" fn print_metrics_at_exit() {
 #[used]
 #[unsafe(link_section = ".fini_array")]
 static PRINT_METRICS_AT_EXIT: extern "C" fn() = print_metrics_at_exit;
+
+#[cfg(test)]
+mod test {
+    //! The C functions are built under their Rust names here, so the test binary keeps the system
+    //! allocator's symbols and calls these directly.
+
+    use super::*;
+
+    fn errno() -> c_int {
+        // SAFETY: the errno location is valid for the calling thread.
+        unsafe { *errno_location() }
+    }
+
+    #[test]
+    fn calloc_refuses_a_size_that_overflows_and_zeroes_what_it_returns() {
+        set_errno(0);
+        // SAFETY: the C contract.
+        assert!(unsafe { calloc(usize::MAX, 2) }.is_null());
+        assert_eq!(errno(), libc::ENOMEM);
+        // SAFETY: as above.
+        let block = unsafe { calloc(100, 3) }.cast::<u8>();
+        // SAFETY: the block holds 300 bytes.
+        assert!(unsafe { core::slice::from_raw_parts(block, 300) }.iter().all(|&byte| byte == 0));
+        // SAFETY: the block is live and freed once.
+        unsafe { free(block.cast()) };
+    }
+
+    #[test]
+    fn realloc_follows_the_c_rules_for_null_zero_and_failure() {
+        // SAFETY: the C contract, for each call.
+        unsafe {
+            let block = realloc(ptr::null_mut(), 40).cast::<u8>();
+            assert!(!block.is_null(), "a null pointer allocates");
+            block.write_bytes(9, 40);
+            set_errno(0);
+            assert!(realloc(block.cast(), usize::MAX).is_null());
+            assert_eq!(errno(), libc::ENOMEM);
+            assert!(core::slice::from_raw_parts(block, 40).iter().all(|&b| b == 9), "kept");
+            let grown = realloc(block.cast(), 5000).cast::<u8>();
+            assert!(core::slice::from_raw_parts(grown, 40).iter().all(|&b| b == 9));
+            assert!(malloc_usable_size(grown.cast()) >= 5000);
+            assert!(realloc(grown.cast(), 0).is_null(), "a size of zero frees");
+        }
+    }
+
+    #[test]
+    fn aligned_allocations_check_their_alignment_and_keep_errno_where_posix_says() {
+        // SAFETY: the C contract, for each call.
+        unsafe {
+            set_errno(0);
+            assert!(aligned_alloc(24, 100).is_null());
+            assert_eq!(errno(), libc::EINVAL);
+            let mut out = ptr::dangling_mut::<c_void>();
+            set_errno(7);
+            assert_eq!(posix_memalign(&raw mut out, 4, 100), libc::EINVAL);
+            assert_eq!(posix_memalign(&raw mut out, 1 << 20, 100), libc::ENOMEM);
+            assert_eq!(out, ptr::dangling_mut(), "a failed call leaves the output alone");
+            assert_eq!(errno(), 7, "and errno too");
+            assert_eq!(posix_memalign(&raw mut out, 4096, 100), 0);
+            assert!(out.addr().is_multiple_of(4096));
+            free(out);
+            let page = page_size();
+            let block = pvalloc(1);
+            assert!(block.addr().is_multiple_of(page) && malloc_usable_size(block) >= page);
+            free(block);
+            assert!(pvalloc(usize::MAX).is_null());
+            assert_eq!(errno(), libc::ENOMEM);
+            let block = memalign(256, 10);
+            assert!(block.addr().is_multiple_of(256));
+            free(block);
+        }
+    }
+
+    #[test]
+    fn small_requests_are_sixteen_byte_aligned_and_null_is_harmless() {
+        // SAFETY: the C contract, for each call.
+        unsafe {
+            for size in [0, 1, 8, 24, 40, 100, 8192, 100_000] {
+                let block = malloc(size);
+                assert!(!block.is_null() && block.addr().is_multiple_of(MIN_ALIGN), "{size}");
+                assert!(malloc_usable_size(block) >= size);
+                free(block);
+            }
+            free(ptr::null_mut());
+            assert_eq!(malloc_usable_size(ptr::null_mut()), 0);
+            let mut outside = 0_u64;
+            free((&raw mut outside).cast());
+        }
+    }
+}

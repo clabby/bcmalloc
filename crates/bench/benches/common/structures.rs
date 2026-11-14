@@ -1,12 +1,11 @@
 //! Workloads built from ordinary Rust collections and trees, where the allocator is a means
 //! to an end.
 
+use super::harness::{Outcome, Rng, Scale, timed};
 use std::{
     collections::{BTreeMap, HashMap, LinkedList},
     hint::black_box,
 };
-
-use super::harness::{Outcome, Rng, Scale, timed};
 
 /// A hash map that keeps replacing random entries with new ones of other sizes.
 pub(crate) fn hash_map(scale: Scale) -> Outcome {

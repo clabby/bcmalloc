@@ -35,7 +35,7 @@
 //! block's slab belongs to this heap comes from the chunk map, one load from a dense array.
 //!
 //! ```text
-//!                     +- own slab, or a class whose blocks share no cache line -> push on the bin
+//!                     +- own slab, or a small block that owns its cache lines -> push on the bin
 //!   free(ptr, layout) |
 //!                     +- another heap's slab -> append to the outbox for that heap
 //!                                                  |
@@ -44,10 +44,11 @@
 //! ```
 //!
 //! A heap may keep a block of another heap's slab in its own bin and hand it out again, as
-//! jemalloc and TCMalloc do, but only for classes whose blocks never share a cache line with other
-//! blocks. Otherwise the reusing thread would write next to a block that the owner still uses,
-//! which is the false sharing that Hoard's rule of returning blocks to their owner prevents. Blocks
-//! of the other classes always go home.
+//! jemalloc and TCMalloc do, but only for classes of at most 256 bytes whose blocks never share a
+//! cache line with other blocks, and for messages. Otherwise the reusing thread would write next to
+//! a block that the owner still uses, which is the false sharing that Hoard's rule of returning
+//! blocks to their owner prevents, or pull across many lines that the owner still holds. Blocks of
+//! the other classes always go home.
 //!
 //! A bin that fills up gives its oldest half back: blocks of this heap's slabs go to the slab, and
 //! the others go to their owners.
@@ -71,15 +72,6 @@
 //! empties its bins and outboxes and is released with all its slabs intact, and the next thread to
 //! start picks it up. Messages that arrive in between wait in its inbox.
 
-use core::{
-    alloc::{AllocError, Allocator, Layout},
-    cell::Cell,
-    fmt,
-    marker::PhantomData,
-    ptr,
-    ptr::NonNull,
-};
-
 use crate::{
     allocator::{Backend, allocator},
     cache::CacheLine,
@@ -88,6 +80,14 @@ use crate::{
     size_class::{CLASSES, Class, MAX_SMALL, Request, STEP, TABLE_MAX, TABLE_STEPS, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+};
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    cell::Cell,
+    fmt,
+    marker::PhantomData,
+    ptr,
+    ptr::NonNull,
 };
 
 /// The tag on an inbox link that marks a node as a single block and not a message.
@@ -1928,8 +1928,10 @@ impl<'r> Heap<'r> {
 
     /// Resizes a block, returning `None` (and leaving the block untouched) if there is no room.
     ///
-    /// A block whose new size falls in the same size class, or the same number of chunks for huge
-    /// blocks, is returned as is. Otherwise the contents are copied to a new block.
+    /// A block of a slab stays where it is while the new size fits in it and fills at least half
+    /// of it. A block of whole chunks that shrinks gives back the chunks past its new end, and one
+    /// that grows takes the chunks right after it if they are free. Otherwise the contents are
+    /// copied to a new block.
     ///
     /// # Safety
     ///
@@ -2015,18 +2017,17 @@ impl Drop for Heap<'_> {
 
 #[cfg(all(test, not(loom)))]
 mod test {
+    use super::*;
+    use crate::{
+        chunks::CHUNK_SIZE,
+        testing::{Harness, Rng, TestRegion, iterations, random_traffic},
+    };
     use core::{
         alloc::Layout,
         mem::{MaybeUninit, align_of, offset_of, size_of},
         ptr::NonNull,
     };
     use std::vec::Vec;
-
-    use super::*;
-    use crate::{
-        chunks::CHUNK_SIZE,
-        testing::{Harness, Rng, TestRegion, iterations, random_traffic},
-    };
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).unwrap()
@@ -2749,12 +2750,10 @@ mod test {
 
 #[cfg(all(test, loom))]
 mod loom_test {
-    use core::mem;
-
-    use loom::thread;
-
     use super::*;
     use crate::testing::TestRegion;
+    use core::mem;
+    use loom::thread;
 
     /// A pointer that may be moved to another thread.
     struct SendPtr(NonNull<u8>);

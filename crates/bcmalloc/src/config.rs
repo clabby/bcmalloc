@@ -59,9 +59,8 @@ impl Config {
 
     /// Sets how many threads can allocate at once.
     ///
-    /// Each running thread holds one heap, and a thread that finds none free fails its allocations.
-    /// This bounds concurrency the way TigerBeetle bounds connections, so choose it from the design
-    /// of the program instead of guessing.
+    /// Each running thread holds one heap, and a thread that finds none free fails its allocations,
+    /// so set it to the most threads the program runs at once, with some room to spare.
     #[must_use]
     pub const fn max_heaps(mut self, heaps: usize) -> Self {
         self.max_heaps = heaps;
