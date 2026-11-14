@@ -54,9 +54,10 @@ coverage *args:
 loom *args:
     RUSTFLAGS="--cfg loom" cargo nextest run -p bcmalloc --release --lib loom_test "$@"
 
-# Fuzz one target for a number of seconds. The targets are heap_ops and chunk_ops.
+# Fuzz one target for a number of seconds. The targets are heap_ops and chunk_ops. The target triple
+# is the toolchain's host, because a prebuilt cargo-fuzz defaults to its own, which on CI is musl.
 fuzz target='heap_ops' seconds='60':
-    cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
+    cargo +nightly fuzz run --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{target}} -- -max_total_time={{seconds}}
 
 # Build the benchmarks and the held-out programs without running them.
 bench-build:
