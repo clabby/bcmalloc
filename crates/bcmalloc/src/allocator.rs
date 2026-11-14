@@ -289,10 +289,10 @@ mod test {
         let heap = region.heap().unwrap();
         let block = heap.allocate(layout(20, 8)).unwrap();
         // SAFETY: the block is live with the old layout and the new size is larger.
-        let grown = unsafe { heap.grow(block.cast(), layout(20, 8), layout(30, 8)) }.unwrap();
+        let grown = unsafe { heap.grow(block.cast(), layout(20, 8), layout(24, 8)) }.unwrap();
         assert_eq!(grown.cast::<u8>(), block.cast::<u8>());
         // SAFETY: the block is live with the layout it was grown to, and the new size is smaller.
-        let shrunk = unsafe { heap.shrink(grown.cast(), layout(30, 8), layout(18, 8)) }.unwrap();
+        let shrunk = unsafe { heap.shrink(grown.cast(), layout(24, 8), layout(18, 8)) }.unwrap();
         assert_eq!(shrunk.cast::<u8>(), block.cast::<u8>());
     }
 

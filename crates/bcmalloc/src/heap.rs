@@ -85,7 +85,7 @@ use crate::{
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
     region::{Entry, HUGE_PAGE_CHUNKS, Region},
-    size_class::{CLASSES, Class, MAX_SMALL, MIN_ALIGN, Request, TABLE_MAX, classify},
+    size_class::{CLASSES, Class, MAX_SMALL, Request, STEP, TABLE_MAX, TABLE_STEPS, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
@@ -149,14 +149,14 @@ const FLUSH_BATCH: usize = 512;
 /// The size of a bin, which [`Entry`] uses to keep the offset of a class's bin.
 pub(crate) const BIN_SIZE: usize = size_of::<Bin>();
 
-/// For every size that the class table covers, in steps of [`MIN_ALIGN`], the byte offset of the
+/// For every size that the class table covers, in steps of [`STEP`], the byte offset of the
 /// bin of its class in a heap's array of bins. The allocation fast path finds its bin with one load
 /// where looking the class up and then the bin would take a load and a multiplication.
-const BIN_OFFSETS: [u16; TABLE_MAX / MIN_ALIGN + 1] = {
-    let mut offsets = [0; TABLE_MAX / MIN_ALIGN + 1];
+const BIN_OFFSETS: [u16; TABLE_STEPS] = {
+    let mut offsets = [0; TABLE_STEPS];
     let mut step = 0;
     while step < offsets.len() {
-        offsets[step] = (Class::from_table(step * MIN_ALIGN).index() * size_of::<Bin>()) as u16;
+        offsets[step] = (Class::from_table(step * STEP).index() * size_of::<Bin>()) as u16;
         step += 1;
     }
     offsets
@@ -670,7 +670,7 @@ impl HeapData {
     pub(crate) unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if Class::is_table_request(layout) {
             // SAFETY: forwarded, and the table covers the size.
-            return unsafe { self.alloc_table(layout.size()) };
+            return unsafe { self.alloc_table(Class::table_size(layout)) };
         }
         // SAFETY: forwarded.
         unsafe { self.alloc_general(layout) }
@@ -687,7 +687,7 @@ impl HeapData {
         // SAFETY: the size is at most `TABLE_MAX`, so its step is in the table, and every offset
         // in it is that of a bin in the array.
         let bin = unsafe {
-            let offset = *BIN_OFFSETS.get_unchecked(size.div_ceil(MIN_ALIGN));
+            let offset = *BIN_OFFSETS.get_unchecked(size.div_ceil(STEP));
             &*self.private.bins.as_ptr().byte_add(usize::from(offset))
         };
         if let Some(block) = Self::pop_from(bin) {
@@ -2336,11 +2336,11 @@ mod test {
         unsafe { block.as_ptr().write_bytes(0xAB, 100) };
 
         // SAFETY: the block is live with the layout given.
-        let same = unsafe { heap.realloc(block, old, 110) }.unwrap();
-        assert_eq!(same, block, "100 and 110 bytes share a size class");
+        let same = unsafe { heap.realloc(block, old, 104) }.unwrap();
+        assert_eq!(same, block, "100 and 104 bytes share a size class");
 
-        // SAFETY: the block is still live, now with the 110-byte layout.
-        let grown = unsafe { heap.realloc(same, layout(110, 8), 5000) }.unwrap();
+        // SAFETY: the block is still live, now with the 104-byte layout.
+        let grown = unsafe { heap.realloc(same, layout(104, 8), 5000) }.unwrap();
         assert_ne!(grown, block);
         // SAFETY: the grown block holds at least 100 initialised bytes.
         let copied = unsafe { core::slice::from_raw_parts(grown.as_ptr(), 100) };
@@ -2535,6 +2535,19 @@ mod test {
         heap.flush();
         heap.validate();
         assert_eq!(used(&region), 0);
+    }
+    #[test]
+    fn blocks_are_as_aligned_as_their_layouts_ask() {
+        let test = TestRegion::new(64, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        for size in [8, 24, 40, 56, 120, 136] {
+            for align in [8, 16] {
+                let blocks = alloc_many(&heap, layout(size, align), 50);
+                assert!(blocks.iter().all(|block| block.as_ptr().addr() % align == 0));
+                free_all(&heap, layout(size, align), blocks);
+            }
+        }
     }
 
     #[test]

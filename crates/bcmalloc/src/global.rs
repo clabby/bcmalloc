@@ -158,9 +158,9 @@ impl Bcmalloc {
         if size <= TABLE_MAX &&
             let Some(data) = self.thread_heap()
         {
-            // SAFETY: a thread's bound heap is claimed by that thread alone, and the size is one
-            // the table classifies.
-            return unsafe { data.alloc_table(size) };
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and a multiple of 16
+            // up to the table's limit is a size the table classifies into a 16-byte aligned class.
+            return unsafe { data.alloc_table(size.next_multiple_of(MIN_ALIGN)) };
         }
         self.malloc_general(size)
     }

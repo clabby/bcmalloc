@@ -1,13 +1,14 @@
 //! Size classes and slab geometry.
 //!
-//! A request of up to 64 KiB is rounded up to one of 80 size classes. Classes are 16 bytes apart
-//! up to 128 bytes. Above that there are eight classes per doubling, so rounding wastes at most one
-//! part in eight.
+//! A request of up to 64 KiB is rounded up to one of 87 size classes. Classes are 8 bytes apart
+//! from 16 up to 128 bytes, as in TCMalloc and mimalloc, so the many Rust values of three, five or
+//! seven words fill their blocks. Above that there are eight classes per doubling, so rounding
+//! wastes at most one part in eight.
 //!
 //! ```text
-//!    16 32 48 64 80 96 112 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 64K
-//!    <---- 8 classes, +16 ---->  <------- 8 classes, +16 ------->  <--- +32 --->  ...
-//!                                <-------- one doubling -------->
+//!    16 24 32 ... 112 120 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 64K
+//!    <---- 15 classes, +8 ---->  <------- 8 classes, +16 ------->  <--- +32 --->  ...
+//!                                 <-------- one doubling -------->
 //! ```
 //!
 //! Each class is carved out of slabs. A slab is a run of chunks aligned to its own size, so the
@@ -26,18 +27,23 @@
 //!
 //! # Alignment
 //!
-//! Every class size is a multiple of 16 and a slab starts on a multiple of its own size, so every
-//! block is 16-byte aligned for free. A request for more alignment is rounded up to a power of two
-//! that is at least as large as the alignment. A block of such a class starts at a multiple of its
-//! size, which is therefore a multiple of the alignment. Huge allocations start on a chunk
-//! boundary, so the largest supported alignment is one chunk.
+//! A slab starts on a multiple of its own size and a block on a multiple of its size within the
+//! slab, so a block is aligned to the largest power of two that divides its size. Every class is a
+//! multiple of 8, so every block is 8-byte aligned. A request that asks for 16, which C's malloc
+//! always does, is rounded up to a multiple of 16 first. A request for more alignment is rounded
+//! up to a power of two that is at least as large as the alignment. Huge allocations start on a
+//! chunk boundary, so the largest supported alignment is one chunk.
 
 use core::alloc::Layout;
 
 use crate::chunks::CHUNK_SIZE;
 
-/// The alignment every block has regardless of its class.
+/// The alignment that C's malloc promises, which a request gets unless its layout asks for less.
 pub(crate) const MIN_ALIGN: usize = 16;
+
+/// How far apart the classes up to [`LINEAR_LIMIT`] are, which is also the alignment every block
+/// has.
+pub(crate) const STEP: usize = 8;
 
 /// The largest alignment the allocator supports, which is one chunk.
 pub const MAX_ALIGN: usize = CHUNK_SIZE;
@@ -52,11 +58,19 @@ const ANYWHERE_MAX: usize = 256;
 /// Requests of up to this many bytes are classified by a table lookup.
 pub(crate) const TABLE_MAX: usize = 8192;
 
-/// The number of size classes: eight up to 128 bytes, and eight per doubling up to [`MAX_SMALL`].
-pub(crate) const CLASSES: usize = 8 + 8 * (MAX_SMALL.ilog2() - LINEAR_LIMIT.ilog2()) as usize;
+/// The number of size classes: fifteen up to 128 bytes, and eight per doubling up to
+/// [`MAX_SMALL`].
+pub(crate) const CLASSES: usize =
+    LINEAR_CLASSES + 8 * (MAX_SMALL.ilog2() - LINEAR_LIMIT.ilog2()) as usize;
 
-/// Classes up to this many bytes advance in steps of 16.
+/// Classes up to this many bytes advance in steps of [`STEP`].
 const LINEAR_LIMIT: usize = 128;
+
+/// The smallest class. A slab's bitmap has room for the blocks of a single chunk of it.
+const SMALLEST: usize = 16;
+
+/// How many classes there are up to [`LINEAR_LIMIT`].
+const LINEAR_CLASSES: usize = (LINEAR_LIMIT - SMALLEST) / STEP + 1;
 
 /// A size class, which is an index into the table of block sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,10 +87,10 @@ pub(crate) enum Request {
 
 /// The block size of class index `i`.
 const fn block_size_of(i: usize) -> usize {
-    if i < LINEAR_LIMIT / MIN_ALIGN {
-        return (i + 1) * MIN_ALIGN;
+    if i < LINEAR_CLASSES {
+        return SMALLEST + i * STEP;
     }
-    let (doubling, step) = ((i - 8) / 8, (i - 8) % 8);
+    let (doubling, step) = ((i - LINEAR_CLASSES) / 8, (i - LINEAR_CLASSES) % 8);
     let top_bit = doubling + 7;
     (1 << top_bit) + (step + 1) * (1 << (top_bit - 3))
 }
@@ -172,22 +186,38 @@ const RECIPROCALS: [u64; CLASSES] = {
     table
 };
 
-/// The class of every size up to [`TABLE_MAX`], indexed by the size in 16-byte steps rounded up.
-const TABLE: [u8; TABLE_MAX / MIN_ALIGN + 1] = {
-    let mut table = [0; TABLE_MAX / MIN_ALIGN + 1];
+/// How many entries the class table has: one for every [`STEP`] up to [`TABLE_MAX`].
+pub(crate) const TABLE_STEPS: usize = TABLE_MAX / STEP + 1;
+
+/// The class of every size up to [`TABLE_MAX`], indexed by the size in steps of [`STEP`] rounded
+/// up.
+const TABLE: [u8; TABLE_STEPS] = {
+    let mut table = [0; TABLE_STEPS];
     let mut step = 0;
     while step < table.len() {
-        table[step] = Class::for_size(step * MIN_ALIGN).0;
+        table[step] = Class::for_size(step * STEP).0;
         step += 1;
     }
     table
 };
 
 impl Class {
-    /// The class of a request that [`Class`::is_table_request] accepts.
+    /// The class of a size of at most [`TABLE_MAX`] that [`table_size`](Self::table_size) gave.
     #[inline(always)]
     pub(crate) const fn from_table(size: usize) -> Self {
-        Self(TABLE[size.div_ceil(MIN_ALIGN)])
+        Self(TABLE[size.div_ceil(STEP)])
+    }
+
+    /// The size to look up in the class table for a layout that
+    /// [`is_table_request`](Self::is_table_request) accepts. A layout that asks for an alignment of
+    /// 16 is rounded up to a multiple of 16, whose class's blocks are 16-byte aligned.
+    #[inline(always)]
+    pub(crate) const fn table_size(layout: Layout) -> usize {
+        if layout.align() > STEP {
+            layout.size().next_multiple_of(MIN_ALIGN)
+        } else {
+            layout.size()
+        }
     }
 
     /// Whether the layout is small and aligned loosely enough to be classified by the table,
@@ -217,12 +247,12 @@ impl Class {
     pub(crate) const fn for_size(size: usize) -> Self {
         debug_assert!(size <= MAX_SMALL);
         if size <= LINEAR_LIMIT {
-            return Self(size.saturating_sub(1).div_euclid(MIN_ALIGN) as u8);
+            return Self(size.saturating_sub(SMALLEST).div_ceil(STEP) as u8);
         }
         let below = size - 1;
         let top_bit = (usize::BITS - 1 - below.leading_zeros()) as usize;
         let step = (below >> (top_bit - 3)) & 7;
-        Self((8 + (top_bit - 7) * 8 + step) as u8)
+        Self((LINEAR_CLASSES + (top_bit - 7) * 8 + step) as u8)
     }
 
     /// How many block pointers the bin of this class holds when a heap starts.
@@ -293,8 +323,10 @@ pub(crate) const fn classify(layout: Layout) -> Option<Request> {
         return Some(Request::Huge { chunks: size.div_ceil(CHUNK_SIZE) });
     }
     // Over-aligned blocks come from power-of-two classes, as the module documentation explains.
-    let size = if align <= MIN_ALIGN {
+    let size = if align <= STEP {
         size
+    } else if align == MIN_ALIGN {
+        size.next_multiple_of(MIN_ALIGN)
     } else {
         let rounded = size.next_power_of_two();
         if rounded > align { rounded } else { align }
@@ -314,9 +346,10 @@ mod test {
     fn the_table_is_strictly_increasing_and_spans_the_range() {
         let sizes: std::vec::Vec<_> =
             (0..CLASSES).map(|i| Class::from_index(i).block_size()).collect();
-        assert_eq!((sizes[0], sizes[CLASSES - 1]), (MIN_ALIGN, MAX_SMALL));
+        assert_eq!((sizes[0], sizes[CLASSES - 1]), (SMALLEST, MAX_SMALL));
         assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(sizes.iter().all(|size| size % MIN_ALIGN == 0));
+        assert!(sizes.iter().all(|size| size % STEP == 0));
+        assert!(sizes[LINEAR_CLASSES..].iter().all(|size| size % MIN_ALIGN == 0));
     }
 
     #[test]
@@ -401,6 +434,18 @@ mod test {
                 }
             }
         }
+    }
+    #[test]
+    fn requests_for_sixteen_bytes_of_alignment_get_classes_that_keep_it() {
+        for size in 1..=TABLE_MAX {
+            let Some(Request::Small(class)) = classify(layout(size, MIN_ALIGN)) else { panic!() };
+            assert_eq!(class.block_size() % MIN_ALIGN, 0, "{size}");
+            assert_eq!(Class::from_table(Class::table_size(layout(size, MIN_ALIGN))), class);
+            let Some(Request::Small(loose)) = classify(layout(size, STEP)) else { panic!() };
+            assert!(loose.block_size() <= class.block_size());
+            assert_eq!(Class::from_table(Class::table_size(layout(size, STEP))), loose);
+        }
+        assert_eq!(Class::for_size(24).block_size(), 24, "three words fill their block");
     }
 
     #[test]
