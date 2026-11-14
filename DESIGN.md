@@ -164,6 +164,8 @@ Each bin is a range of pointer slots in the region, with its top pointer kept ne
 
 **Heap lifetime.** A heap is a slot in the region and not a property of a thread. When a thread exits, its heap empties its bins and outboxes and goes back to the pool with all its slabs, and the next thread to start takes it. A thread that is about to go quiet can call `Bcmalloc::flush_thread` to hand back what its heap keeps, as jemalloc's thread cache flush does.
 
+**Threads without a heap.** The global allocator's region has spare heaps past `max_heaps` that no thread binds, four per online CPU and between 8 and 1024, so that the threads that run at once seldom find every spare held. A thread that finds every heap taken, or that runs destructors after its own heap went back at exit, borrows a spare for each allocation. The borrow is a compare-and-swap on the slot's claim, the allocation runs on the spare as it would on a bound heap, and a store releases the slot. A spare keeps its bins and slabs from one borrower to the next. A thread asks first for the spare it had last, and for its first borrow for one picked from the address of its thread-local storage, so that threads sharing the spares spread over them. A borrower that finds every spare taken spins for a moment and then yields. Its frees go home through the region without a heap, as a free from an exiting thread does. A count of the free heap slots tells such a thread in one load that none is free, where a pass over the slots would cost a cache miss for each of 4096, and the thread binds a heap of its own on its first call after one is given back. `trim` empties the spares along with the idle heaps.
+
 ## 7. Freeing from another thread
 
 A free reads the chunk map entry of the block, which names the heap that owns its slab. If that is the calling thread's heap, the block goes into the bin. Otherwise there are two cases.
@@ -224,7 +226,7 @@ Concurrency bugs hide from tests that pass, so the allocator is checked in sever
 
 | Tool                 | What it covers                                                                                        |
 | -------------------- | ----------------------------------------------------------------------------------------------------- |
-| loom                 | Every interleaving of the chunk bitmap, a purge pass and its flag, heap claims, and inbox pushes       |
+| loom                 | Every interleaving of the chunk bitmap, a purge pass and its flag, heap claims, borrows, inbox pushes |
 | Miri                 | All unit tests under strict provenance, on the portable thread lookup                                  |
 | fuzzing              | Random operation sequences against a model, with a validator that checks every structure after a step |
 | unit tests           | Every module, including a causal test for each bug found, with line coverage reported to Codecov       |
@@ -252,7 +254,7 @@ The design spends a little memory and some bookkeeping to keep three things chea
 
 These are the costs.
 
-- **Metadata.** The free bitmaps make a slab descriptor 640 bytes, so metadata is about 1% of the managed memory instead of a fraction of that, and every heap slot reserves about 280 KiB of address space for bin slots. All of it is address space until it is used, but a small region with the default 4096 heaps reserves more for bins than for blocks, so small regions should set `max_heaps` to what they need.
+- **Metadata.** The free bitmaps make a slab descriptor 640 bytes, so metadata is about 1% of the managed memory instead of a fraction of that, and every heap slot reserves about 280 KiB of address space for bin slots, spare heaps included. All of it is address space until it is used, unless `Commit::Lock` pins the region, but a small region with the default 4096 heaps still reserves more for bins than for blocks, so small regions should set `max_heaps` to what they need.
 - **Bursts larger than a bin.** A block that overflows a bin goes back to its slab and comes out again on the next refill, one bitmap operation each way, where a list would move a whole chain at once. Bins that keep overflowing grow to make this rare, within a budget.
 - **Most remote frees go home.** Except for small blocks that own their lines, the freeing thread cannot keep a block, so a producer and a consumer pay one message per batch, and blocks wait in an outbox until it fills, is needed for another destination, or is flushed.
 - **Per-thread caches hold memory.** A heap's bins and outboxes keep blocks that other threads cannot use until the heap flushes them, and a thread that goes quiet keeps them until it exits or calls `flush_thread`.
@@ -261,7 +263,7 @@ These are the costs.
 ## 14. Limits
 
 - Alignments above 4 MiB are refused. A request aligned to more than 64 KiB takes a run of whole chunks of its own, at least 128 KiB, whatever its size.
-- A thread that finds every heap taken fails its allocations, which aborts the program. `max_heaps` is a design-time bound, like TigerBeetle's connection limit.
+- Threads past `max_heaps` share the spare heaps, four per online CPU and at most 1024, one call at a time. They do not fail, but each call costs a few times what it costs a thread with a heap of its own, and more of them allocating at once than there are spares wait on each other, so `max_heaps` should still cover the threads a program runs at once.
 - Allocations over 4 MiB claim several bitmap words and are obstruction-free, not lock-free.
 - The capacity is a hard limit. A purge pass or a trim makes some chunks look allocated while it holds them, so a request that needs those chunks waits for the pass to finish. It does not fail.
 - A heap holds blocks in its bins and outboxes until it needs them, fills a message, or is flushed. A thread that goes quiet keeps them until it exits or calls `flush_thread`. The bins of one heap hold at most their initial capacity plus 2 MiB.

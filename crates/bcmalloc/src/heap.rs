@@ -450,26 +450,47 @@ impl HeapData {
         &self.private.events
     }
 
-    /// Tries to claim this slot as heap number `id` of the region.
+    /// Tries to claim this slot as heap number `id` of the region, for a thread to keep.
     pub(crate) fn claim(&self, id: u32, region: &Region<'_>) -> bool {
-        let won = !self.shared.claimed.load(Ordering::Relaxed) &&
+        let won = self.try_take();
+        if won {
+            self.adopt(id, region);
+        }
+        won
+    }
+
+    /// Tries to take this slot, as heap number `id` of the region, for as long as one operation
+    /// takes. Unlike [`claim`](Self::claim), it keeps whatever the heap held when it was last
+    /// released, which is what spare heaps and `trim` want. Only the first taker sets it up.
+    pub(crate) fn borrow(&self, id: u32, region: &Region<'_>) -> bool {
+        let won = self.try_take();
+        if won && self.private.region.get().is_null() {
+            self.adopt(id, region);
+        }
+        won
+    }
+
+    /// Takes the slot if no one holds it.
+    fn try_take(&self) -> bool {
+        !self.shared.claimed.load(Ordering::Relaxed) &&
             self.shared
                 .claimed
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok();
-        if won {
-            let private = &self.private;
-            private.id.set(id);
-            private.region.set(ptr::from_ref(region).cast());
-            private.base.set(region.chunk_ptr(0));
-            private.span.set(region.span());
-            private.slabs.set(region.slabs_ptr());
-            private.map.set(region.map_ptr());
-            private.slots.set(region.bin_slots(id));
-            self.settle_on(region, region.current_node());
-            self.init_bins();
-        }
-        won
+                .is_ok()
+    }
+
+    /// Sets up a slot that was just taken as heap number `id` of the region.
+    fn adopt(&self, id: u32, region: &Region<'_>) {
+        let private = &self.private;
+        private.id.set(id);
+        private.region.set(ptr::from_ref(region).cast());
+        private.base.set(region.chunk_ptr(0));
+        private.span.set(region.span());
+        private.slabs.set(region.slabs_ptr());
+        private.map.set(region.map_ptr());
+        private.slots.set(region.bin_slots(id));
+        self.settle_on(region, region.current_node());
+        self.init_bins();
     }
 
     /// Makes the heap take its chunks from the part of the region of NUMA node `node`.
@@ -576,11 +597,14 @@ impl HeapData {
     ///
     /// # Safety
     ///
-    /// The caller must hold the claim.
+    /// The caller must hold the claim, which [`Region::heap`] handed out.
     pub(crate) unsafe fn give_up(&self) {
+        // SAFETY: the claim was made on this region.
+        let region = unsafe { self.region() };
         // SAFETY: forwarded.
-        unsafe { self.empty_caches(self.region()) };
+        unsafe { self.empty_caches(region) };
         self.release_claim();
+        region.vacate();
     }
 
     /// Gives the slot up for another thread to claim.
@@ -2466,7 +2490,7 @@ impl<'r> Heap<'r> {
     }
 
     /// Gives up this handle without releasing the claim, which the caller takes over. The slot
-    /// stays claimed until [`release_claim`](HeapData::release_claim) is called on it.
+    /// stays claimed until [`give_up`](HeapData::give_up) is called on it.
     #[cfg(all(feature = "std", not(loom)))]
     pub(crate) const fn leak(self) -> &'r HeapData {
         let data = self.data;
@@ -3235,6 +3259,42 @@ mod test {
     }
 
     #[test]
+    fn spare_heaps_serve_one_borrower_at_a_time_keep_their_slabs_and_are_trimmed() {
+        let test = TestRegion::new(128, 1).with_spare_heaps(2);
+        let region = test.region();
+        let bound = region.heap().unwrap();
+        assert!(region.heap().is_none(), "spare heaps are never handed out");
+        let (first, data) = region.borrow_spare(0);
+        let (second, other) = region.borrow_spare(0);
+        assert_eq!((first, second), (0, 1), "a borrowed spare is passed over");
+        other.release_claim();
+
+        let layout = layout(48, 8);
+        // SAFETY: the spare is borrowed until its claim is released.
+        let block = NonNull::new(unsafe { data.alloc(layout) }).unwrap();
+        data.release_claim();
+        let (again, data) = region.borrow_spare(first);
+        assert_eq!(again, first, "a free spare is taken where the hint says");
+        // SAFETY: as above.
+        let next = NonNull::new(unsafe { data.alloc(layout) }).unwrap();
+        data.release_claim();
+        let chunk = |block: NonNull<u8>| block.as_ptr().addr() / CHUNK_SIZE;
+        assert_eq!(chunk(block), chunk(next), "the spare kept its slab for the next borrower");
+        assert_eq!(region.stats().heaps_in_use, 1, "spare heaps are not heaps in use");
+
+        // Blocks of a spare go home to it like any other heap's, and trimming empties it.
+        // SAFETY: both blocks are live with this layout and freed once.
+        unsafe {
+            bound.dealloc(block, layout);
+            region.dealloc(next, layout);
+        }
+        bound.flush();
+        drop(bound);
+        region.trim();
+        assert_eq!(used(&region), 0, "the spare gave its slab back");
+    }
+
+    #[test]
     fn a_thread_without_a_heap_can_still_free() {
         let test = TestRegion::new(128, 1);
         let region = test.region();
@@ -3426,6 +3486,44 @@ mod loom_test {
             let mine = region.heap();
             let theirs = other.join().unwrap();
             assert!(mine.is_some() && theirs.is_some(), "a claim failed with a free slot");
+        });
+    }
+
+    #[test]
+    fn a_claim_racing_a_release_finds_the_slot_or_leaves_it_free() {
+        loom::model(|| {
+            let test = TestRegion::new(1, 1);
+            let region = test.region();
+            let held = region.heap().unwrap();
+            // SAFETY: the thread is joined below, before the region goes away.
+            let shared = unsafe { forever(&region) };
+            let other = thread::spawn(move || shared.heap());
+            drop(held);
+            let theirs = other.join().unwrap();
+            // The release was counted exactly once, so the slot is either theirs or free.
+            assert!(theirs.is_some() != region.heap().is_some());
+        });
+    }
+
+    #[test]
+    fn threads_without_a_heap_never_share_a_spare() {
+        /// Borrows the spare and checks that no other thread is inside it.
+        fn borrow_alone(region: &Region<'_>, inside: &AtomicBool) {
+            let (_, data) = region.borrow_spare(0);
+            assert!(!inside.swap(true, Ordering::Relaxed), "two threads borrowed one spare");
+            inside.store(false, Ordering::Relaxed);
+            data.release_claim();
+        }
+        loom::model(|| {
+            let test = TestRegion::new(1, 1).with_spare_heaps(1);
+            let region = test.region();
+            let inside = loom::sync::Arc::new(AtomicBool::new(false));
+            // SAFETY: the thread is joined below, before the region goes away.
+            let shared = unsafe { forever(&region) };
+            let theirs = loom::sync::Arc::clone(&inside);
+            let other = thread::spawn(move || borrow_alone(shared, &theirs));
+            borrow_alone(&region, &inside);
+            other.join().unwrap();
         });
     }
 

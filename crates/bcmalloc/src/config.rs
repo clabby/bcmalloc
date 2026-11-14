@@ -59,10 +59,12 @@ impl Config {
         self
     }
 
-    /// Sets how many threads can allocate at once.
+    /// Sets how many threads get a heap of their own.
     ///
-    /// Each running thread holds one heap, and a thread that finds none free fails its allocations,
-    /// so set it to the most threads the program runs at once, with some room to spare.
+    /// Each running thread holds one heap. Through [`Bcmalloc`](crate::Bcmalloc), threads past
+    /// this many share a few spare heaps, one call at a time, which is slower, and a
+    /// [`Region`](crate::Region) used directly hands out no more heaps than this. Set it to the
+    /// most threads the program runs at once, with some room to spare.
     #[must_use]
     pub const fn max_heaps(mut self, heaps: usize) -> Self {
         self.max_heaps = heaps;

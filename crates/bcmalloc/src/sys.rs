@@ -208,6 +208,15 @@ pub(crate) fn monotonic_ms() -> u64 {
     }
 }
 
+/// How many CPUs are online, or 1 if the system does not say. It reads no files and allocates
+/// nothing, so the allocator can ask while it sets itself up.
+#[cfg(all(feature = "std", not(loom)))]
+pub(crate) fn online_cpus() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    usize::try_from(cpus).unwrap_or(1).max(1)
+}
+
 /// How many NUMA nodes the machine has, counting from node 0. It is 1 where the system does not
 /// say, the list of nodes has gaps, or the platform has no NUMA support to speak of.
 #[cfg_attr(

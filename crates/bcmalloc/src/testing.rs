@@ -130,6 +130,7 @@ pub struct TestRegion {
     slabs: Box<[Slab]>,
     map: Box<[AtomicU64]>,
     heaps: Box<[HeapData]>,
+    spare_heaps: usize,
     bins: Box<[Cell<*mut Block>]>,
     memory: Buffer,
     chunks: usize,
@@ -153,6 +154,7 @@ impl TestRegion {
                 slabs: zeroed(chunks, Slab::new),
                 map: zeroed(chunks, || AtomicU64::new(0)),
                 heaps: zeroed(heaps, HeapData::new),
+                spare_heaps: 0,
                 bins: zeroed(heaps * BIN_SLOTS, || Cell::new(ptr::null_mut())),
                 memory: Buffer::new(chunks << CHUNK_SHIFT),
                 chunks,
@@ -175,6 +177,22 @@ impl TestRegion {
         Self { huge_zone: true, ..self }
     }
 
+    /// This region with `spares` spare heaps after its heap slots, which threads without a heap
+    /// of their own borrow, as the global allocator's region has.
+    #[must_use]
+    pub fn with_spare_heaps(self, spares: usize) -> Self {
+        let slots = self.heaps.len() + spares;
+        // SAFETY: as in `new`.
+        unsafe {
+            Self {
+                heaps: zeroed(slots, HeapData::new),
+                spare_heaps: spares,
+                bins: zeroed(slots * BIN_SLOTS, || Cell::new(ptr::null_mut())),
+                ..self
+            }
+        }
+    }
+
     /// The region over this storage.
     pub fn region(&self) -> Region<'_> {
         // SAFETY: the buffer is 4 MiB aligned and `chunks` chunks long, and everything else was
@@ -187,6 +205,7 @@ impl TestRegion {
                 slabs: &self.slabs,
                 map: &self.map,
                 heaps: &self.heaps,
+                spare_heaps: self.spare_heaps,
                 bin_slots: self.bins.as_ptr().cast::<*mut Block>().cast_mut(),
                 nodes: self.nodes,
                 huge_zone: self.huge_zone,

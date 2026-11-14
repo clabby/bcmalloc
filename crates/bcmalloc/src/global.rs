@@ -1,7 +1,7 @@
 //! The `#[global_allocator]` front end.
 //!
 //! [`Bcmalloc`] is a `static` that creates its [`Region`] the first time anything allocates, and
-//! gives every thread a [`Heap`] of its own. After that a call looks like this.
+//! gives every thread a [`Heap`](crate::Heap) of its own. After that a call looks like this.
 //!
 //! ```text
 //!    alloc(layout)
@@ -19,23 +19,32 @@
 //!
 //! A thread binds its heap on its first allocation or free, and a key destructor releases the
 //! heap when the thread exits. Other destructors may still allocate or free after that one has
-//! run. At that point the slot is empty and the thread is marked as gone, so frees fall back to
-//! [`Region`::dealloc] and allocations borrow a heap for just that one call.
+//! run. At that point the slot is empty and the thread is marked as gone, so it has no heap of its
+//! own, as described next.
+//!
+//! # Threads without a heap
+//!
+//! The region has a few spare heaps past `max_heaps` that no thread binds. A thread that finds
+//! every heap taken, or that gave its heap back at exit, borrows a spare for each allocation with
+//! one compare-and-swap and gives it back when the call returns. Its frees go home through
+//! [`Region::dealloc`], which needs no heap. Such a thread binds a heap of its own on its first
+//! call after one is given back. The spares are shared, so these threads allocate more slowly than
+//! threads with a heap, but they do not fail for want of one.
 //!
 //! # Failure
 //!
 //! A failed allocation returns null, and the standard library turns that into an abort. That
-//! happens when the region is full, when the alignment is above [`MAX_ALIGN`](crate::MAX_ALIGN),
-//! or when more threads are running than the configuration has heaps for.
+//! happens when the region is full or when the alignment is above
+//! [`MAX_ALIGN`](crate::MAX_ALIGN).
 
 use crate::{
     chunks::CHUNK_SHIFT,
     config::Config,
-    heap::{Heap, HeapData},
+    heap::HeapData,
     region::{Entry, Error, Mapping, Region, Stats},
     size_class::{MAX_SMALL, MIN_ALIGN, TABLE_MAX},
     sync::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-    tls,
+    sys, tls,
 };
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -44,6 +53,16 @@ use core::{
 
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
 const MIN_CAPACITY: usize = 256 << 20;
+
+/// How many spare heaps the region has for threads without a heap of their own, per online CPU.
+/// With one per CPU, the threads that run at once often found every spare held and had to yield,
+/// and 64 threads on 32 CPUs allocated six times slower than with four.
+const SPARE_HEAPS_PER_CPU: usize = 4;
+
+/// The bounds on the number of spare heaps. Each costs as much address space as a heap slot, and
+/// memory only once a thread uses it.
+const MIN_SPARE_HEAPS: usize = 8;
+const MAX_SPARE_HEAPS: usize = 1024;
 
 /// Zeroed requests below this many bytes are cleared without asking whether the memory is fresh,
 /// as [`HeapData::alloc_zeroed`] does.
@@ -411,8 +430,10 @@ impl Bcmalloc {
     #[cold]
     fn create(&self) -> Option<&'static Region<'static>> {
         let mut config = self.config;
+        let spares =
+            (SPARE_HEAPS_PER_CPU * sys::online_cpus()).clamp(MIN_SPARE_HEAPS, MAX_SPARE_HEAPS);
         let mapping = loop {
-            match Mapping::new(&config) {
+            match Mapping::with_spare_heaps(&config, spares) {
                 Ok(mapping) => break mapping,
                 Err(Error::OutOfAddressSpace) if config.capacity_bytes() / 2 >= MIN_CAPACITY => {
                     config = config.capacity(config.capacity_bytes() / 2);
@@ -489,10 +510,11 @@ impl Bcmalloc {
 
     /// The body of [`bind`](Self::bind), which runs with the binding flag set.
     fn bind_now(&self, region: &'static Region<'static>) -> Option<&'static HeapData> {
-        // The fast frees read the directory once this thread has a heap.
-        self.directory.publish(region);
         let key = self.key()?;
         let heap = region.heap()?;
+        // The fast frees read the directory once this thread has a heap. A thread that finds no
+        // heap does not write it, because it tries again on every call and every free reads it.
+        self.directory.publish(region);
         // The heap releases its claim if the system refuses to remember it.
         let data = heap.leak();
         if tls::bind(key, data) {
@@ -517,7 +539,8 @@ impl Bcmalloc {
             // SAFETY: binding claimed the heap for this thread.
             return unsafe { data.alloc(layout) };
         }
-        region.heap().and_then(|heap| heap.alloc(layout)).map_or(ptr::null_mut(), NonNull::as_ptr)
+        // SAFETY: the spare is borrowed for the call.
+        with_spare(region, |data| unsafe { data.alloc(layout) })
     }
 
     /// Frees for a thread that has no heap yet.
@@ -555,12 +578,21 @@ impl Bcmalloc {
             // block and the size.
             return unsafe { data.realloc(ptr, layout, new_size) };
         }
-        let resize = |heap: &Heap<'_>| {
-            // SAFETY: the caller vouches for the block and the size.
-            unsafe { heap.realloc(ptr, layout, new_size) }
-        };
-        region.heap().and_then(|heap| resize(&heap)).map_or(ptr::null_mut(), NonNull::as_ptr)
+        // SAFETY: the spare is borrowed for the call, and the caller vouches for the block and the
+        // size.
+        with_spare(region, |data| unsafe { data.realloc(ptr, layout, new_size) })
     }
+}
+
+/// Runs `op` on a spare heap of `region`, for a thread that has no heap of its own. The thread
+/// asks for the spare it had last time, so that threads sharing the spares settle on different
+/// ones.
+fn with_spare<T>(region: &Region<'_>, op: impl FnOnce(&HeapData) -> T) -> T {
+    let (spare, data) = region.borrow_spare(tls::spare());
+    tls::set_spare(spare);
+    let result = op(data);
+    data.release_claim();
+    result
 }
 
 // SAFETY: every method forwards to a heap or region of the allocator, which return blocks that
@@ -804,6 +836,84 @@ mod test {
         .join()
         .unwrap();
         assert_eq!(allocator.config().heap_count(), 4);
+    }
+
+    #[test]
+    fn threads_past_max_heaps_borrow_spares_until_a_heap_is_free() {
+        use std::sync::mpsc;
+        let allocator = instance();
+        let layout = Layout::from_size_align(100, 8).unwrap();
+        // Four threads take every heap and keep them until they are told to exit.
+        let (bound, all_bound) = mpsc::channel();
+        let mut holders: Vec<_> = (0..4)
+            .map(|_| {
+                let bound = bound.clone();
+                let (exit, told_to_exit) = mpsc::channel::<()>();
+                let thread = std::thread::spawn(move || {
+                    // SAFETY: the layout is not zero sized, and the block is freed once.
+                    unsafe { allocator.dealloc(allocator.alloc(layout), layout) };
+                    bound.send(()).unwrap();
+                    told_to_exit.recv().unwrap();
+                });
+                (exit, thread)
+            })
+            .collect();
+        for _ in 0..4 {
+            all_bound.recv().unwrap();
+        }
+        assert_eq!(allocator.stats().unwrap().heaps_in_use, 4);
+
+        let (borrowed, all_borrowed) = mpsc::channel();
+        let (go, told_to_go) = mpsc::channel::<()>();
+        let latecomer = std::thread::spawn(move || {
+            // Every heap is taken, so each call borrows a spare.
+            // SAFETY: the layout is not zero sized.
+            let block = unsafe { allocator.alloc(layout) };
+            assert!(!block.is_null());
+            // SAFETY: the block holds 100 bytes, is live with its layout, and the new size is
+            // valid.
+            let grown = unsafe {
+                block.write_bytes(5, 100);
+                allocator.realloc(block, layout, 300_000)
+            };
+            // SAFETY: the grown block holds at least 100 bytes.
+            assert!(unsafe { core::slice::from_raw_parts(grown, 100) }.iter().all(|&b| b == 5));
+            // SAFETY: the grown block is live with the new size, and is freed once.
+            unsafe { allocator.dealloc(grown, Layout::from_size_align(300_000, 8).unwrap()) };
+            let zeroed = NonNull::new(allocator.calloc(10, 100)).unwrap();
+            // SAFETY: the block holds 1000 bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(zeroed.as_ptr(), 1000) };
+            assert!(bytes.iter().all(|&b| b == 0));
+            // SAFETY: the block is live, the size is not zero, and the result is freed once.
+            unsafe {
+                let moved = NonNull::new(allocator.realloc_unsized(zeroed, 5000)).unwrap();
+                allocator.free_unsized(moved);
+            }
+            assert!(allocator.bound_heap().is_none(), "no heap was free to bind");
+            borrowed.send(()).unwrap();
+            told_to_go.recv().unwrap();
+            // SAFETY: as for the first block.
+            unsafe { allocator.dealloc(allocator.alloc(layout), layout) };
+            assert!(
+                allocator.bound_heap().is_some(),
+                "the next call after a heap is free binds it"
+            );
+        });
+        all_borrowed.recv().unwrap();
+        // Joining a thread waits for its key destructor, which gives its heap back.
+        let (exit, thread) = holders.remove(0);
+        exit.send(()).unwrap();
+        thread.join().unwrap();
+        go.send(()).unwrap();
+        latecomer.join().unwrap();
+        for (exit, thread) in holders {
+            exit.send(()).unwrap();
+            thread.join().unwrap();
+        }
+        assert_eq!(allocator.stats().unwrap().heaps_in_use, 0);
+        allocator.trim();
+        let stats = allocator.stats().unwrap();
+        assert_eq!(stats.free, stats.capacity, "the heaps and the spares gave everything back");
     }
 
     #[test]
