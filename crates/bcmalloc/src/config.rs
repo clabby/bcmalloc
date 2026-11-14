@@ -5,11 +5,13 @@ use crate::chunks::CHUNK_SIZE;
 /// How much of the reserved memory is backed by physical pages when the region is created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Commit {
-    /// Pages are backed on first use. Start-up is instant and the footprint follows the workload.
+    /// Pages are backed on first use, and pages that stay idle go back to the operating system.
+    /// Start-up is instant and the footprint follows the workload.
     #[default]
     Lazy,
-    /// Every page is backed before the region is returned, so the allocator never takes a page
-    /// fault. The whole capacity counts as resident from the start.
+    /// Every page is backed before the region is returned and stays backed: idle memory is never
+    /// given back, so the allocator never takes a page fault. The whole capacity counts as
+    /// resident from the start.
     Populate,
     /// As `Populate`, and the pages are also pinned in RAM so they are never swapped out. This
     /// needs a high enough `RLIMIT_MEMLOCK`, and creating the region fails without it.

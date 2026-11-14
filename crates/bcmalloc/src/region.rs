@@ -138,6 +138,10 @@ struct Clock {
     purges_active: AtomicUsize,
     /// How many purge passes and trims have finished.
     purges_done: AtomicUsize,
+    /// Set when the region keeps every page it has backed: from the start in a region backed up
+    /// front, and from the first time the kernel refuses to take pages back, as it does for pages
+    /// that the program locked in memory. The purge clock then stops, and `trim` leaves pages.
+    keeps_pages: AtomicBool,
 }
 
 /// How many chunks slabs and blocks of whole chunks hold, which tells a big process from a small
@@ -222,6 +226,7 @@ impl<'a> Region<'a> {
                 aging: AtomicBool::new(false),
                 purges_active: AtomicUsize::new(0),
                 purges_done: AtomicUsize::new(0),
+                keeps_pages: AtomicBool::new(false),
             },
             occupancy: Occupancy { _line: [], chunks: AtomicUsize::new(0) },
             #[cfg(feature = "metrics")]
@@ -277,7 +282,9 @@ impl<'a> Region<'a> {
     }
 
     /// Returns the empty slabs of every idle heap to the region, and tells the operating system
-    /// that free chunks no longer need physical pages.
+    /// that free chunks no longer need physical pages. A region that keeps its pages, because it
+    /// was backed up front with [`Commit::Populate`] or [`Commit::Lock`] or because the kernel
+    /// refused to take pages back, only does the first.
     ///
     /// Heaps that are in use are skipped, and a thread trims its own slabs with [`Heap::flush`].
     /// While this drains a bitmap word the 64 chunks in it look allocated to everyone else, so run
@@ -299,14 +306,12 @@ impl<'a> Region<'a> {
                 break;
             }
         }
+        if self.clock.keeps_pages.load(Ordering::Relaxed) {
+            return;
+        }
         self.clock.purges_active.fetch_add(1, Ordering::Release);
-        self.chunks.drain(|run| {
-            // SAFETY: the run is free and held by the drain while we advise on it.
-            unsafe {
-                let start = NonNull::new_unchecked(self.chunk_ptr(run.start));
-                sys::discard(start, run.len() << CHUNK_SHIFT);
-            }
-        });
+        // The drain holds each run while its pages go back.
+        self.chunks.drain(|run| self.give_back(run));
         self.clock.purges_done.fetch_add(1, Ordering::Release);
         self.clock.purges_active.fetch_sub(1, Ordering::Release);
     }
@@ -539,13 +544,38 @@ impl<'a> Region<'a> {
         }
     }
 
-    /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge.
+    /// Frees chunks as `Chunks`::free_at does, and starts them ageing towards a purge unless the
+    /// region keeps its pages.
     pub(crate) fn free_chunks(&self, first: usize, n: usize) {
         self.occupancy.chunks.fetch_sub(n, Ordering::Relaxed);
         self.chunks.free_at(first, n, sys::monotonic_ms());
+        if self.clock.keeps_pages.load(Ordering::Relaxed) {
+            return;
+        }
         // A read-modify-write, so that the pass that consumes the flag also sees the bits above no
         // matter which free it read the flag from.
         self.clock.aging.fetch_or(true, Ordering::Release);
+    }
+
+    /// Gives the pages of a run of chunks that a purge pass or a trim holds back to the operating
+    /// system, and returns whether they went. The first refusal, which comes from pages that are
+    /// locked in memory, makes the region keep its pages from then on, since retrying would only
+    /// be refused again.
+    fn give_back(&self, run: Range<usize>) -> bool {
+        if self.clock.keeps_pages.load(Ordering::Relaxed) {
+            return false;
+        }
+        // SAFETY: the caller holds the run, so no allocation overlaps it.
+        let given = unsafe {
+            sys::discard(
+                NonNull::new_unchecked(self.chunk_ptr(run.start)),
+                run.len() << CHUNK_SHIFT,
+            )
+        };
+        if !given {
+            self.clock.keeps_pages.store(true, Ordering::Relaxed);
+        }
+        given
     }
 
     /// Runs the purge clock if free chunks are ageing and an interval has passed. Chunks that stay
@@ -560,6 +590,11 @@ impl<'a> Region<'a> {
 
     #[cold]
     fn purge_when_due(&self) {
+        if self.clock.keeps_pages.load(Ordering::Relaxed) {
+            // Frees no longer set the flag, so this runs at most once after the pages are kept.
+            self.clock.aging.store(false, Ordering::Relaxed);
+            return;
+        }
         let now = sys::monotonic_ms();
         let due = self.clock.next_purge.load(Ordering::Relaxed);
         let won = now >= due &&
@@ -587,14 +622,11 @@ impl<'a> Region<'a> {
         self.counters.purge_passes.add(1);
         let pending = self.chunks.purge_pass(now, PURGE_INTERVAL_MS, |run| {
             #[cfg(feature = "metrics")]
-            self.counters.chunks_purged.add(run.len() as u64);
-            // SAFETY: the pass holds the run, so no allocation overlaps it.
-            unsafe {
-                sys::discard(
-                    NonNull::new_unchecked(self.chunk_ptr(run.start)),
-                    run.len() << CHUNK_SHIFT,
-                );
-            }
+            let len = run.len() as u64;
+            let given = self.give_back(run);
+            #[cfg(feature = "metrics")]
+            self.counters.chunks_purged.add(if given { len } else { 0 });
+            given
         });
         self.clock.purges_done.fetch_add(1, Ordering::Release);
         self.clock.purges_active.fetch_sub(1, Ordering::Release);
@@ -916,6 +948,8 @@ impl Mapping {
         match config.commit_mode() {
             Commit::Lazy => {}
             Commit::Populate | Commit::Lock => {
+                // Memory backed up front stays backed, so the allocator never faults it in again.
+                region.clock.keeps_pages.store(true, Ordering::Relaxed);
                 // SAFETY: the data range is inside the reservation and holds nothing yet.
                 unsafe { sys::populate(data, data_len) };
                 if config.commit_mode() == Commit::Lock {
@@ -1145,6 +1179,75 @@ mod test {
         }
     }
 
+    /// Whether every page of the `len` bytes from `ptr` is resident.
+    #[cfg(not(miri))]
+    fn resident(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut pages = std::vec![0_u8; len.div_ceil(page)];
+        // SAFETY: the range is mapped, and the vector has a byte for each of its pages.
+        let status = unsafe { libc::mincore(ptr.cast(), len, pages.as_mut_ptr().cast()) };
+        status == 0 && pages.iter().all(|&page| page & 1 == 1)
+    }
+
+    /// Writes old contents into a block of whole chunks, frees it, trims the region and asks for a
+    /// zeroed block of the same size, which reuses the same chunks. `before_free` runs on the
+    /// block just before it is freed. Returns the block's address and whether the zeroed one read
+    /// as zeros.
+    fn reuse_after_trim(
+        region: &Region<'_>,
+        before_free: impl FnOnce(NonNull<u8>),
+    ) -> (NonNull<u8>, bool) {
+        let heap = region.heap().unwrap();
+        let layout = Layout::from_size_align(MIB, 16).unwrap();
+        let block = heap.alloc(layout).unwrap();
+        // SAFETY: the block holds a mebibyte.
+        unsafe { block.as_ptr().write_bytes(0xAA, MIB) };
+        before_free(block);
+        // SAFETY: the block is live with this layout.
+        unsafe { heap.dealloc(block, layout) };
+        heap.flush();
+        region.trim();
+        let zeroed = heap.alloc_zeroed(layout).unwrap();
+        assert_eq!(zeroed, block, "the zeroed block reuses the same chunks");
+        // SAFETY: the block holds a mebibyte.
+        let bytes = unsafe { slice::from_raw_parts(zeroed.as_ptr(), MIB) };
+        (block, bytes.iter().all(|&byte| byte == 0))
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn memory_the_kernel_will_not_take_back_is_cleared_for_zeroed_requests() {
+        let mapping = Mapping::new(&config(16 * MIB)).unwrap();
+        let mut locked = true;
+        // A program that pins its memory, as mlockall does, keeps the kernel from discarding it.
+        let (_, zeroed) = reuse_after_trim(mapping.region(), |block| {
+            // SAFETY: the block is inside the reservation.
+            locked = unsafe { sys::lock(block, MIB) };
+        });
+        // Pinning memory needs a high enough RLIMIT_MEMLOCK, which CI cannot promise.
+        if locked {
+            assert!(zeroed, "a zeroed block kept the old contents of pinned pages");
+        }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_region_backed_up_front_keeps_its_pages() {
+        for commit in [Commit::Populate, Commit::Lock] {
+            let mapping = match Mapping::new(&config(16 * MIB).commit(commit)) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    assert_eq!((commit, error), (Commit::Lock, Error::LockFailed));
+                    continue;
+                }
+            };
+            let (block, zeroed) = reuse_after_trim(mapping.region(), |_| {});
+            assert!(zeroed, "{commit:?}: a zeroed block kept old contents");
+            assert!(resident(block.as_ptr(), MIB), "{commit:?}: the region gave pages back");
+        }
+    }
+
     #[test]
     fn huge_page_advice_is_harmless() {
         let mapping = Mapping::new(&config(16 * MIB).huge_pages(true)).unwrap();
@@ -1173,7 +1276,10 @@ mod loom_test {
             purger.join().unwrap();
             // Whatever the pass missed has to be announced, or nothing would ever look again.
             let mut missed = 0;
-            region.chunks.purge_pass(u64::MAX, 0, |run| missed += run.len());
+            region.chunks.purge_pass(u64::MAX, 0, |run| {
+                missed += run.len();
+                true
+            });
             assert!(
                 missed == 0 || region.clock.aging.load(Ordering::Acquire),
                 "a free chunk is dirty and nothing is going to purge it"

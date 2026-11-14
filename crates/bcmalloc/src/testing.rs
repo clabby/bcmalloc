@@ -634,7 +634,10 @@ impl ChunkModel {
         const DELAY: u64 = 5;
         self.now += elapsed;
         let mut visited = Vec::new();
-        let pending = self.bitmap.chunks().purge_pass(self.now, DELAY, |run| visited.extend(run));
+        let pending = self.bitmap.chunks().purge_pass(self.now, DELAY, |run| {
+            visited.extend(run);
+            true
+        });
         let len = self.taken.len();
         let groups: Vec<_> = (0..len)
             .step_by(self.granule)

@@ -89,7 +89,7 @@ Section 10 explains how huge pages are kept whole once they are in use.
 
 **NUMA.** On a machine with more than one NUMA node, the chunks are split into one contiguous part per node, and each part asks the kernel to prefer its node's memory. A heap takes its slabs from the part of the node its thread was running on when it claimed the heap, and borrows from the other parts only when its own is full. A thread's memory therefore sits on its own node without the allocator ever asking where it runs on the fast path.
 
-The configuration decides how eager to be. `Commit::Lazy` touches nothing. `Commit::Populate` backs every page before the first allocation, and `Commit::Lock` also pins them. With those, a program gets TigerBeetle's posture directly. The memory is resident from the start, there are no page faults on the allocation path, and the capacity is a hard limit.
+The configuration decides how eager to be. `Commit::Lazy` touches nothing. `Commit::Populate` backs every page before the first allocation, and `Commit::Lock` also pins them. With those, a program gets TigerBeetle's posture directly. The memory is resident from the start and stays resident, because such a region never gives pages back, there are no page faults on the allocation path, and the capacity is a hard limit.
 
 ## 4. Chunks
 
@@ -209,6 +209,8 @@ The next claim of a purged chunk has to know. Allocation checks the given-back b
 A pass makes free chunks look allocated while it holds them. If a pass holds every free chunk, an allocation that looks at the bitmap would fail although memory is free. The allocator therefore does not report that the region is full until it has looked again with no pass overlapping the attempt, and two counters, one for passes running and one for passes finished, tell it whether any did.
 
 `trim` is the explicit version. It empties every heap that no thread holds, then gives back every free chunk, whole huge page or not, because the caller asked for it.
+
+Some regions keep their pages. One backed up front with `Commit::Populate` or `Commit::Lock` asked to stay resident, so its clock never runs and `trim` only empties heaps. The kernel also refuses to discard pages that are locked in memory, which happens when a program pins its memory with `mlockall`, and those pages keep their contents. A chunk is recorded as given back only when the kernel took its pages, so a zeroed request never trusts a refused run to read as zeros, and the first refusal makes the region keep its pages from then on, since asking again would only be refused again.
 
 ## 11. Metrics
 
