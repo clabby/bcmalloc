@@ -84,7 +84,7 @@ use crate::{
     allocator::{Backend, allocator},
     cache::CacheLine,
     chunks::CHUNK_SHIFT,
-    region::{Entry, Region},
+    region::{Entry, HUGE_PAGE_CHUNKS, Region},
     size_class::{CLASSES, Class, MAX_SMALL, Request, classify},
     slab::{Block, List, Owned, Returns, Slab},
     sync::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -264,6 +264,9 @@ struct Private {
     /// its chunks come from the zone of transparent huge pages. A slab that was never filled may
     /// have most of its pages untouched, so counting it would move heaps that are small in memory.
     held: Cell<usize>,
+    /// How many chunks the blocks of whole chunks that this heap handed out and did not free take
+    /// up. It counts towards the size of the heap as `held` does.
+    runs: Cell<usize>,
     bins: [Bin; CLASSES],
     /// This heap's bin slots in the region, set at every claim.
     slots: Cell<*mut *mut Block>,
@@ -321,6 +324,7 @@ impl HeapData {
                 node: Cell::new(0),
                 cursor: Cell::new(0),
                 held: Cell::new(0),
+                runs: Cell::new(0),
                 bins: [const {
                     Bin {
                         top: Cell::new(ptr::null_mut()),
@@ -404,6 +408,12 @@ impl HeapData {
         }
     }
 
+    /// Whether the heap holds enough memory that its chunks come from the zone of transparent huge
+    /// pages. See [`HUGE_ZONE_CHUNKS`].
+    const fn is_big(&self) -> bool {
+        self.private.held.get() + self.private.runs.get() >= HUGE_ZONE_CHUNKS
+    }
+
     /// The part of the region the next slab of `class` comes from. See [`Region::part`].
     ///
     /// Slabs of a big heap go to the zone of transparent huge pages when they will be dense. A
@@ -412,7 +422,7 @@ impl HeapData {
     /// it goes there only once the heap holds a slab of its class that it has filled.
     const fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
         let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
-        let huge = dense && self.private.held.get() >= HUGE_ZONE_CHUNKS;
+        let huge = dense && self.is_big();
         region.part(self.private.node.get(), huge)
     }
 
@@ -1026,6 +1036,7 @@ impl HeapData {
             return unsafe { region.dealloc(ptr, layout) };
         };
         let bytes = chunks << CHUNK_SHIFT;
+        self.private.runs.set(self.private.runs.get().saturating_sub(chunks));
         count!(self, HugeFrees, 1);
         count!(self, HugeBytesFreed, bytes);
         if bytes <= HUGE_CACHE_BLOCK {
@@ -1526,17 +1537,19 @@ impl HeapData {
                 // The next kept block of this size has been asked for, so it stays a while.
                 self.mark_kept_reused(chunks);
                 count!(self, HugeCacheHits, 1);
-                self.count_huge_alloc(chunks);
+                self.note_huge_alloc(chunks);
                 return (region.chunk_ptr(block.first), false);
             }
         }
         // A block of whole chunks is a buffer or an arena that most programs touch all of, and
-        // blocks of whole chunks pack next to each other, so they use huge pages.
-        let part = region.part(self.private.node.get(), true);
+        // such blocks pack next to each other, so they use huge pages once the heap is big. One of
+        // a huge page or more is worth it whatever the size of the heap.
+        let huge = chunks >= HUGE_PAGE_CHUNKS || self.is_big();
+        let part = region.part(self.private.node.get(), huge);
         let Some((first, zeroed)) = region.alloc_chunks_zeroed(chunks, 1, 0, part) else {
             return (ptr::null_mut(), false);
         };
-        self.count_huge_alloc(chunks);
+        self.note_huge_alloc(chunks);
         region.set_huge(first, chunks);
         #[cfg(feature = "metrics")]
         if zeroed {
@@ -1545,15 +1558,11 @@ impl HeapData {
         (region.chunk_ptr(first), zeroed)
     }
 
-    /// Counts a huge block of `chunks` chunks handed out.
-    #[cfg_attr(
-        not(feature = "metrics"),
-        allow(clippy::unused_self, clippy::missing_const_for_fn, reason = "it counts nothing")
-    )]
-    fn count_huge_alloc(&self, chunks: usize) {
+    /// Records that a huge block of `chunks` chunks was handed out.
+    fn note_huge_alloc(&self, chunks: usize) {
+        self.private.runs.set(self.private.runs.get() + chunks);
         count!(self, HugeAllocs, 1);
         count!(self, HugeBytesAllocated, chunks << CHUNK_SHIFT);
-        let _ = chunks;
     }
 
     /// Marks the kept huge blocks of `chunks` chunks as wanted.
@@ -1955,7 +1964,6 @@ mod test {
     use super::*;
     use crate::{
         chunks::CHUNK_SIZE,
-        region::HUGE_PAGE_CHUNKS,
         testing::{Harness, Rng, TestRegion, iterations, random_traffic},
     };
 
@@ -2485,11 +2493,13 @@ mod test {
         let sparse = big.alloc(layout(20 << 10, 8)).unwrap();
         assert!(chunk(sparse) < 128, "a slab of several chunks of a big heap uses small pages");
         let run = big.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
-        assert!(chunk(run) >= 128, "a block of whole chunks uses huge pages");
+        assert!(chunk(run) >= 128, "a block of whole chunks of a big heap uses huge pages");
         let medium = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
-        assert!(chunk(medium) >= 128, "whatever the size of its heap");
+        assert!(chunk(medium) < 128, "and one of a small heap does not");
         let large = small.alloc(layout(HUGE_PAGE_CHUNKS * CHUNK_SIZE, 8)).unwrap();
         assert!(chunk(large) >= 128, "a block of a huge page or more uses huge pages");
+        let next = small.alloc(layout(9 * CHUNK_SIZE, 8)).unwrap();
+        assert!(chunk(next) >= 128, "a heap is big once it holds big blocks too");
         for block in first.into_iter().chain(later) {
             // SAFETY: allocated above with this layout.
             unsafe { big.dealloc(block, blocks) };

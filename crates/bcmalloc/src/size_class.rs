@@ -1,11 +1,11 @@
 //! Size classes and slab geometry.
 //!
-//! A request of up to 512 KiB is rounded up to one of 104 size classes. Classes are 16 bytes apart
+//! A request of up to 64 KiB is rounded up to one of 80 size classes. Classes are 16 bytes apart
 //! up to 128 bytes. Above that there are eight classes per doubling, so rounding wastes at most one
 //! part in eight.
 //!
 //! ```text
-//!    16 32 48 64 80 96 112 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 512K
+//!    16 32 48 64 80 96 112 128 | 144 160 176 192 208 224 240 256 | 288 320 352 ... 64K
 //!    <---- 8 classes, +16 ---->  <------- 8 classes, +16 ------->  <--- +32 --->  ...
 //!                                <-------- one doubling -------->
 //! ```
@@ -14,13 +14,15 @@
 //! first chunk of a slab is found by masking a chunk index. Bigger blocks get bigger slabs. That
 //! keeps at least eight blocks in every slab and the unusable tail of a slab under an eighth of it.
 //!
-//! | Block size        | Slab        | Blocks per slab |
-//! | ----------------- | ----------- | --------------- |
-//! | 16 B to 8 KiB     | 64 KiB (1)  | 8 to 4096       |
-//! | 8 KiB to 64 KiB   | 512 KiB (8) | 8 to 56         |
-//! | 64 KiB to 512 KiB | 4 MiB (64)  | 8 to 56         |
+//! | Block size      | Slab        | Blocks per slab |
+//! | --------------- | ----------- | --------------- |
+//! | 16 B to 8 KiB   | 64 KiB (1)  | 8 to 4096       |
+//! | 8 KiB to 64 KiB | 512 KiB (8) | 8 to 56         |
 //!
-//! Anything larger than 512 KiB is a huge request, which gets a run of whole chunks of its own.
+//! Anything larger than 64 KiB is a huge request, which gets a run of whole chunks of its own,
+//! as jemalloc gives large requests extents of their own. A slab of bigger blocks would hold so
+//! few of them that one partly used slab per class and heap would cost more than rounding up to
+//! whole chunks does.
 //!
 //! # Alignment
 //!
@@ -41,7 +43,7 @@ pub(crate) const MIN_ALIGN: usize = 16;
 pub const MAX_ALIGN: usize = CHUNK_SIZE;
 
 /// The largest block served from a slab. Bigger requests are huge allocations.
-pub const MAX_SMALL: usize = 512 << 10;
+pub const MAX_SMALL: usize = 64 << 10;
 
 /// The largest block that a heap may reuse when another heap owns it. See
 /// [`Class::reusable_anywhere`].
@@ -50,8 +52,8 @@ const ANYWHERE_MAX: usize = 256;
 /// Requests of up to this many bytes are classified by a table lookup.
 pub(crate) const TABLE_MAX: usize = 8192;
 
-/// The number of size classes.
-pub(crate) const CLASSES: usize = 104;
+/// The number of size classes: eight up to 128 bytes, and eight per doubling up to [`MAX_SMALL`].
+pub(crate) const CLASSES: usize = 8 + 8 * (MAX_SMALL.ilog2() - LINEAR_LIMIT.ilog2()) as usize;
 
 /// Classes up to this many bytes advance in steps of 16.
 const LINEAR_LIMIT: usize = 128;
@@ -269,17 +271,10 @@ impl Class {
         ((offset as u64 * RECIPROCALS[self.0 as usize]) >> 32) as usize
     }
 
-    /// How many chunks one slab of this class spans, which is 1, 8 or 64. Slabs are aligned to this
+    /// How many chunks one slab of this class spans, which is 1 or 8. Slabs are aligned to this
     /// many chunks.
     pub(crate) const fn slab_chunks(self) -> usize {
-        let size = self.block_size();
-        if size <= 8192 {
-            1
-        } else if size <= 65536 {
-            8
-        } else {
-            64
-        }
+        if self.block_size() <= TABLE_MAX { 1 } else { 8 }
     }
 
     /// How many blocks fit in one slab.
@@ -326,7 +321,7 @@ mod test {
 
     #[test]
     fn for_size_picks_the_smallest_class_that_fits() {
-        // Every size below 512 KiB is cheap to check, and Miri takes a sample.
+        // Every small size is cheap to check, and Miri takes a sample.
         let step = if cfg!(miri) { 997 } else { 1 };
         for size in (1..=MAX_SMALL).step_by(step) {
             let class = Class::for_size(size);
@@ -414,7 +409,7 @@ mod test {
             classify(layout(MAX_SMALL, 1)),
             Some(Request::Small(Class::from_index(CLASSES - 1)))
         );
-        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 9 }));
+        assert_eq!(classify(layout(MAX_SMALL + 1, 1)), Some(Request::Huge { chunks: 2 }));
         assert_eq!(
             classify(layout(CHUNK_SIZE, 1)),
             Some(Request::Small(Class::for_size(CHUNK_SIZE)))

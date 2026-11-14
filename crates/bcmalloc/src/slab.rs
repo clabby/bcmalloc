@@ -454,7 +454,7 @@ mod test {
 
     #[test]
     fn a_fresh_slab_yields_every_block_once_in_address_order() {
-        for size in [16, 48, 1024, 3000, 100_000] {
+        for size in [16, 48, 1024, 3000, 60_000] {
             let fixture = Fixture::new(size);
             let capacity = Class::for_size(size).blocks_per_slab();
             let blocks = fixture.take(usize::MAX);

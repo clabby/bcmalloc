@@ -907,6 +907,21 @@ mod test {
         let tiny = crate::testing::TestRegion::with_nodes(64, 1, 4);
         assert_eq!(tiny.region().home(3), 0..1, "a region smaller than the nodes is not split");
     }
+    #[test]
+    fn print_geometry_tmp() {
+        let g = Geometry::new(1 << 20, 4096).unwrap();
+        std::println!(
+            "GEOM heaps {} bins {} slabs {} map {} words {} data {} heapdata {} slab {}",
+            g.heaps >> 20,
+            g.bins >> 20,
+            g.slabs >> 20,
+            g.map >> 20,
+            g.words >> 20,
+            g.data >> 20,
+            mem::size_of::<HeapData>(),
+            mem::size_of::<Slab>()
+        );
+    }
 
     #[test]
     fn every_node_gets_a_small_and_a_huge_page_zone_side_by_side() {
@@ -966,10 +981,10 @@ mod test {
     fn slabs_start_on_multiples_of_their_size() {
         let mapping = Mapping::new(&config(64 * MIB)).unwrap();
         let heap = mapping.region().heap().unwrap();
-        // The largest class lives in 4 MiB slabs, and its blocks are 512 KiB apart.
-        let layout = Layout::from_size_align(512 << 10, 64 << 10).unwrap();
+        // The largest class lives in 512 KiB slabs, and its blocks are 64 KiB apart.
+        let layout = Layout::from_size_align(64 << 10, 64 << 10).unwrap();
         let blocks: std::vec::Vec<_> = (0..4).map(|_| heap.alloc(layout).unwrap()).collect();
-        assert!(blocks.iter().all(|block| block.as_ptr().addr() % (512 << 10) == 0));
+        assert!(blocks.iter().all(|block| block.as_ptr().addr() % (64 << 10) == 0));
     }
 
     #[test]
