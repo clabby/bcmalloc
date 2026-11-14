@@ -8,6 +8,7 @@ publish = false
 description = "The synthetic benchmark suite of bcmalloc and the driver that runs it and the bench apps."
 
 [dependencies]
+bcmalloc-bench-data = { path = "../bench-data" }
 bcmalloc = { workspace = true, features = ["std"] }
 libc = { workspace = true, features = ["std"] }
 mimalloc.workspace = true
