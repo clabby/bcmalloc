@@ -28,7 +28,7 @@
 //!
 //! Once a thread's destructor has run, other destructors on that thread may still allocate or
 //! free. The slot is empty by then, and binding a new heap would hand a claim to a thread that will
-//! never release it. [`exiting`] tells the slow path to use a temporary heap instead.
+//! never release it. [`exiting`] tells the slow path to borrow a spare heap instead.
 
 use crate::heap::HeapData;
 use core::{cell::Cell, ffi::c_void, ptr};
@@ -45,6 +45,8 @@ thread_local! {
     /// Set while this thread is binding a heap. When the allocator replaces malloc, creating a key
     /// or storing a value may itself allocate, and that allocation must not try to bind again.
     static BINDING: Cell<bool> = const { Cell::new(false) };
+    /// The spare heap this thread borrowed last, if it has no heap of its own, or `NO_SPARE`.
+    static SPARE: Cell<usize> = const { Cell::new(NO_SPARE) };
 }
 
 /// Whether this thread is in the middle of binding a heap.
@@ -55,6 +57,26 @@ pub(crate) fn binding() -> bool {
 /// Marks this thread as binding a heap, or as done.
 pub(crate) fn set_binding(on: bool) {
     BINDING.with(|binding| binding.set(on));
+}
+
+/// A spare heap number that stands for a thread that has borrowed none yet.
+const NO_SPARE: usize = usize::MAX;
+
+/// The spare heap this thread borrowed last, which it asks for first next time. Before its first
+/// borrow a thread asks for one picked from the address of its own thread-local storage, so that
+/// threads spread over the spares from the start. The region reduces the number to its spares.
+pub(crate) fn spare() -> usize {
+    SPARE.with(|last| match last.get() {
+        // Thread-local blocks lie a stack apart, so their low bits are alike. A multiplicative
+        // hash moves the bits that differ into the top ones.
+        NO_SPARE => ptr::from_ref(last).addr().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48,
+        spare => spare,
+    })
+}
+
+/// Remembers the spare heap this thread borrowed.
+pub(crate) fn set_spare(spare: usize) {
+    SPARE.with(|last| last.set(spare));
 }
 
 /// Whether this thread has already given its heap back, so that it must not bind a new one.

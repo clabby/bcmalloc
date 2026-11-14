@@ -83,7 +83,7 @@ The C library prints the same report at exit when it is built with the feature a
 | Option       | Default | What it does                                                                     |
 | ------------ | ------- | -------------------------------------------------------------------------------- |
 | `capacity`   | 64 GiB  | Size of the region. It is address space until memory is touched.                 |
-| `max_heaps`  | 4096    | How many threads can allocate at once.                                           |
+| `max_heaps`  | 4096    | How many threads get a heap of their own.                                        |
 | `commit`     | `Lazy`  | `Populate` backs every page now and `Lock` also pins them in RAM.                |
 | `huge_pages` | on      | Huge pages on Linux for big heaps, big processes and big blocks. macOS has none. |
 | `numa`       | on      | Splits the region between NUMA nodes on Linux machines with several.             |
@@ -110,7 +110,7 @@ The development suite has 51 synthetic workloads and is what the allocator is tu
 - The capacity is a hard limit. Nothing grows the region after start-up, and an allocation that does not fit fails. Through the global allocator, a failed allocation aborts the program.
 - The default region is 64 GiB of address space. Under strict overcommit (`vm.overcommit_memory=2`), or with a limit on a process's data or address space, the kernel counts all of it. The global allocator then retries with half the capacity until the reservation fits, down to 256 MiB.
 - Alignments above 4 MiB are refused, and the allocation fails. A request aligned to more than 64 KiB takes a run of whole chunks of its own, at least 128 KiB, whatever its size.
-- A thread that finds all `max_heaps` heaps taken fails its allocations.
+- Threads past `max_heaps` share a few spare heaps, one call at a time. They do not fail, but they allocate more slowly than threads with a heap of their own, so set `max_heaps` to the most threads the program runs at once.
 - Idle memory goes back to the operating system from the allocator's slower operations, such as refilling a thread's cache, and not from a background thread. A program that goes quiet keeps what it freed until it allocates enough to reach one of them, or until it calls [`Bcmalloc::trim`](https://docs.rs/bcmalloc/latest/bcmalloc/struct.Bcmalloc.html#method.trim).
 - A region backed up front with `Commit::Populate` or `Commit::Lock` keeps every page and gives nothing back. So does any region once the kernel refuses to take pages back, as it does for memory the program has locked, for example with `mlockall`.
 - It builds for 64-bit Linux and macOS. Other Unix systems are untested, and other systems, Windows among them, are refused at compile time.

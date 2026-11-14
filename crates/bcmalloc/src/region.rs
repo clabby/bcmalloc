@@ -24,6 +24,8 @@
 //! A [`Region`] is the shared, thread-safe half of the allocator. Threads take a [`Heap`] from it
 //! to allocate. A [`Mapping`] owns the memory behind a region and unmaps it on drop.
 
+#[cfg(any(test, feature = "std"))]
+use crate::sync::yield_now;
 use crate::{
     cache::CacheLine,
     chunks::{CHUNK_SHIFT, CHUNK_SIZE, Chunks},
@@ -59,6 +61,11 @@ const HUGE_PURGE_WAIT: u64 = 10;
 
 /// The chunks in one transparent huge page of 2 MiB.
 pub(crate) const HUGE_PAGE_CHUNKS: usize = (2 << 20) / CHUNK_SIZE;
+
+/// How many passes over the spare heaps a borrower makes, pausing between them, before it yields
+/// to other threads.
+#[cfg(any(test, feature = "std"))]
+const SPARE_SPINS: u32 = 16;
 
 /// Why a region could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +114,9 @@ pub struct Region<'a> {
     /// For every chunk of a slab, the owning heap and the class. See [`Entry`].
     map: &'a [AtomicU64],
     heaps: &'a [HeapData],
+    /// How many slots at the end of `heaps` are spare heaps, which [`Region::heap`] never hands
+    /// out and threads without a heap of their own borrow one operation at a time.
+    spares: usize,
     /// The bin slots of every heap, [`BIN_SLOTS`] for each, owned by whoever claims the heap.
     bin_slots: *mut *mut Block,
     /// How many NUMA nodes the region is split between, into how many zones the part of each node
@@ -117,6 +127,9 @@ pub struct Region<'a> {
     /// How many heap slots may have been claimed. Slots at or beyond it are untouched, so the
     /// operations that visit every slot stop here.
     claimed_mark: AtomicUsize,
+    /// How many of the slots that [`Region::heap`] hands out are not held. A claim takes one
+    /// before it looks for the slot, and giving a heap up returns it.
+    vacant: AtomicUsize,
     clock: Clock,
     occupancy: Occupancy,
     #[cfg(feature = "metrics")]
@@ -170,7 +183,7 @@ unsafe impl Sync for Region<'_> {}
 ///   long as `'a`, and used by nothing else.
 /// * `words` must be zeroed bitmap storage for `chunk_count` chunks, `slabs` must hold
 ///   `chunk_count` unused descriptors, `map` `chunk_count` entries, and `heaps` unclaimed heap
-///   slots.
+///   slots, the last `spare_heaps` of which are spare heaps.
 /// * `bin_slots` must point to [`BIN_SLOTS`] writable pointers for each heap slot, valid for as
 ///   long as `'a` and used by nothing else.
 pub(crate) struct Parts<'a> {
@@ -180,6 +193,7 @@ pub(crate) struct Parts<'a> {
     pub(crate) slabs: &'a [Slab],
     pub(crate) map: &'a [AtomicU64],
     pub(crate) heaps: &'a [HeapData],
+    pub(crate) spare_heaps: usize,
     pub(crate) bin_slots: *mut *mut Block,
     /// How many NUMA nodes to split the chunks between, at least 1.
     pub(crate) nodes: usize,
@@ -200,6 +214,7 @@ impl<'a> Region<'a> {
         // chunks must fit in the bits below it. See `Entry::huge`.
         debug_assert!(parts.heaps.len() <= Entry::HUGE_OWNER as usize);
         debug_assert!(parts.chunk_count < Entry::HUGE_OWNER as usize);
+        debug_assert!(parts.spare_heaps <= parts.heaps.len());
         let words = Chunks::words_for(parts.chunk_count);
         // A region too small to give every node a word of its own is not split at all, because
         // the parts are numbered by physical node. Zones are given up first, since they only
@@ -219,11 +234,13 @@ impl<'a> Region<'a> {
             slabs: parts.slabs,
             map: parts.map,
             heaps: parts.heaps,
+            spares: parts.spare_heaps,
             bin_slots: parts.bin_slots,
             nodes,
             zones,
             words,
             claimed_mark: AtomicUsize::new(0),
+            vacant: AtomicUsize::new(parts.heaps.len() - parts.spare_heaps),
             clock: Clock {
                 _line: [],
                 next_purge: AtomicU64::new(0),
@@ -240,16 +257,86 @@ impl<'a> Region<'a> {
 
     /// Claims a free heap, or returns `None` if every one is in use.
     pub fn heap(&self) -> Option<Heap<'_>> {
+        if !self.take_vacancy() {
+            return None;
+        }
         // The search stops at the first free slot, so it only ever touches one slot that has never
         // been used. Bounding it by `claimed_mark` instead would make concurrent claims race for
         // that one slot and fail although others are free.
-        for (id, data) in self.heaps.iter().enumerate() {
+        for (id, data) in self.heaps[..self.heaps.len() - self.spares].iter().enumerate() {
             if data.claim(id as u32, self) {
                 self.claimed_mark.fetch_max(id + 1, Ordering::Release);
                 return Some(Heap::new(self, data));
             }
         }
+        // A trim was holding the free slot for a moment.
+        self.vacate();
         None
+    }
+
+    /// Counts one free slot as taken, or returns false if none is free. When every slot is held
+    /// this costs one load, where a pass over all of them would cost one cache miss per slot, on
+    /// every call of a program with more threads than heaps.
+    fn take_vacancy(&self) -> bool {
+        let mut vacant = self.vacant.load(Ordering::Relaxed);
+        while vacant > 0 {
+            match self.vacant.compare_exchange_weak(
+                vacant,
+                vacant - 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => vacant = now,
+            }
+        }
+        false
+    }
+
+    /// Counts a slot that [`heap`](Self::heap) handed out as free again. Its claim must already be
+    /// released, so that a claim that takes the count finds the slot free.
+    pub(crate) fn vacate(&self) {
+        self.vacant.fetch_add(1, Ordering::Release);
+    }
+
+    /// Borrows a spare heap for one operation, which the caller ends with
+    /// [`HeapData::release_claim`]. It tries spare number `hint`, reduced to the number of spares,
+    /// first and waits while every spare is held. Returns the number of the spare it took, the hint
+    /// for next time, and the heap.
+    ///
+    /// Spare heaps serve threads without a heap of their own: threads past the configured number of
+    /// heaps, and threads that gave theirs back at exit. A spare keeps its bins and slabs from one
+    /// borrower to the next, so a borrow costs one compare-and-swap.
+    #[cfg(any(test, feature = "std"))]
+    pub(crate) fn borrow_spare(&self, hint: usize) -> (usize, &HeapData) {
+        assert!(self.spares > 0, "the region has no spare heaps");
+        let first = self.heaps.len() - self.spares;
+        let hint = if hint < self.spares { hint } else { hint % self.spares };
+        let mut spins = 0;
+        loop {
+            for index in (hint..self.spares).chain(0..hint) {
+                let id = first + index;
+                if self.heaps[id].borrow(id as u32, self) {
+                    return (index, &self.heaps[id]);
+                }
+            }
+            // A borrower holds a spare for one operation, but threads past the cap often outnumber
+            // the cores, so a waiter soon lets the holder run. Loom has to see a yield on every
+            // pass to explore the thread it waits for.
+            if cfg!(loom) || spins == SPARE_SPINS {
+                yield_now();
+            } else {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// The slots that may hold memory, with their ids: those claimed so far and the spare heaps.
+    fn used_heaps(&self) -> impl Iterator<Item = (usize, &HeapData)> + Clone {
+        let claimed = self.claimed_mark.load(Ordering::Acquire);
+        let spare = self.heaps.len() - self.spares;
+        (0..claimed).chain(spare..self.heaps.len()).map(|id| (id, &self.heaps[id]))
     }
 
     /// Frees a block without a heap, from any thread.
@@ -294,19 +381,19 @@ impl<'a> Region<'a> {
     /// While this drains a bitmap word the 64 chunks in it look allocated to everyone else, so run
     /// it when the program is not close to full.
     pub fn trim(&self) {
-        let claimed = self.claimed_mark.load(Ordering::Acquire);
+        let heaps = self.used_heaps();
         // Flushing one heap can send blocks to another that was flushed before it, so a few more
         // passes take in what arrived. Each pass sends less, because a heap only sends blocks of
         // other heaps and those come to rest in their own slabs.
         for _ in 0..4 {
-            for (id, data) in self.heaps[..claimed].iter().enumerate() {
-                if data.claim(id as u32, self) {
-                    // SAFETY: we just claimed the slot.
+            for (id, data) in heaps.clone() {
+                if data.borrow(id as u32, self) {
+                    // SAFETY: we just took the slot.
                     unsafe { data.flush(self) };
                     data.release_claim();
                 }
             }
-            if self.heaps[..claimed].iter().all(|data| data.is_claimed() || !data.has_mail()) {
+            if heaps.clone().all(|(_, data)| data.is_claimed() || !data.has_mail()) {
                 break;
             }
         }
@@ -330,25 +417,25 @@ impl<'a> Region<'a> {
         }
     }
 
-    /// A snapshot of the allocator's metrics, summed over every heap slot that has been claimed.
-    /// It costs a pass over those slots and the chunk bitmap, so call it now and then, not on a
-    /// hot path. See [`Metrics`](crate::Metrics).
+    /// A snapshot of the allocator's metrics, summed over every heap slot that has been claimed and
+    /// the spare heaps. It costs a pass over those slots and the chunk bitmap, so call it now and
+    /// then, not on a hot path. See [`Metrics`](crate::Metrics).
     #[cfg(feature = "metrics")]
     pub fn metrics(&self) -> crate::Metrics {
         use crate::metrics::Event;
         let claimed = self.claimed_mark.load(Ordering::Acquire);
-        let heaps = &self.heaps[..claimed];
+        let heaps = self.used_heaps().map(|(_, heap)| heap);
         let counters = &self.counters;
         let classes = crate::metrics::class_metrics(|class| {
             let unbound = counters.frees[class.index()].get();
             heaps
-                .iter()
+                .clone()
                 .map(|heap| heap.class_counts(class))
                 .fold((0, unbound, 0), |(allocs, frees, slabs), (a, f, s)| {
                     (allocs + a, frees + f, slabs.wrapping_add(s))
                 })
         });
-        let sum = |event| heaps.iter().map(|heap| heap.events().get(event)).sum::<u64>();
+        let sum = |event| heaps.clone().map(|heap| heap.events().get(event)).sum::<u64>();
         let huge_allocated = sum(Event::HugeBytesAllocated);
         let huge_freed = sum(Event::HugeBytesFreed) + counters.huge_bytes_freed.get();
         let stats = self.stats();
@@ -864,11 +951,17 @@ impl Mapping {
     /// Fails if the configuration is unusable, the operating system refuses the reservation, or
     /// [`Commit::Lock`] cannot be honoured.
     pub fn new(config: &Config) -> Result<Self, Error> {
+        Self::with_spare_heaps(config, 0)
+    }
+
+    /// As [`new`](Self::new), with `spares` more heap slots that [`Region::heap`] never hands
+    /// out, for threads without a heap of their own to borrow.
+    pub(crate) fn with_spare_heaps(config: &Config, spares: usize) -> Result<Self, Error> {
         let chunks = config.capacity_bytes() / CHUNK_SIZE;
-        let heaps = config.heap_count();
-        if chunks == 0 || heaps == 0 {
+        if chunks == 0 || config.heap_count() == 0 {
             return Err(Error::InvalidConfig);
         }
+        let heaps = config.heap_count().checked_add(spares).ok_or(Error::InvalidConfig)?;
         let geometry = Geometry::new(chunks, heaps).ok_or(Error::InvalidConfig)?;
         let raw_len = geometry.total.checked_add(SLAB_ALIGN).ok_or(Error::InvalidConfig)?;
         let raw = sys::reserve(raw_len).ok_or(Error::OutOfAddressSpace)?;
@@ -898,6 +991,7 @@ impl Mapping {
                 slabs,
                 map,
                 heaps: heap_slots,
+                spare_heaps: spares,
                 bin_slots: at(geometry.bins).cast::<*mut Block>(),
                 nodes,
                 huge_zone: config.wants_huge_pages() && cfg!(target_os = "linux"),
