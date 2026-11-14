@@ -107,7 +107,7 @@ const MESSAGE_CLASS: Class = Class::for_size(MESSAGE_BYTES);
 
 /// How many outboxes a heap keeps. A remote free goes to the one picked by the destination heap's
 /// id, so this many destinations can each fill a message without displacing each other.
-const OUTBOXES: usize = 16;
+const OUTBOXES: usize = 32;
 
 /// The size of a spilled batch, which is the block size of one class.
 const BATCH_BYTES: usize = 4096;
@@ -207,9 +207,15 @@ const REFILLED: u8 = 0b1000;
 #[repr(C)]
 struct Message {
     next: *mut Block,
-    count: usize,
+    count: u32,
+    /// The class of every block in the message, or [`MIXED`]. The owner files the blocks of a
+    /// message of one class into its bin with one copy, without looking each block up.
+    class: u32,
     blocks: [*mut Block; MESSAGE_BLOCKS],
 }
+
+/// The class of a message whose blocks are of more than one class.
+const MIXED: u32 = u32::MAX;
 
 const _: () = assert!(size_of::<Message>() == MESSAGE_BYTES);
 const _: () = assert!(MESSAGE_CLASS.block_size() == MESSAGE_BYTES);
@@ -1351,7 +1357,9 @@ impl HeapData {
         let id = self.private.id.get();
         let span = class.slab_chunks() << CHUNK_SHIFT;
         let mut run: Option<Returns<'_>> = None;
-        for &block in blocks {
+        let mut rest = blocks;
+        while let Some((&block, more)) = rest.split_first() {
+            rest = more;
             if let Some(returns) = &mut run {
                 if block.addr().wrapping_sub(returns.slab().start().addr()) < span {
                     // SAFETY: the block is an in-use block of the slab, given up.
@@ -1364,13 +1372,11 @@ impl HeapData {
             }
             let owner = self.entry_of(block.cast()).owner();
             if owner != id {
-                if directly {
-                    // SAFETY: the block belongs to `owner` and is given up.
-                    unsafe { region.heap_slot(owner).post_block(block) };
-                } else {
-                    // SAFETY: as above.
-                    unsafe { self.send(block, class, owner) };
-                }
+                let at = blocks.len() - rest.len() - 1;
+                // SAFETY: forwarded, and the first of the blocks is `block`, which is `owner`'s.
+                let given =
+                    unsafe { self.give_away(region, class, &blocks[at..], owner, directly) };
+                rest = &blocks[at + given..];
                 continue;
             }
             // SAFETY: the chunk map says the slab is ours.
@@ -1384,6 +1390,49 @@ impl HeapData {
         if let Some(returns) = run {
             self.settle(region, returns.finish());
         }
+    }
+
+    /// Gives the first of `blocks`, which belongs to heap `owner`, back to it, with the blocks
+    /// after it that belong to it too, and returns how many blocks it gave. This stays out of line
+    /// so that the loop of [`give_back`](Self::give_back) over the heap's own blocks stays short.
+    ///
+    /// # Safety
+    ///
+    /// As for [`give_back`](Self::give_back), and the first block must belong to `owner`.
+    #[inline(never)]
+    unsafe fn give_away(
+        &self,
+        region: &Region<'_>,
+        class: Class,
+        blocks: &[*mut Block],
+        owner: u32,
+        directly: bool,
+    ) -> usize {
+        // The blocks that follow and belong to the same owner go with the first. Slabs are aligned
+        // to their size, so blocks of one slab need no second look at the map.
+        let mask = !((class.slab_chunks() << CHUNK_SHIFT) - 1);
+        let mut slab = blocks[0].addr() & mask;
+        let mut len = 1;
+        while let Some(&next) = blocks.get(len) {
+            if next.addr() & mask != slab {
+                if self.entry_of(next.cast()).owner() != owner {
+                    break;
+                }
+                slab = next.addr() & mask;
+            }
+            len += 1;
+        }
+        let others = &blocks[..len];
+        if directly {
+            for &block in others {
+                // SAFETY: the block belongs to `owner` and is given up.
+                unsafe { region.heap_slot(owner).post_block(block) };
+            }
+        } else {
+            // SAFETY: as above.
+            unsafe { self.send_run(others, class, owner) };
+        }
+        len
     }
 
     /// Moves or releases a slab that has just taken blocks back, as its occupancy says.
@@ -1426,8 +1475,94 @@ impl HeapData {
         count!(self, BlocksSent, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
+        let outbox = &self.private.outboxes[owner as usize % OUTBOXES];
+        // SAFETY: the caller holds the claim.
+        let message = unsafe { self.open_outbox(region, outbox, class, owner) };
+        if message.is_null() {
+            // SAFETY: the caller gives the block up, and it belongs to `owner`.
+            return unsafe { region.heap_slot(owner).post_block(block) };
+        }
+        // SAFETY: an open message is ours until it is posted, and it is never left full.
+        let count = unsafe {
+            let count = (*message).count as usize;
+            (&raw mut (*message).blocks).cast::<*mut Block>().add(count).write(block);
+            (*message).count = (count + 1) as u32;
+            count + 1
+        };
+        let bytes = outbox.bytes.get() as usize + class.block_size();
+        outbox.bytes.set(bytes as u32);
+        if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
+            // SAFETY: the caller holds the claim.
+            unsafe { self.post_outbox(region, outbox) };
+        }
+    }
+
+    /// Appends blocks of `class` that all belong to heap `owner` to the outbox for that heap,
+    /// posting the message each time it fills, so that a run of blocks costs one look at the
+    /// outbox per message and not a call per block. A single block from a free takes
+    /// [`send`](Self::send), which is shorter for one block.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the blocks must be distinct in-use blocks of `class` of
+    /// slabs owned by heap `owner`, which are given up.
+    unsafe fn send_run(&self, blocks: &[*mut Block], class: Class, owner: u32) {
+        count!(self, BlocksSent, blocks.len());
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
         let size = class.block_size();
         let outbox = &self.private.outboxes[owner as usize % OUTBOXES];
+        let mut rest = blocks;
+        while !rest.is_empty() {
+            // SAFETY: the caller holds the claim.
+            let message = unsafe { self.open_outbox(region, outbox, class, owner) };
+            if message.is_null() {
+                for &block in rest {
+                    // SAFETY: the caller gives the block up, and it belongs to `owner`.
+                    unsafe { region.heap_slot(owner).post_block(block) };
+                }
+                return;
+            }
+            // SAFETY: an open message is ours until it is posted, and it is never left full.
+            let mut count = unsafe { (*message).count as usize };
+            let mut bytes = outbox.bytes.get() as usize;
+            // Up to the block that fills the message or takes it past its byte limit.
+            while let Some((&block, more)) = rest.split_first() &&
+                count < MESSAGE_BLOCKS &&
+                bytes < OUTBOX_BYTES
+            {
+                // SAFETY: the message has room for the block, as the loop condition says.
+                unsafe {
+                    (&raw mut (*message).blocks).cast::<*mut Block>().add(count).write(block)
+                };
+                count += 1;
+                bytes += size;
+                rest = more;
+            }
+            // SAFETY: as above.
+            unsafe { (*message).count = count as u32 };
+            outbox.bytes.set(bytes as u32);
+            if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
+                // SAFETY: the caller holds the claim.
+                unsafe { self.post_outbox(region, outbox) };
+            }
+        }
+    }
+
+    /// Readies `outbox` to take blocks of `class` for heap `owner` and returns its message, or null
+    /// if the blocks must travel on their own because they are too big to wait in an outbox or
+    /// there is no memory for a message.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    unsafe fn open_outbox(
+        &self,
+        region: &Region<'_>,
+        outbox: &Outbox,
+        class: Class,
+        owner: u32,
+    ) -> *mut Message {
         if outbox.message.get().is_null() {
             // Messages come back to their sender once read, and a thread that only frees would
             // otherwise never take them in and keep allocating new ones. Reading the inbox may
@@ -1442,14 +1577,12 @@ impl HeapData {
             message = outbox.message.get();
         }
         if message.is_null() {
-            if size >= OUTBOX_BYTES {
-                // SAFETY: the caller gives the block up, and it belongs to `owner`.
-                return unsafe { region.heap_slot(owner).post_block(block) };
+            if class.block_size() >= OUTBOX_BYTES {
+                return ptr::null_mut();
             }
             message = self.alloc_message(region);
             if message.is_null() {
-                // SAFETY: as above.
-                return unsafe { region.heap_slot(owner).post_block(block) };
+                return message;
             }
             // SAFETY: the message is a fresh block of ours.
             unsafe { (*message).count = 0 };
@@ -1457,19 +1590,15 @@ impl HeapData {
             outbox.bytes.set(0);
         }
         outbox.dest.set(owner);
-        // SAFETY: the message is ours until it is posted, and it is never left full.
-        let count = unsafe {
-            let count = (*message).count;
-            (*message).blocks[count] = block;
-            (*message).count = count + 1;
-            count + 1
-        };
-        let bytes = outbox.bytes.get() as usize + size;
-        outbox.bytes.set(bytes as u32);
-        if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
-            // SAFETY: the caller holds the claim.
-            unsafe { self.post_outbox(region, outbox) };
+        // SAFETY: the message is ours until it is posted.
+        unsafe {
+            if (*message).count == 0 {
+                (*message).class = class.index() as u32;
+            } else if (*message).class != class.index() as u32 {
+                (*message).class = MIXED;
+            }
         }
+        message
     }
 
     /// Posts what an outbox holds to its destination. A message with one block sends the block on
@@ -1555,15 +1684,43 @@ impl HeapData {
                 unsafe { self.file(region, raw) };
             } else {
                 let message = raw.cast::<Message>();
-                // SAFETY: as above, a message holds `count` blocks of our slabs.
+                // SAFETY: as above, a message holds `count` blocks of our slabs, of `class` unless
+                // it is mixed, and the blocks are read before the message is freed.
                 unsafe {
-                    for index in 0..(*message).count {
-                        self.file(region, (*message).blocks[index]);
+                    let blocks = core::slice::from_raw_parts(
+                        (&raw const (*message).blocks).cast::<*mut Block>(),
+                        (*message).count as usize,
+                    );
+                    match (*message).class {
+                        MIXED => blocks.iter().for_each(|&block| self.file(region, block)),
+                        class => self.file_run(region, Class::from_index(class as usize), blocks),
                     }
                     self.free_small(message.cast());
                 }
             }
             node = next;
+        }
+    }
+
+    /// Takes in blocks of `class` of this heap's slabs that another thread sent back: as many as
+    /// fit go into the bin with one copy, and the rest back to their slabs.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the blocks must be distinct in-use blocks of `class` of
+    /// this heap's slabs, which are given up.
+    unsafe fn file_run(&self, region: &Region<'_>, class: Class, blocks: &[*mut Block]) {
+        count!(self, BlocksFiled, blocks.len());
+        let bin = self.bin(class);
+        let room = usize::from(bin.capacity.get()) - self.bin_len(class);
+        let (kept, rest) = blocks.split_at(room.min(blocks.len()));
+        let top = bin.top.get().wrapping_sub(kept.len());
+        // SAFETY: the bin has room for `kept` blocks below its top.
+        unsafe { ptr::copy_nonoverlapping(kept.as_ptr(), top, kept.len()) };
+        bin.top.set(top);
+        if !rest.is_empty() {
+            // SAFETY: forwarded. The blocks are this heap's, so giving them back sends nothing.
+            unsafe { self.give_back(region, class, rest, false) };
         }
     }
 
@@ -2086,8 +2243,18 @@ impl HeapData {
             assert_eq!(check(message.cast(), "an outbox").class(), MESSAGE_CLASS);
             claim(message.cast(), "an outbox");
             // SAFETY: the message is ours until it is posted.
-            let blocks = unsafe { &(&(*message).blocks)[..(*message).count] };
+            let blocks = unsafe { &(&(*message).blocks)[..(*message).count as usize] };
             assert!(blocks.len() < MESSAGE_BLOCKS, "a full message was not posted");
+            // SAFETY: as above.
+            let class = unsafe { (*message).class };
+            assert!(
+                blocks.is_empty() ||
+                    class == MIXED ||
+                    blocks.iter().all(
+                        |&block| self.entry_of(block.cast()).class().index() == class as usize
+                    ),
+                "a message of one class holds a block of another"
+            );
             for &block in blocks {
                 let entry = check(block, "an outbox");
                 assert_eq!(
@@ -2113,7 +2280,7 @@ impl HeapData {
                 let message = raw.cast::<Message>();
                 claim(raw, "the inbox");
                 // SAFETY: nothing frees remotely while this runs, so the inbox is stable.
-                for &block in unsafe { &(&(*message).blocks)[..(*message).count] } {
+                for &block in unsafe { &(&(*message).blocks)[..(*message).count as usize] } {
                     assert_eq!(check(block, "the inbox").owner(), id, "a message went astray");
                     claim(block, "the inbox");
                 }
