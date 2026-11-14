@@ -95,15 +95,15 @@ If the operating system refuses the default reservation, the global allocator re
 <!-- generated:overview -->
 | Compared with mimalloc             | system | bcmalloc | jemalloc | snmalloc |
 | ---------------------------------- | ------ | -------- | -------- | -------- |
-| development suite, macOS, speed    | 0.52   | 2.09     | 0.87     | 1.22     |
-| development suite, Linux, speed    | 0.63   | 1.73     | 0.88     | 1.14     |
-| Rust programs, macOS, speed        | 0.91   | 1.02     | 0.93     | 1.01     |
-| Rust programs, Linux, speed        | 0.82   | 1.09     | 1.03     | 1.04     |
-| mimalloc-bench, Linux, speed       | -      | 1.00     | 0.82     | 0.94     |
-| mimalloc-bench, Linux, peak memory | -      | 1.51     | 1.38     | 1.40     |
+| development suite, macOS, speed    | 0.52   | 2.09     | 0.86     | 1.24     |
+| development suite, Linux, speed    | 0.64   | 1.82     | 0.89     | 1.18     |
+| Rust programs, macOS, speed        | 0.94   | 1.03     | 0.96     | 1.04     |
+| Rust programs, Linux, speed        | 0.72   | 1.13     | 1.03     | 1.05     |
+| mimalloc-bench, Linux, speed       | -      | 1.02     | 0.82     | 0.94     |
+| mimalloc-bench, Linux, peak memory | -      | 1.49     | 1.37     | 1.40     |
 <!-- /generated:overview -->
 
-The development suite has 51 synthetic workloads and is what the allocator is tuned against. The Rust programs, built on serde_json, regex, syn, hyper and tokio, and the C programs of mimalloc-bench are never tuned against. Figures are relative to mimalloc, and above 1.00 is better, faster or less memory. [BENCHMARKS.md](https://github.com/clabby/bcmalloc/blob/main/BENCHMARKS.md) has the method, the machines, every table, and the programs where bcmalloc is not the fastest.
+The development suite has 51 synthetic workloads and is what the allocator is tuned against. The Rust programs, built on serde_json, regex, syn, hyper, tokio, fjall and rayon, and the C programs of mimalloc-bench are never tuned against. Figures are relative to mimalloc, and above 1.00 is better, faster or less memory. [BENCHMARKS.md](https://github.com/clabby/bcmalloc/blob/main/BENCHMARKS.md) has the method, the machines, every table, and the programs where bcmalloc is not the fastest.
 
 ## Limits
 

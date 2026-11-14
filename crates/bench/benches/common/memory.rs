@@ -5,7 +5,7 @@ use super::{
     churn::{MEDIUM, MIXED, SMALL, Sizes},
     harness::{Block, Outcome, Rng, Scale, empty_slots, resident_mib},
 };
-use std::{thread, time::Duration};
+use std::{hint::black_box, thread, time::Duration};
 
 /// How long to wait after freeing before looking, so that allocators that return memory on a
 /// timer have had their turn.
@@ -21,9 +21,10 @@ fn settle() {
 fn settle_for(delay: Duration) {
     thread::sleep(delay);
     // A running program touches many size classes, which is what makes a lazy allocator look at
-    // its free memory.
+    // its free memory. The compiler may remove an allocation that nothing reads, so each block
+    // passes through black_box.
     for i in 0..10_000 {
-        drop(Block::new(16 << (i % 12)));
+        drop(black_box(Block::new(16 << (i % 12))));
     }
     thread::sleep(delay);
 }

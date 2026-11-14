@@ -50,8 +50,11 @@
 //! blocks to their owner prevents, or pull across many lines that the owner still holds. Blocks of
 //! the other classes always go home.
 //!
-//! A bin that fills up gives its oldest half back: blocks of this heap's slabs go to the slab, and
-//! the others go to their owners.
+//! A bin that fills up moves its oldest blocks into a spilled batch, an array of pointers that the
+//! next refill of the class copies back, so that a burst of frees bigger than the bin costs a copy
+//! of pointers each way. Batches that no refill wants go back to their slabs at the heap's next
+//! maintenance step, and when the heap has spilled as much as it may, a full bin gives its oldest
+//! half back at once: blocks of this heap's slabs go to the slab, and the others to their owners.
 //!
 //! # Messages
 //!
@@ -104,7 +107,23 @@ const MESSAGE_CLASS: Class = Class::for_size(MESSAGE_BYTES);
 
 /// How many outboxes a heap keeps. A remote free goes to the one picked by the destination heap's
 /// id, so this many destinations can each fill a message without displacing each other.
-const OUTBOXES: usize = 16;
+const OUTBOXES: usize = 32;
+
+/// The size of a spilled batch, which is the block size of one class.
+const BATCH_BYTES: usize = 4096;
+
+/// How many block pointers fit in a batch after its link and its count.
+const BATCH_BLOCKS: usize = BATCH_BYTES / size_of::<usize>() - 2;
+
+/// The class that batches are allocated from. Its own bin never spills, so that spilling never
+/// needs a batch to make room for a batch.
+const BATCH_CLASS: Class = Class::for_size(BATCH_BYTES);
+
+/// How many bytes of blocks a heap may keep in spilled batches. Spilled blocks are blocks that the
+/// program used a moment ago, so they add nothing to the peak, but they keep their slabs from going
+/// back until a refill takes them or a maintenance step returns them. A budget of 1 MiB gave
+/// sh8bench all the speed of 8 MiB, and many threads that each spill hold correspondingly less.
+const SPILL_BUDGET: usize = 1 << 20;
 
 /// An outbox is posted once it holds this many bytes of blocks, so that big blocks are not held
 /// back for long. A single block this large is sent on its own at once.
@@ -176,6 +195,11 @@ const OVERFLOW: u8 = 0b10;
 /// The bin has missed since the last maintenance step.
 const MISSED: u8 = 0b100;
 
+/// The bin ran dry in this maintenance interval or the one before, so the heap allocates from the
+/// class and a spilled batch has a refill to wait for. A heap that only frees a class never spills
+/// it, and gives the blocks back at once.
+const REFILLED: u8 = 0b1000;
+
 /// Blocks on their way to the heap that owns their slabs.
 ///
 /// A message is an ordinary block of [`MESSAGE_CLASS`] from the sender's heap. Its first word is
@@ -183,12 +207,33 @@ const MISSED: u8 = 0b100;
 #[repr(C)]
 struct Message {
     next: *mut Block,
-    count: usize,
+    count: u32,
+    /// The class of every block in the message, or [`MIXED`]. The owner files the blocks of a
+    /// message of one class into its bin with one copy, without looking each block up.
+    class: u32,
     blocks: [*mut Block; MESSAGE_BLOCKS],
 }
 
+/// The class of a message whose blocks are of more than one class.
+const MIXED: u32 = u32::MAX;
+
 const _: () = assert!(size_of::<Message>() == MESSAGE_BYTES);
 const _: () = assert!(MESSAGE_CLASS.block_size() == MESSAGE_BYTES);
+
+/// Blocks that overflowed a bin, kept for the next refill of their class.
+///
+/// A batch is an ordinary block of [`BATCH_CLASS`] from the heap's own slabs, and the batches of a
+/// class form a stack, newest first, through `next`. `blocks` holds the blocks in the order they
+/// sat in the bin, newest first.
+#[repr(C)]
+struct Batch {
+    next: *mut Self,
+    count: usize,
+    blocks: [*mut Block; BATCH_BLOCKS],
+}
+
+const _: () = assert!(size_of::<Batch>() == BATCH_BYTES);
+const _: () = assert!(BATCH_CLASS.block_size() == BATCH_BYTES);
 
 /// A stack of free block pointers for one class. See the [module documentation](self).
 ///
@@ -242,6 +287,10 @@ struct Lists {
     full: Cell<*const Slab>,
     /// How many of the class's slabs that the heap holds have been filled once.
     filled: Cell<u32>,
+    /// The batches that overflows of the class's bin spilled, newest first.
+    spill: Cell<*mut Batch>,
+    /// Whether a refill took a spilled batch since the last maintenance step.
+    unspilled: Cell<bool>,
     /// How many slabs of the class the heap holds.
     #[cfg(feature = "metrics")]
     slabs: crate::metrics::Counter,
@@ -265,6 +314,9 @@ struct Private {
     draining: Cell<bool>,
     /// How many bytes of capacity the bins have grown by, against [`GROWTH_BUDGET`].
     grown: Cell<usize>,
+    /// How many bytes of blocks the spilled batches of all classes hold, against
+    /// [`SPILL_BUDGET`].
+    spilled: Cell<usize>,
     /// The start of the managed memory, the slab descriptors and the chunk map of the region this
     /// slot was claimed from, so that the fast paths reach them without loading the region. They
     /// are set at every claim and valid while the claim lasts.
@@ -337,6 +389,7 @@ impl HeapData {
                 refills: Cell::new(0),
                 draining: Cell::new(false),
                 grown: Cell::new(0),
+                spilled: Cell::new(0),
                 base: Cell::new(ptr::null_mut()),
                 span: Cell::new(0),
                 map: Cell::new(ptr::null()),
@@ -376,6 +429,8 @@ impl HeapData {
                         active_last: Cell::new(ptr::null()),
                         full: Cell::new(ptr::null()),
                         filled: Cell::new(0),
+                        spill: Cell::new(ptr::null_mut()),
+                        unspilled: Cell::new(false),
                         #[cfg(feature = "metrics")]
                         slabs: crate::metrics::Counter::new(),
                     }
@@ -447,10 +502,15 @@ impl HeapData {
     /// Slabs of a big heap go to the zone of transparent huge pages when they will be dense. A
     /// single-chunk slab fills quickly and packs next to others. A slab of several chunks holds
     /// few blocks and may stay mostly untouched, where a huge page fault would back all of it, so
-    /// it goes there only once the heap holds a slab of its class that it has filled.
+    /// it goes there only once the heap holds a slab of its class that it has filled. In a big
+    /// process, see [`Region::is_big`], the slabs of a class that the heap fills go there too.
     fn slab_part(&self, region: &Region<'_>, class: Class) -> usize {
-        let dense = class.slab_chunks() == 1 || self.lists(class).filled.get() > 0;
-        let huge = dense && self.is_big();
+        let filled = self.lists(class).filled.get() > 0;
+        let dense = class.slab_chunks() == 1 || filled;
+        // In a big process, a class whose slabs this heap fills is dense whatever the heap's size,
+        // so its next slabs take huge pages too. Many threads that each fill slabs of a few classes
+        // would otherwise fault every page of those slabs in one by one.
+        let huge = dense && (self.is_big() || (filled && region.is_big()));
         region.part(self.private.node.get(), huge)
     }
 
@@ -492,7 +552,8 @@ impl HeapData {
     fn note_miss(&self, class: Class, kind: u8) -> bool {
         let bin = self.bin(class);
         let last = bin.misses.get() & (UNDERFLOW | OVERFLOW);
-        bin.misses.set(kind | MISSED);
+        let refilled = if kind == UNDERFLOW { REFILLED } else { bin.misses.get() & REFILLED };
+        bin.misses.set(kind | MISSED | refilled);
         let capacity = usize::from(bin.capacity.get());
         if last == 0 || last == kind || capacity == class.bin_max() {
             return false;
@@ -684,19 +745,35 @@ impl HeapData {
     /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
     #[inline(always)]
     pub(crate) unsafe fn alloc_table(&self, size: usize, wide: bool) -> *mut u8 {
+        if let Some(block) = self.pop_table(size, wide) {
+            return block;
+        }
+        // SAFETY: forwarded.
+        unsafe { self.refill(Class::from_table(Self::table_step(size, wide) * STEP)) }.cast()
+    }
+
+    /// Pops a block of `size` bytes, as [`alloc_table`](Self::alloc_table) places it, off its bin,
+    /// or returns None if the bin is empty.
+    ///
+    /// The caller must hold the claim on this slot, and `size` must be at most [`TABLE_MAX`].
+    #[inline(always)]
+    pub(crate) fn pop_table(&self, size: usize, wide: bool) -> Option<*mut u8> {
         debug_assert!(size <= TABLE_MAX);
-        let step = if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) };
-        // SAFETY: the size is at most `TABLE_MAX`, a multiple of 16, so its step is in the table,
-        // and every offset in it is that of a bin in the array.
+        let step = Self::table_step(size, wide);
+        // SAFETY: the size is at most `TABLE_MAX`, so its step is in the table, and every offset in
+        // it is that of a bin in the array.
         let bin = unsafe {
             let offset = *BIN_OFFSETS.get_unchecked(step);
             &*self.private.bins.as_ptr().byte_add(usize::from(offset))
         };
-        if let Some(block) = Self::pop_from(bin) {
-            return block.cast();
-        }
-        // SAFETY: forwarded.
-        unsafe { self.refill(Class::from_table(step * STEP)) }.cast()
+        Self::pop_from(bin).map(<*mut Block>::cast)
+    }
+
+    /// The index in the class table of a request of `size` bytes. A wide request rounds the size
+    /// up to a multiple of 16, whose class's blocks are 16-byte aligned.
+    #[inline(always)]
+    const fn table_step(size: usize, wide: bool) -> usize {
+        if wide { size.div_ceil(2 * STEP) * 2 } else { size.div_ceil(STEP) }
     }
 
     /// Allocates anything that the fast path in [`HeapData::alloc`] does not take.
@@ -707,26 +784,42 @@ impl HeapData {
     #[inline(never)]
     unsafe fn alloc_general(&self, layout: Layout) -> *mut u8 {
         match classify(layout) {
-            Some(Request::Small(class)) => self
-                .pop(class)
-                // SAFETY: forwarded.
-                .unwrap_or_else(|| unsafe { self.refill(class) })
-                .cast(),
-            Some(Request::Huge { chunks }) => {
+            Some(Request::Small(class)) => {
+                // Bins serve most of a quiet program's requests, and then nothing runs the purge
+                // clock, which keeps memory that a burst left behind. Bigger blocks come through
+                // here, which costs a load of a flag, and runs the clock when chunks are waiting.
                 // SAFETY: the claim keeps the region alive.
-                let region = unsafe { self.region() };
-                let block = self.alloc_huge(region, chunks);
-                if !block.is_null() {
-                    return block;
-                }
-                // The region looks full, but this heap may be sitting on empty slabs. Give them
-                // back and retry.
-                // SAFETY: the caller holds the claim.
-                unsafe { self.flush(region) };
-                self.alloc_huge(region, chunks)
+                unsafe { self.region() }.purge_if_due();
+                self.pop(class)
+                    // SAFETY: forwarded.
+                    .unwrap_or_else(|| unsafe { self.refill(class) })
+                    .cast()
             }
+            // SAFETY: forwarded.
+            Some(Request::Huge { chunks }) => unsafe { self.alloc_whole(chunks) },
             None => ptr::null_mut(),
         }
+    }
+
+    /// Allocates a block of whole chunks, out of line so that the saves of registers that it needs
+    /// stay off the path of small blocks in [`alloc_general`](Self::alloc_general).
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot.
+    #[inline(never)]
+    unsafe fn alloc_whole(&self, chunks: usize) -> *mut u8 {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
+        let block = self.alloc_huge(region, chunks);
+        if !block.is_null() {
+            return block;
+        }
+        // The region looks full, but this heap may be sitting on empty slabs. Give them back and
+        // retry.
+        // SAFETY: the caller holds the claim.
+        unsafe { self.flush(region) };
+        self.alloc_huge(region, chunks)
     }
 
     /// Fills the empty bin of `class` and pops a block, or returns null if the region is out of
@@ -754,6 +847,11 @@ impl HeapData {
             return block;
         }
         self.note_miss(class, UNDERFLOW);
+        if self.unspill(region, class) &&
+            let Some(block) = self.pop(class)
+        {
+            return block;
+        }
         if self.fill(region, class) == 0 {
             // The region looks full, but this heap may be sitting on empty slabs. Give them back
             // and retry.
@@ -805,7 +903,19 @@ impl HeapData {
                     let bytes = (capacity - shrunk) * class.block_size();
                     self.private.grown.set(self.private.grown.get() - bytes);
                 }
-                bin.misses.set(bin.misses.get() & !MISSED);
+                // A bin that has not missed for a whole interval forgets that it was refilled.
+                let misses = bin.misses.get();
+                bin.misses.set(if misses & MISSED == 0 {
+                    misses & !REFILLED
+                } else {
+                    misses & !MISSED
+                });
+                // Batches that no refill wanted since the last step go back to their slabs.
+                let lists = self.lists(class);
+                if !lists.unspilled.replace(false) && !lists.spill.get().is_null() {
+                    // SAFETY: forwarded.
+                    unsafe { self.return_spill(region, class, false) };
+                }
             }
         }
     }
@@ -1123,6 +1233,18 @@ impl HeapData {
     #[inline(always)]
     pub(crate) unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
         let Some(entry) = self.entry_in_region(ptr.as_ptr()) else { return };
+        // SAFETY: forwarded, and the entry is the block's.
+        unsafe { self.free_with_entry(ptr, entry) };
+    }
+
+    /// Frees the block at `ptr`, of a slab or huge, whose chunk map entry is `entry`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim on this slot, `entry` must be the entry of the block's chunk,
+    /// and the block must be live and not used again.
+    #[inline(always)]
+    pub(crate) unsafe fn free_with_entry(&self, ptr: NonNull<u8>, entry: Entry) {
         if let Some(chunks) = entry.huge_chunks() {
             // SAFETY: a huge block of `chunks` chunks has this layout, and the caller gives it up.
             return unsafe {
@@ -1155,7 +1277,7 @@ impl HeapData {
     ///
     /// As for [`dealloc`](Self::dealloc), and `entry` must be the entry of the block's chunk.
     #[inline(always)]
-    unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
+    pub(crate) unsafe fn free_entry(&self, block: *mut Block, entry: Entry) {
         // SAFETY: entries hold the offset of a bin in the array.
         let bin = unsafe { &*self.private.bins.as_ptr().byte_add(entry.bin_offset()) };
         #[cfg(feature = "metrics")]
@@ -1182,10 +1304,15 @@ impl HeapData {
     #[cold]
     #[inline(never)]
     unsafe fn free_full(&self, block: *mut Block, class: Class) {
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
         // A thread that only frees never refills, so this is where it takes in its mail.
         // SAFETY: the caller holds the claim.
-        unsafe { self.read_mail(self.region()) };
+        unsafe { self.read_mail(region) };
         if self.note_miss(class, OVERFLOW) && self.push(class, block) {
+            return;
+        }
+        if self.spill(region, class) && self.push(class, block) {
             return;
         }
         loop {
@@ -1251,7 +1378,9 @@ impl HeapData {
         let id = self.private.id.get();
         let span = class.slab_chunks() << CHUNK_SHIFT;
         let mut run: Option<Returns<'_>> = None;
-        for &block in blocks {
+        let mut rest = blocks;
+        while let Some((&block, more)) = rest.split_first() {
+            rest = more;
             if let Some(returns) = &mut run {
                 if block.addr().wrapping_sub(returns.slab().start().addr()) < span {
                     // SAFETY: the block is an in-use block of the slab, given up.
@@ -1264,13 +1393,11 @@ impl HeapData {
             }
             let owner = self.entry_of(block.cast()).owner();
             if owner != id {
-                if directly {
-                    // SAFETY: the block belongs to `owner` and is given up.
-                    unsafe { region.heap_slot(owner).post_block(block) };
-                } else {
-                    // SAFETY: as above.
-                    unsafe { self.send(block, class, owner) };
-                }
+                let at = blocks.len() - rest.len() - 1;
+                // SAFETY: forwarded, and the first of the blocks is `block`, which is `owner`'s.
+                let given =
+                    unsafe { self.give_away(region, class, &blocks[at..], owner, directly) };
+                rest = &blocks[at + given..];
                 continue;
             }
             // SAFETY: the chunk map says the slab is ours.
@@ -1284,6 +1411,49 @@ impl HeapData {
         if let Some(returns) = run {
             self.settle(region, returns.finish());
         }
+    }
+
+    /// Gives the first of `blocks`, which belongs to heap `owner`, back to it, with the blocks
+    /// after it that belong to it too, and returns how many blocks it gave. This stays out of line
+    /// so that the loop of [`give_back`](Self::give_back) over the heap's own blocks stays short.
+    ///
+    /// # Safety
+    ///
+    /// As for [`give_back`](Self::give_back), and the first block must belong to `owner`.
+    #[inline(never)]
+    unsafe fn give_away(
+        &self,
+        region: &Region<'_>,
+        class: Class,
+        blocks: &[*mut Block],
+        owner: u32,
+        directly: bool,
+    ) -> usize {
+        // The blocks that follow and belong to the same owner go with the first. Slabs are aligned
+        // to their size, so blocks of one slab need no second look at the map.
+        let mask = !((class.slab_chunks() << CHUNK_SHIFT) - 1);
+        let mut slab = blocks[0].addr() & mask;
+        let mut len = 1;
+        while let Some(&next) = blocks.get(len) {
+            if next.addr() & mask != slab {
+                if self.entry_of(next.cast()).owner() != owner {
+                    break;
+                }
+                slab = next.addr() & mask;
+            }
+            len += 1;
+        }
+        let others = &blocks[..len];
+        if directly {
+            for &block in others {
+                // SAFETY: the block belongs to `owner` and is given up.
+                unsafe { region.heap_slot(owner).post_block(block) };
+            }
+        } else {
+            // SAFETY: as above.
+            unsafe { self.send_run(others, class, owner) };
+        }
+        len
     }
 
     /// Moves or releases a slab that has just taken blocks back, as its occupancy says.
@@ -1326,8 +1496,94 @@ impl HeapData {
         count!(self, BlocksSent, 1);
         // SAFETY: the claim keeps the region alive.
         let region = unsafe { self.region() };
+        let outbox = &self.private.outboxes[owner as usize % OUTBOXES];
+        // SAFETY: the caller holds the claim.
+        let message = unsafe { self.open_outbox(region, outbox, class, owner) };
+        if message.is_null() {
+            // SAFETY: the caller gives the block up, and it belongs to `owner`.
+            return unsafe { region.heap_slot(owner).post_block(block) };
+        }
+        // SAFETY: an open message is ours until it is posted, and it is never left full.
+        let count = unsafe {
+            let count = (*message).count as usize;
+            (&raw mut (*message).blocks).cast::<*mut Block>().add(count).write(block);
+            (*message).count = (count + 1) as u32;
+            count + 1
+        };
+        let bytes = outbox.bytes.get() as usize + class.block_size();
+        outbox.bytes.set(bytes as u32);
+        if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
+            // SAFETY: the caller holds the claim.
+            unsafe { self.post_outbox(region, outbox) };
+        }
+    }
+
+    /// Appends blocks of `class` that all belong to heap `owner` to the outbox for that heap,
+    /// posting the message each time it fills, so that a run of blocks costs one look at the
+    /// outbox per message and not a call per block. A single block from a free takes
+    /// [`send`](Self::send), which is shorter for one block.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the blocks must be distinct in-use blocks of `class` of
+    /// slabs owned by heap `owner`, which are given up.
+    unsafe fn send_run(&self, blocks: &[*mut Block], class: Class, owner: u32) {
+        count!(self, BlocksSent, blocks.len());
+        // SAFETY: the claim keeps the region alive.
+        let region = unsafe { self.region() };
         let size = class.block_size();
         let outbox = &self.private.outboxes[owner as usize % OUTBOXES];
+        let mut rest = blocks;
+        while !rest.is_empty() {
+            // SAFETY: the caller holds the claim.
+            let message = unsafe { self.open_outbox(region, outbox, class, owner) };
+            if message.is_null() {
+                for &block in rest {
+                    // SAFETY: the caller gives the block up, and it belongs to `owner`.
+                    unsafe { region.heap_slot(owner).post_block(block) };
+                }
+                return;
+            }
+            // SAFETY: an open message is ours until it is posted, and it is never left full.
+            let mut count = unsafe { (*message).count as usize };
+            let mut bytes = outbox.bytes.get() as usize;
+            // Up to the block that fills the message or takes it past its byte limit.
+            while let Some((&block, more)) = rest.split_first() &&
+                count < MESSAGE_BLOCKS &&
+                bytes < OUTBOX_BYTES
+            {
+                // SAFETY: the message has room for the block, as the loop condition says.
+                unsafe {
+                    (&raw mut (*message).blocks).cast::<*mut Block>().add(count).write(block)
+                };
+                count += 1;
+                bytes += size;
+                rest = more;
+            }
+            // SAFETY: as above.
+            unsafe { (*message).count = count as u32 };
+            outbox.bytes.set(bytes as u32);
+            if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
+                // SAFETY: the caller holds the claim.
+                unsafe { self.post_outbox(region, outbox) };
+            }
+        }
+    }
+
+    /// Readies `outbox` to take blocks of `class` for heap `owner` and returns its message, or null
+    /// if the blocks must travel on their own because they are too big to wait in an outbox or
+    /// there is no memory for a message.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    unsafe fn open_outbox(
+        &self,
+        region: &Region<'_>,
+        outbox: &Outbox,
+        class: Class,
+        owner: u32,
+    ) -> *mut Message {
         if outbox.message.get().is_null() {
             // Messages come back to their sender once read, and a thread that only frees would
             // otherwise never take them in and keep allocating new ones. Reading the inbox may
@@ -1342,14 +1598,12 @@ impl HeapData {
             message = outbox.message.get();
         }
         if message.is_null() {
-            if size >= OUTBOX_BYTES {
-                // SAFETY: the caller gives the block up, and it belongs to `owner`.
-                return unsafe { region.heap_slot(owner).post_block(block) };
+            if class.block_size() >= OUTBOX_BYTES {
+                return ptr::null_mut();
             }
             message = self.alloc_message(region);
             if message.is_null() {
-                // SAFETY: as above.
-                return unsafe { region.heap_slot(owner).post_block(block) };
+                return message;
             }
             // SAFETY: the message is a fresh block of ours.
             unsafe { (*message).count = 0 };
@@ -1357,19 +1611,15 @@ impl HeapData {
             outbox.bytes.set(0);
         }
         outbox.dest.set(owner);
-        // SAFETY: the message is ours until it is posted, and it is never left full.
-        let count = unsafe {
-            let count = (*message).count;
-            (*message).blocks[count] = block;
-            (*message).count = count + 1;
-            count + 1
-        };
-        let bytes = outbox.bytes.get() as usize + size;
-        outbox.bytes.set(bytes as u32);
-        if count == MESSAGE_BLOCKS || bytes >= OUTBOX_BYTES {
-            // SAFETY: the caller holds the claim.
-            unsafe { self.post_outbox(region, outbox) };
+        // SAFETY: the message is ours until it is posted.
+        unsafe {
+            if (*message).count == 0 {
+                (*message).class = class.index() as u32;
+            } else if (*message).class != class.index() as u32 {
+                (*message).class = MIXED;
+            }
         }
+        message
     }
 
     /// Posts what an outbox holds to its destination. A message with one block sends the block on
@@ -1455,15 +1705,43 @@ impl HeapData {
                 unsafe { self.file(region, raw) };
             } else {
                 let message = raw.cast::<Message>();
-                // SAFETY: as above, a message holds `count` blocks of our slabs.
+                // SAFETY: as above, a message holds `count` blocks of our slabs, of `class` unless
+                // it is mixed, and the blocks are read before the message is freed.
                 unsafe {
-                    for index in 0..(*message).count {
-                        self.file(region, (*message).blocks[index]);
+                    let blocks = core::slice::from_raw_parts(
+                        (&raw const (*message).blocks).cast::<*mut Block>(),
+                        (*message).count as usize,
+                    );
+                    match (*message).class {
+                        MIXED => blocks.iter().for_each(|&block| self.file(region, block)),
+                        class => self.file_run(region, Class::from_index(class as usize), blocks),
                     }
                     self.free_small(message.cast());
                 }
             }
             node = next;
+        }
+    }
+
+    /// Takes in blocks of `class` of this heap's slabs that another thread sent back: as many as
+    /// fit go into the bin with one copy, and the rest back to their slabs.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim, and the blocks must be distinct in-use blocks of `class` of
+    /// this heap's slabs, which are given up.
+    unsafe fn file_run(&self, region: &Region<'_>, class: Class, blocks: &[*mut Block]) {
+        count!(self, BlocksFiled, blocks.len());
+        let bin = self.bin(class);
+        let room = usize::from(bin.capacity.get()) - self.bin_len(class);
+        let (kept, rest) = blocks.split_at(room.min(blocks.len()));
+        let top = bin.top.get().wrapping_sub(kept.len());
+        // SAFETY: the bin has room for `kept` blocks below its top.
+        unsafe { ptr::copy_nonoverlapping(kept.as_ptr(), top, kept.len()) };
+        bin.top.set(top);
+        if !rest.is_empty() {
+            // SAFETY: forwarded. The blocks are this heap's, so giving them back sends nothing.
+            unsafe { self.give_back(region, class, rest, false) };
         }
     }
 
@@ -1496,6 +1774,11 @@ impl HeapData {
     unsafe fn empty_caches(&self, region: &Region<'_>) {
         // SAFETY: forwarded.
         unsafe { self.drain_inbox(region) };
+        // Before the bins, because returning a spill frees its batches, which are blocks too.
+        for index in 0..CLASSES {
+            // SAFETY: forwarded.
+            unsafe { self.return_spill(region, Class::from_index(index), true) };
+        }
         for kept in &self.private.kept {
             let block = kept.replace(Kept::NONE);
             if block.chunks != 0 {
@@ -1524,6 +1807,161 @@ impl HeapData {
             bin.misses.set(0);
         }
         self.private.grown.set(0);
+    }
+
+    /// Moves the oldest blocks of the full bin of `class`, up to half of it and at most a batch,
+    /// into a spilled batch for the next refill of the class. A burst of frees bigger than the bin
+    /// then costs a copy of pointers, where giving the blocks back costs a bitmap write per block
+    /// now and a bitmap read per block when the class is refilled. Returns false, and moves
+    /// nothing, if the class does not spill, its bin can still grow, the heap has spilled as much
+    /// as it may, or there is no memory for a batch. In the third case the batches of the class go
+    /// back to their slabs, because the burst outgrew them.
+    fn spill(&self, region: &Region<'_>, class: Class) -> bool {
+        let bin = self.bin(class);
+        // Messages circulate between heaps, so they go home at once and are never held here.
+        if class == BATCH_CLASS || class == MESSAGE_CLASS || bin.misses.get() & REFILLED == 0 {
+            return false;
+        }
+        // Bursts that fit in a bin grown to its largest are the bin's to absorb, so a batch is
+        // only for a bin that cannot grow any more.
+        let capacity = usize::from(bin.capacity.get());
+        let room = self.private.grown.get() + capacity * class.block_size() <= GROWTH_BUDGET;
+        if capacity < class.bin_max() && room {
+            return false;
+        }
+        let len = self.bin_len(class);
+        let gone = (len - usize::from(bin.capacity.get()) / 2).min(BATCH_BLOCKS);
+        let bytes = gone * class.block_size();
+        if gone == 0 {
+            return false;
+        }
+        if self.private.spilled.get() + bytes > SPILL_BUDGET {
+            // A burst bigger than the budget is not one that the next refills take back. Its
+            // oldest blocks, kept in batches, would hold on to a few blocks of every slab the burst
+            // freed, which then could never be released, so they go back with the rest of it, and
+            // the class spills again only after its next refill.
+            bin.misses.set(bin.misses.get() & !REFILLED);
+            // SAFETY: the caller holds the claim.
+            unsafe { self.return_spill(region, class, false) };
+            return false;
+        }
+        let batch = self.alloc_batch(region);
+        if batch.is_null() {
+            return false;
+        }
+        count!(self, BlocksSpilled, gone);
+        let lists = self.lists(class);
+        // The oldest blocks are at the end of the bin. Taking them out moves the rest down.
+        let top = bin.top.get();
+        // SAFETY: the bin holds `len` blocks from `top`, the batch is a fresh block of ours with
+        // room for `gone` of them, and allocating it touched no bin but that of `BATCH_CLASS`.
+        unsafe {
+            ptr::copy_nonoverlapping(top.add(len - gone), (&raw mut (*batch).blocks).cast(), gone);
+            ptr::copy(top, top.add(gone), len - gone);
+            (*batch).count = gone;
+            (*batch).next = lists.spill.get();
+        }
+        bin.top.set(top.wrapping_add(gone));
+        lists.spill.set(batch);
+        self.private.spilled.set(self.private.spilled.get() + bytes);
+        true
+    }
+
+    /// Fills the empty bin of `class` from its newest spilled batch, and returns whether there was
+    /// one. A batch bigger than the bin, which can happen after the bin shrank, keeps the rest.
+    fn unspill(&self, region: &Region<'_>, class: Class) -> bool {
+        let lists = self.lists(class);
+        let batch = lists.spill.get();
+        if batch.is_null() {
+            return false;
+        }
+        let bin = self.bin(class);
+        debug_assert_eq!(self.bin_len(class), 0, "a bin takes a batch only when it is empty");
+        // SAFETY: spilled batches are blocks of ours that only this heap uses.
+        let count = unsafe { (*batch).count };
+        let take = count.min(usize::from(bin.capacity.get()));
+        let first = bin.top.get().wrapping_sub(take);
+        // SAFETY: the bin is empty, so the `take` slots below its end are free, and the batch
+        // holds `count` blocks.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (&raw const (*batch).blocks).cast::<*mut Block>().add(count - take),
+                first,
+                take,
+            );
+        }
+        bin.top.set(first);
+        count!(self, BlocksUnspilled, take);
+        lists.unspilled.set(true);
+        self.private.spilled.set(self.private.spilled.get() - take * class.block_size());
+        if take == count {
+            // SAFETY: as above.
+            lists.spill.set(unsafe { (*batch).next });
+            self.free_batch(region, batch);
+        } else {
+            // SAFETY: as above.
+            unsafe { (*batch).count = count - take };
+        }
+        true
+    }
+
+    /// Gives every spilled batch of `class` back: its blocks go to their slabs or owners as
+    /// [`give_back`](Self::give_back) sends them, `directly` or through the outboxes, and the
+    /// batches themselves to their slab.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the claim.
+    unsafe fn return_spill(&self, region: &Region<'_>, class: Class, directly: bool) {
+        let lists = self.lists(class);
+        loop {
+            let batch = lists.spill.get();
+            if batch.is_null() {
+                return;
+            }
+            // SAFETY: spilled batches are blocks of ours that only this heap uses, and each holds
+            // `count` distinct in-use blocks of the class.
+            let blocks = unsafe {
+                lists.spill.set((*batch).next);
+                core::slice::from_raw_parts(
+                    (&raw const (*batch).blocks).cast::<*mut Block>(),
+                    (*batch).count,
+                )
+            };
+            self.private
+                .spilled
+                .set(self.private.spilled.get() - blocks.len() * class.block_size());
+            #[cfg(feature = "metrics")]
+            self.bin(BATCH_CLASS).frees.add(1);
+            // SAFETY: the blocks are in use and ours to give back, and the batch is not read again.
+            unsafe {
+                self.give_back(region, class, blocks, directly);
+                self.give_back(region, BATCH_CLASS, &[batch.cast()], true);
+            }
+        }
+    }
+
+    /// Allocates a block for a spilled batch without looking at the inbox or at spilled batches.
+    /// Returns null if the region is out of room.
+    fn alloc_batch(&self, region: &Region<'_>) -> *mut Batch {
+        if let Some(block) = self.pop(BATCH_CLASS) {
+            return block.cast();
+        }
+        if self.fill(region, BATCH_CLASS) == 0 {
+            return ptr::null_mut();
+        }
+        self.pop(BATCH_CLASS).map_or(ptr::null_mut(), <*mut Block>::cast)
+    }
+
+    /// Frees a batch that a refill emptied, without spilling or reading the inbox.
+    fn free_batch(&self, region: &Region<'_>, batch: *mut Batch) {
+        #[cfg(feature = "metrics")]
+        self.bin(BATCH_CLASS).frees.add(1);
+        if !self.push(BATCH_CLASS, batch.cast()) {
+            // SAFETY: a batch is an in-use block of one of this heap's slabs of `BATCH_CLASS`,
+            // which is given up here.
+            unsafe { self.free_to_slab(region, batch.cast(), BATCH_CLASS) };
+        }
     }
 
     /// Handles a slab with no live blocks. Its chunks are returned unless it is the only active
@@ -1748,6 +2186,7 @@ impl HeapData {
             }
             entry
         };
+        let mut spilled = 0;
         for index in 0..CLASSES {
             let class = Class::from_index(index);
             let lists = &self.private.classes[index];
@@ -1795,7 +2234,28 @@ impl HeapData {
                 claim(block, "a bin");
                 slot = slot.wrapping_add(1);
             }
+            let mut batch = lists.spill.get();
+            while !batch.is_null() {
+                assert_eq!(check(batch.cast(), "a spill").class(), BATCH_CLASS);
+                claim(batch.cast(), "a spill");
+                // SAFETY: spilled batches are blocks of ours, each holding `count` blocks.
+                let blocks = unsafe { &(&(*batch).blocks)[..(*batch).count] };
+                assert!(!blocks.is_empty() && class != BATCH_CLASS, "a spilled batch is wrong");
+                for &block in blocks {
+                    let entry = check(block, "a spill");
+                    assert_eq!(entry.class(), class, "a spill holds a block of another class");
+                    assert!(
+                        entry.owner() == id || bin.anywhere.get(),
+                        "a spill holds another heap's block of a class that must go home"
+                    );
+                    claim(block, "a spill");
+                    spilled += class.block_size();
+                }
+                // SAFETY: as above.
+                batch = unsafe { (*batch).next };
+            }
         }
+        assert_eq!(spilled, self.private.spilled.get(), "the spill budget disagrees");
         for outbox in &self.private.outboxes {
             let message = outbox.message.get();
             if message.is_null() {
@@ -1804,8 +2264,18 @@ impl HeapData {
             assert_eq!(check(message.cast(), "an outbox").class(), MESSAGE_CLASS);
             claim(message.cast(), "an outbox");
             // SAFETY: the message is ours until it is posted.
-            let blocks = unsafe { &(&(*message).blocks)[..(*message).count] };
+            let blocks = unsafe { &(&(*message).blocks)[..(*message).count as usize] };
             assert!(blocks.len() < MESSAGE_BLOCKS, "a full message was not posted");
+            // SAFETY: as above.
+            let class = unsafe { (*message).class };
+            assert!(
+                blocks.is_empty() ||
+                    class == MIXED ||
+                    blocks.iter().all(
+                        |&block| self.entry_of(block.cast()).class().index() == class as usize
+                    ),
+                "a message of one class holds a block of another"
+            );
             for &block in blocks {
                 let entry = check(block, "an outbox");
                 assert_eq!(
@@ -1831,7 +2301,7 @@ impl HeapData {
                 let message = raw.cast::<Message>();
                 claim(raw, "the inbox");
                 // SAFETY: nothing frees remotely while this runs, so the inbox is stable.
-                for &block in unsafe { &(&(*message).blocks)[..(*message).count] } {
+                for &block in unsafe { &(&(*message).blocks)[..(*message).count as usize] } {
                     assert_eq!(check(block, "the inbox").owner(), id, "a message went astray");
                     claim(block, "the inbox");
                 }
@@ -2139,6 +2609,98 @@ mod test {
         heap.validate();
         heap.flush();
         assert_eq!(used(&region), 0);
+    }
+
+    /// The block size of the spill tests. Their bursts are multiples of the class's largest bin,
+    /// 2048 blocks of 64 bytes, which take Miri many minutes, so under Miri they use the largest
+    /// class that is still reusable anywhere, whose bin holds 512.
+    const SPILL_SIZE: usize = if cfg!(miri) { ANYWHERE } else { 64 };
+
+    #[test]
+    fn a_burst_bigger_than_the_bin_spills_and_the_next_burst_takes_it_back() {
+        let test = TestRegion::new(128, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let layout = layout(SPILL_SIZE, 8);
+        let burst = 4 * Class::for_size(SPILL_SIZE).bin_max();
+        // Bursts that alternate with refills grow the bin to its largest, and only then does an
+        // overflow spill.
+        for _ in 0..8 {
+            let blocks = alloc_many(&heap, layout, burst);
+            free_all(&heap, layout, blocks);
+        }
+        heap.validate();
+        assert!(heap.data.private.spilled.get() > 0, "an overflowing bin spills");
+        let slabs = used(&region);
+        // The next burst takes the spilled blocks back before it touches a slab.
+        let blocks = alloc_many(&heap, layout, burst);
+        assert_eq!(used(&region), slabs, "the next burst reuses the last one's blocks");
+        heap.validate();
+        free_all(&heap, layout, blocks);
+        heap.flush();
+        assert_eq!(heap.data.private.spilled.get(), 0);
+        assert_eq!(used(&region), 0, "a flush returns spilled blocks to their slabs");
+    }
+
+    #[test]
+    fn a_burst_bigger_than_the_spill_budget_keeps_no_batches() {
+        let test = TestRegion::new(128, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let layout = layout(SPILL_SIZE, 8);
+        let class = Class::for_size(SPILL_SIZE);
+        for _ in 0..8 {
+            let blocks = alloc_many(&heap, layout, 4 * class.bin_max());
+            free_all(&heap, layout, blocks);
+        }
+        assert!(!heap.data.lists(class).spill.get().is_null(), "bursts that fit spill");
+        // Twice the budget: batches would pin a few blocks of every slab the burst freed.
+        let burst = 2 * SPILL_BUDGET / class.block_size();
+        let blocks = alloc_many(&heap, layout, burst);
+        free_all(&heap, layout, blocks);
+        heap.validate();
+        assert!(heap.data.lists(class).spill.get().is_null(), "the burst outgrew the batches");
+        assert_eq!(heap.data.private.spilled.get(), 0);
+        heap.flush();
+        assert_eq!(used(&region), 0);
+    }
+
+    #[test]
+    fn spilled_batches_that_no_refill_takes_go_back_at_maintenance() {
+        let test = TestRegion::new(128, 1);
+        let region = test.region();
+        let heap = region.heap().unwrap();
+        let (layout, other) = (layout(SPILL_SIZE, 8), layout(1024, 8));
+        let class = Class::for_size(SPILL_SIZE);
+        for _ in 0..8 {
+            let blocks = alloc_many(&heap, layout, 4 * class.bin_max());
+            free_all(&heap, layout, blocks);
+        }
+        assert!(!heap.data.lists(class).spill.get().is_null());
+        // Refills of another class run maintenance steps, which return the idle class's batches.
+        for _ in 0..8 {
+            let blocks = alloc_many(&heap, other, 16 * MAINTENANCE_INTERVAL as usize);
+            free_all(&heap, other, blocks);
+        }
+        heap.validate();
+        assert!(heap.data.lists(class).spill.get().is_null(), "idle batches go back");
+    }
+
+    #[test]
+    fn a_heap_that_only_frees_a_class_never_spills_it() {
+        let test = TestRegion::new(128, 2);
+        let region = test.region();
+        let (owner, freer) = (region.heap().unwrap(), region.heap().unwrap());
+        // These blocks may stay in the freeing heap's bin, but that heap never allocates them.
+        let layout = layout(SPILL_SIZE, 8);
+        for _ in 0..8 {
+            let blocks = alloc_many(&owner, layout, 4 * Class::for_size(SPILL_SIZE).bin_max());
+            free_all(&freer, layout, blocks);
+        }
+        freer.validate();
+        assert_eq!(freer.data.private.spilled.get(), 0, "no refill would take a spill");
+        freer.flush();
+        owner.flush();
     }
 
     #[test]

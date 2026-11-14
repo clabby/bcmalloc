@@ -54,9 +54,10 @@ coverage *args:
 loom *args:
     RUSTFLAGS="--cfg loom" cargo nextest run -p bcmalloc --release --lib loom_test "$@"
 
-# Fuzz one target for a number of seconds. The targets are heap_ops and chunk_ops.
+# Fuzz one target for a number of seconds. The targets are heap_ops and chunk_ops. The target triple
+# is the toolchain's host, because a prebuilt cargo-fuzz defaults to its own, which on CI is musl.
 fuzz target='heap_ops' seconds='60':
-    cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
+    cargo +nightly fuzz run --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{target}} -- -max_total_time={{seconds}}
 
 # Build the benchmarks and the held-out programs without running them.
 bench-build:
@@ -83,9 +84,19 @@ bench-apps *args:
 
 # Build the C allocation interface as target/cabi/release/libbcmalloc_c.so (or .dylib), to preload
 # into C programs. The initial-exec TLS model needs nightly, and is what a preloaded library wants.
-# It builds in its own target directory, so the flag does not rebuild the rest of the workspace.
+# A panic aborts: nothing may unwind into C anyway, and without unwind paths the fast paths need
+# no stack frame and end in jumps to the slow paths. It builds in its own target directory, so the
+# flags do not rebuild the rest of the workspace.
 cabi:
-    RUSTFLAGS="-Z tls-model=initial-exec" cargo +nightly build -p bcmalloc-cabi --release --target-dir target/cabi
+    RUSTFLAGS="-Z tls-model=initial-exec -C panic=abort" cargo +nightly build -p bcmalloc-cabi --release --target-dir target/cabi
+
+# Check the C++ operators of the C library in a C++ program that preloads it (Linux, with a C++
+# compiler): a new that cannot allocate runs the new-handler and throws through the library. It
+# builds as cabi does, without the nightly TLS model, in a target directory of its own.
+cabi-cxx:
+    RUSTFLAGS="-C panic=abort" cargo build -p bcmalloc-cabi --release --target-dir target/cabi-cxx
+    c++ -std=c++17 -O2 -Wall crates/cabi/tests/operator_new.cpp -o target/cabi-cxx/operator_new -ldl
+    LD_PRELOAD=target/cabi-cxx/release/libbcmalloc_c.so target/cabi-cxx/operator_new
 
 # Run mimalloc-bench (https://github.com/daanx/mimalloc-bench, built with its build-bench-env.sh)
 # with bcmalloc added as an external allocator, for example
@@ -94,6 +105,13 @@ mimalloc-bench dir args: cabi
     echo "bc $PWD/target/cabi/release/libbcmalloc_c.$(if [ "$(uname)" = Darwin ]; then echo dylib; else echo so; fi)" > target/bcmalloc-external.txt
     cd "$1/out/bench" && ../../bench.sh --external="$OLDPWD/target/bcmalloc-external.txt" $2
     cargo run -q -p bcmalloc-bench-data -- import-mimalloc-bench "$1/out/bench/benchres.csv"
+
+# Run the programs of mimalloc-bench, built in DIR by its build-bench-env.sh, under bcmalloc and the
+# allocators named with --alloc, with wall time in nanoseconds, the allocators interleaved, short
+# programs repeated, and medians with 95% intervals. See scripts/mbrun.py for the options, for
+# example: just mbrun ~/mimalloc-bench --alloc mi --alloc sn --runs 10 --out target/mb.tsv
+mbrun dir *args: cabi
+    dir="$1"; shift; scripts/mbrun.py --dir "$dir" --alloc bc=target/cabi/release/libbcmalloc_c.so "$@"
 
 # Render the tables of BENCHMARKS.md and README.md and assets/benchmarks.svg from benchmarks.json.
 # The benchmark recipes do this after they record their results.

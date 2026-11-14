@@ -8,15 +8,17 @@
 //! ```
 //!
 //! Every function forwards to one [`Bcmalloc`] with its default configuration. C frees carry no
-//! size, so `free`, `realloc` and `malloc_usable_size` read what the block is from the chunk map
-//! through the calling thread's heap.
+//! size, so `free`, `realloc` and `malloc_usable_size` read what the block is from the chunk map.
 //! Pointers that the allocator does not own are ignored by `free`, which can happen with memory a
-//! program got before the library was loaded.
+//! program got before the library was loaded. The C++ operators `new` and `delete` are defined
+//! too, in the [`cxx`] module, so that C++ programs reach the same fast paths.
 //!
 //! This is for running C benchmarks and programs on Linux. On macOS, programs allocate through
 //! malloc zones, which this library does not register.
 
 #![allow(unsafe_code)]
+
+pub mod cxx;
 
 use bcmalloc::Bcmalloc;
 use core::{
@@ -85,11 +87,8 @@ fn allocate(size: usize, align: usize) -> *mut c_void {
 /// Callable from C with the usual contract.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
-    let block = ALLOCATOR.malloc(size);
-    if block.is_null() {
-        set_errno(libc::ENOMEM);
-    }
-    block.cast()
+    // Bcmalloc::malloc sets errno itself when it fails.
+    ALLOCATOR.malloc(size).cast()
 }
 
 /// C `free`.
@@ -111,20 +110,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
 /// Callable from C with the usual contract.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
-    let Some(bytes) = count.checked_mul(size) else {
-        set_errno(libc::ENOMEM);
-        return ptr::null_mut();
-    };
-    let Some(layout) = layout(bytes, MIN_ALIGN) else {
-        set_errno(libc::ENOMEM);
-        return ptr::null_mut();
-    };
-    // SAFETY: the layout has a non-zero size.
-    let block = unsafe { ALLOCATOR.alloc_zeroed(layout) };
-    if block.is_null() {
-        set_errno(libc::ENOMEM);
-    }
-    block.cast()
+    // Bcmalloc::calloc sets errno itself when it fails.
+    ALLOCATOR.calloc(count, size).cast()
 }
 
 /// C `realloc`. A size of zero frees the block and returns null, as glibc does.
@@ -148,6 +135,55 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         set_errno(libc::ENOMEM);
     }
     moved.cast()
+}
+
+/// The obsolete `cfree`, the same as `free`.
+///
+/// # Safety
+///
+/// As for [`free`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn cfree(ptr: *mut c_void) {
+    // SAFETY: forwarded.
+    unsafe { free(ptr) };
+}
+
+/// C23 `free_sized`. The size is not needed, because the chunk map holds the block's class.
+///
+/// # Safety
+///
+/// As for [`free`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn free_sized(ptr: *mut c_void, _size: usize) {
+    // SAFETY: forwarded.
+    unsafe { free(ptr) };
+}
+
+/// C23 `free_aligned_sized`.
+///
+/// # Safety
+///
+/// As for [`free`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn free_aligned_sized(ptr: *mut c_void, _align: usize, _size: usize) {
+    // SAFETY: forwarded.
+    unsafe { free(ptr) };
+}
+
+/// `reallocarray`, a `realloc` of `count` items of `size` bytes that fails when the product
+/// overflows.
+///
+/// # Safety
+///
+/// As for [`realloc`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn reallocarray(ptr: *mut c_void, count: usize, size: usize) -> *mut c_void {
+    let Some(bytes) = count.checked_mul(size) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    // SAFETY: forwarded.
+    unsafe { realloc(ptr, bytes) }
 }
 
 /// C11 `aligned_alloc`.

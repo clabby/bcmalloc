@@ -30,11 +30,12 @@
 
 use crate::{
     allocator::{Backend, allocator},
+    chunks::CHUNK_SHIFT,
     config::Config,
     heap::{Heap, HeapData},
-    region::{Error, Mapping, Region, Stats},
-    size_class::{MIN_ALIGN, TABLE_MAX},
-    sync::{AtomicPtr, AtomicUsize, Ordering},
+    region::{Entry, Error, Mapping, Region, Stats},
+    size_class::{MAX_SMALL, MIN_ALIGN, TABLE_MAX},
+    sync::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     tls,
 };
 use core::{
@@ -44,6 +45,24 @@ use core::{
 
 /// The smallest region the lazy start-up settles for when the OS refuses a bigger one.
 const MIN_CAPACITY: usize = 256 << 20;
+
+/// Zeroed requests below this many bytes are cleared without asking whether the memory is fresh,
+/// as [`HeapData::alloc_zeroed`] does.
+const SMALL_ZEROED: usize = 1024;
+
+/// Sets the calling thread's `errno` to `ENOMEM`, as C's allocation functions do when they fail.
+fn set_out_of_memory() {
+    // SAFETY: the location is the calling thread's errno, valid for as long as the thread lives.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *libc::__errno_location() = libc::ENOMEM;
+    }
+    // SAFETY: as above.
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        *libc::__error() = libc::ENOMEM;
+    }
+}
 
 /// A global allocator that reserves its memory up front.
 ///
@@ -101,6 +120,78 @@ pub struct Bcmalloc {
     region: AtomicPtr<Region<'static>>,
     /// The thread-specific key under which threads keep their heap, or `tls::NO_KEY`.
     key: AtomicUsize,
+    directory: Directory,
+}
+
+/// Where the chunk map entry of a block is, copied out of the region.
+///
+/// A free reads the entry of its block's chunk. Found through the thread's heap, that load waits
+/// for the thread-local load and then for the heap's fields. Kept in the allocator, which is a
+/// `static`, the loads it needs depend on nothing and run alongside the thread-local one, which
+/// takes a step off the longest chain of loads in every free.
+///
+/// Every thread that binds a heap writes the fields first, all from the one published region, so
+/// the values never differ and a thread with a heap always sees them.
+#[derive(Debug)]
+struct Directory {
+    /// The address of the region's first chunk.
+    base: AtomicUsize,
+    /// The length of the managed memory in bytes.
+    span: AtomicUsize,
+    /// The region's chunk map.
+    map: AtomicPtr<AtomicU64>,
+}
+
+impl Directory {
+    const fn new() -> Self {
+        Self {
+            base: AtomicUsize::new(0),
+            span: AtomicUsize::new(0),
+            map: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Records where `region`'s chunks and chunk map are.
+    fn publish(&self, region: &Region<'_>) {
+        self.base.store(region.chunk_ptr(0).addr(), Ordering::Relaxed);
+        self.span.store(region.span(), Ordering::Relaxed);
+        self.map.store(region.map_ptr().cast_mut(), Ordering::Relaxed);
+    }
+
+    /// The chunk map entry of the block at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must have published the directory, and `ptr` must lie in the region.
+    #[inline(always)]
+    unsafe fn entry(&self, ptr: *const u8) -> Entry {
+        // SAFETY: forwarded.
+        unsafe { self.entry_at(ptr.addr() - self.base.load(Ordering::Relaxed)) }
+    }
+
+    /// The chunk map entry of the block at `ptr`, or `None` if `ptr` is not in the region.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must have published the directory.
+    #[inline(always)]
+    unsafe fn entry_in_region(&self, ptr: *const u8) -> Option<Entry> {
+        let offset = ptr.addr().wrapping_sub(self.base.load(Ordering::Relaxed));
+        // SAFETY: the offset shows that the pointer lies in the region.
+        (offset < self.span.load(Ordering::Relaxed)).then(|| unsafe { self.entry_at(offset) })
+    }
+
+    /// The chunk map entry of the chunk `offset` bytes into the managed memory.
+    ///
+    /// # Safety
+    ///
+    /// As for [`entry`](Self::entry), and the offset must be inside the managed memory.
+    #[inline(always)]
+    unsafe fn entry_at(&self, offset: usize) -> Entry {
+        // SAFETY: the offset is inside the region, whose map has an entry for every chunk.
+        let slot = unsafe { &*self.map.load(Ordering::Relaxed).add(offset >> CHUNK_SHIFT) };
+        Entry(slot.load(Ordering::Relaxed))
+    }
 }
 
 impl Bcmalloc {
@@ -111,7 +202,12 @@ impl Bcmalloc {
 
     /// An allocator with the given configuration.
     pub const fn with_config(config: Config) -> Self {
-        Self { config, region: AtomicPtr::new(ptr::null_mut()), key: AtomicUsize::new(tls::NO_KEY) }
+        Self {
+            config,
+            region: AtomicPtr::new(ptr::null_mut()),
+            key: AtomicUsize::new(tls::NO_KEY),
+            directory: Directory::new(),
+        }
     }
 
     /// The configuration the region was or will be created with.
@@ -150,27 +246,76 @@ impl Bcmalloc {
         self.existing()?.block_layout(ptr.as_ptr())
     }
 
-    /// Allocates `size` bytes aligned to 16, as C's `malloc` does, or returns null if there is no
-    /// room. A size of zero gets a block of its own.
+    /// Allocates `size` bytes aligned to 16, as C's `malloc` does, or returns null and sets `errno`
+    /// to `ENOMEM` if there is no room. A size of zero gets a block of its own.
     #[inline]
     pub fn malloc(&self, size: usize) -> *mut u8 {
         if size <= TABLE_MAX &&
-            let Some(data) = self.thread_heap()
+            let Some(data) = self.thread_heap() &&
+            let Some(block) = data.pop_table(size, true)
         {
-            // SAFETY: a thread's bound heap is claimed by that thread alone, and the table covers
-            // the size.
-            return unsafe { data.alloc_table(size, true) };
+            return block;
         }
-        self.malloc_general(size)
+        self.malloc_slow(size)
     }
 
-    /// Allocates what [`malloc`](Self::malloc) does not take on its fast path.
+    /// Allocates what [`malloc`](Self::malloc) does not take off a bin: a size the table does not
+    /// cover, an empty bin, or a thread without a heap. Failure sets `errno` here, so that the
+    /// fast path ends in a jump to this function and needs no stack frame of its own.
+    #[cold]
     #[inline(never)]
-    fn malloc_general(&self, size: usize) -> *mut u8 {
-        Layout::from_size_align(size.max(1), MIN_ALIGN).map_or(ptr::null_mut(), |layout| {
-            // SAFETY: the layout has a non-zero size.
-            unsafe { GlobalAlloc::alloc(self, layout) }
-        })
+    fn malloc_slow(&self, size: usize) -> *mut u8 {
+        let block = match self.thread_heap() {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, and the table covers
+            // the size.
+            Some(data) if size <= TABLE_MAX => unsafe { data.alloc_table(size, true) },
+            _ => {
+                Layout::from_size_align(size.max(1), MIN_ALIGN).map_or(ptr::null_mut(), |layout| {
+                    // SAFETY: the layout has a non-zero size.
+                    unsafe { GlobalAlloc::alloc(self, layout) }
+                })
+            }
+        };
+        if block.is_null() {
+            set_out_of_memory();
+        }
+        block
+    }
+
+    /// Allocates zeroed memory for `count` items of `size` bytes, aligned to 16, as C's `calloc`
+    /// does, or returns null and sets `errno` to `ENOMEM` if there is no room or the size
+    /// overflows.
+    #[inline]
+    pub fn calloc(&self, count: usize, size: usize) -> *mut u8 {
+        // Small blocks are cleared without asking whether they are fresh, which costs less than
+        // finding out, so they come straight off a bin.
+        if let Some(bytes) = count.checked_mul(size) &&
+            bytes < SMALL_ZEROED &&
+            let Some(data) = self.thread_heap() &&
+            let Some(block) = data.pop_table(bytes, true)
+        {
+            // SAFETY: the block holds at least `bytes` bytes and is ours.
+            unsafe { block.write_bytes(0, bytes) };
+            return block;
+        }
+        self.calloc_slow(count, size)
+    }
+
+    /// Allocates what [`calloc`](Self::calloc) does not take off a bin, and sets `errno` when it
+    /// fails.
+    #[cold]
+    #[inline(never)]
+    fn calloc_slow(&self, count: usize, size: usize) -> *mut u8 {
+        let layout = count
+            .checked_mul(size)
+            .and_then(|bytes| Layout::from_size_align(bytes.max(1), MIN_ALIGN).ok());
+        // SAFETY: the layout has a non-zero size.
+        let block = layout
+            .map_or(ptr::null_mut(), |layout| unsafe { GlobalAlloc::alloc_zeroed(self, layout) });
+        if block.is_null() {
+            set_out_of_memory();
+        }
+        block
     }
 
     /// How many bytes the block that `ptr` points to holds, as C's `malloc_usable_size` tells, or
@@ -214,12 +359,15 @@ impl Bcmalloc {
     /// block must not be used again.
     #[inline]
     pub unsafe fn free_unsized(&self, ptr: NonNull<u8>) {
-        match self.thread_heap() {
-            // SAFETY: a thread's bound heap is claimed by that thread alone, its region is this
-            // allocator's, and the caller vouches for the block.
-            Some(data) => unsafe { data.free_unsized(ptr) },
+        let Some(data) = self.thread_heap() else {
             // SAFETY: the caller vouches for the block.
-            None => unsafe { self.free_unsized_unbound(ptr) },
+            return unsafe { self.free_unsized_unbound(ptr) };
+        };
+        // SAFETY: a thread with a heap published the directory when it bound the heap.
+        if let Some(entry) = unsafe { self.directory.entry_in_region(ptr.as_ptr()) } {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, its region is this
+            // allocator's, the entry is the block's, and the caller vouches for the block.
+            unsafe { data.free_with_entry(ptr, entry) };
         }
     }
 
@@ -363,6 +511,8 @@ impl Bcmalloc {
 
     /// The body of [`bind`](Self::bind), which runs with the binding flag set.
     fn bind_now(&self, region: &'static Region<'static>) -> Option<&'static HeapData> {
+        // The fast frees read the directory once this thread has a heap.
+        self.directory.publish(region);
         let key = self.key()?;
         let heap = region.heap()?;
         // The heap releases its claim if the system refuses to remember it.
@@ -467,12 +617,18 @@ unsafe impl GlobalAlloc for Bcmalloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller guarantees the block is live, so it is not null.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        match self.thread_heap() {
-            // SAFETY: a thread's bound heap is claimed by that thread alone, and the caller
-            // guarantees the block came from this allocator with this layout.
-            Some(data) => unsafe { data.dealloc(ptr, layout) },
+        let Some(data) = self.thread_heap() else {
+            // SAFETY: the caller guarantees the block came from this allocator with this layout.
+            return unsafe { self.dealloc_unbound(ptr, layout) };
+        };
+        if layout.size() <= MAX_SMALL {
+            // SAFETY: a thread's bound heap is claimed by that thread alone, it published the
+            // directory when it bound the heap, and the caller guarantees the block came from
+            // this allocator with this layout, so it is a block of a slab in the region.
+            unsafe { data.free_entry(ptr.as_ptr().cast(), self.directory.entry(ptr.as_ptr())) };
+        } else {
             // SAFETY: as above.
-            None => unsafe { self.dealloc_unbound(ptr, layout) },
+            unsafe { data.dealloc(ptr, layout) };
         }
     }
 
