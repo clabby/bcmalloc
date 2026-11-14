@@ -108,12 +108,12 @@ const fn bin_initial_of(i: usize) -> usize {
 }
 
 /// How many block pointers the bin of class index `i` may grow to hold. A bin grows when the
-/// program alternates between emptying it and filling it, so that bursts of a few hundred blocks
+/// program alternates between emptying it and filling it, so that bursts of a few thousand blocks
 /// stay in the bin, as TCMalloc grows its per-CPU caches.
 const fn bin_max_of(i: usize) -> usize {
     let size = block_size_of(i);
     if size <= TABLE_MAX {
-        clamp((128 << 10) / size, 8, 512)
+        clamp((128 << 10) / size, 8, 2048)
     } else {
         clamp((128 << 10) / size, 1, 16)
     }

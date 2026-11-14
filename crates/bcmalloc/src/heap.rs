@@ -143,6 +143,9 @@ const fn reusable_anywhere(class: Class) -> bool {
     class.reusable_anywhere() || class.index() == MESSAGE_CLASS.index()
 }
 
+/// How many blocks a bin that overflows gives back at a time, from a buffer on the stack.
+const FLUSH_BATCH: usize = 512;
+
 /// The size of a bin, which [`Entry`] uses to keep the offset of a class's bin.
 pub(crate) const BIN_SIZE: usize = size_of::<Bin>();
 
@@ -191,7 +194,7 @@ const _: () = assert!(MESSAGE_CLASS.block_size() == MESSAGE_BYTES);
 ///
 /// The stack lives in the heap's slot array and grows down. It is empty when `top` is at the end of
 /// its range and full when it is at the start. Both ends fit in 16 bits of address, because a bin
-/// is at most 1 KiB long, so the checks compare the low bits of `top` only and the bin fits in one
+/// is at most 16 KiB long, so the checks compare the low bits of `top` only and the bin fits in one
 /// load of 16 bytes.
 struct Bin {
     top: Cell<*mut *mut Block>,
@@ -792,12 +795,9 @@ impl HeapData {
                 if bin.misses.get() & MISSED == 0 && capacity > class.bin_initial() {
                     // A bin that has not missed for a while holds more than it needs.
                     let shrunk = (capacity / 2).max(class.bin_initial());
-                    // Giving blocks back may read the inbox, which files blocks into this very
-                    // bin, so the bin only shrinks once it holds no more than the new capacity.
-                    while self.bin_len(class) > shrunk {
-                        // SAFETY: forwarded.
-                        unsafe { self.flush_bin(class, shrunk) };
-                    }
+                    // SAFETY: forwarded. The bin holds no more than the new capacity afterwards,
+                    // even when giving blocks back filed mail into it.
+                    unsafe { self.flush_bin(class, shrunk) };
                     self.set_capacity(class, shrunk);
                     count!(self, BinsShrunk, 1);
                     let bytes = (capacity - shrunk) * class.block_size();
@@ -1210,19 +1210,25 @@ impl HeapData {
         if len <= keep {
             return;
         }
-        let gone = len - keep;
         // The oldest blocks are at the end of the bin. Move them out first and the rest down, so
-        // that the bin is consistent if giving the blocks back allocates or frees again.
-        let mut out = [ptr::null_mut::<Block>(); 512];
-        let top = bin.top.get();
-        // SAFETY: the bin holds `len` blocks from `top`, and `out` holds a bin's capacity.
-        unsafe {
-            ptr::copy_nonoverlapping(top.add(keep), out.as_mut_ptr(), gone);
-            ptr::copy(top, top.add(gone), keep);
+        // that the bin is consistent if giving the blocks back allocates or frees again. A bin
+        // can be longer than the buffer, so this goes a buffer at a time.
+        let mut out = [ptr::null_mut::<Block>(); FLUSH_BATCH];
+        let mut len = len;
+        while len > keep {
+            let gone = (len - keep).min(FLUSH_BATCH);
+            let top = bin.top.get();
+            // SAFETY: the bin holds `len` blocks from `top`, and `out` holds `gone` of them.
+            unsafe {
+                ptr::copy_nonoverlapping(top.add(len - gone), out.as_mut_ptr(), gone);
+                ptr::copy(top, top.add(gone), len - gone);
+            }
+            bin.top.set(top.wrapping_add(gone));
+            // SAFETY: the blocks were in the bin, so they are in use and ours to give back.
+            unsafe { self.give_back(region, class, &out[..gone], false) };
+            // Giving back may have filed blocks from the inbox into this bin.
+            len = self.bin_len(class);
         }
-        bin.top.set(top.wrapping_add(gone));
-        // SAFETY: the blocks were in the bin, so they are in use and ours to give back.
-        unsafe { self.give_back(region, class, &out[..gone], false) };
     }
 
     /// Gives blocks of `class` that this heap holds back: blocks of its own slabs to the slab, and
